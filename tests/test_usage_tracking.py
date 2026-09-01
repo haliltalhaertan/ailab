@@ -30,6 +30,10 @@ def test_openrouter_catalog_parses_pricing_per_million():
 
 def test_trace_summary_records_model_tokens_cost_and_wall_time(tmp_path):
     trace = Trace("usage", out_dir=tmp_path)
+    exact_messages = [
+        {"role": "system", "content": "system rule"},
+        {"role": "user", "content": "problem"},
+    ]
     response = SimpleNamespace(
         content="answer",
         prompt_tokens=120,
@@ -38,6 +42,9 @@ def test_trace_summary_records_model_tokens_cost_and_wall_time(tmp_path):
         cached_tokens=20,
         cost_usd=0.0042,
         latency_s=1.25,
+        provider_reasoning="provider-visible reasoning",
+        reasoning_details=[{"type": "reasoning.text", "text": "detail"}],
+        request_messages=exact_messages,
     )
     trace.agent_call(
         "Theorist",
@@ -63,6 +70,11 @@ def test_trace_summary_records_model_tokens_cost_and_wall_time(tmp_path):
     assert agent["models"] == ["vendor/model-x"]
     assert agent["total_tokens"] == 150
     assert agent["cost_usd"] == 0.0042
+
+    event = json.loads(trace.path.read_text(encoding="utf-8").splitlines()[0])
+    assert event["messages"] == exact_messages
+    assert event["provider_reasoning"] == "provider-visible reasoning"
+    assert event["reasoning_details"][0]["text"] == "detail"
 
 
 def test_trace_marks_partial_cost_when_provider_omits_cost(tmp_path):
