@@ -1,19 +1,10 @@
-from dataclasses import dataclass
 from pathlib import Path
 
+from lab.client import LLMResponse
 from lab.research_state import ResearchState
 from lab.theorem_lab import TheoremResearchLab
 from lab.tools import ResearchToolbox
 from lab.trace import Trace
-
-
-@dataclass
-class FakeResponse:
-    content: str
-    model: str = "fake/model"
-    prompt_tokens: int = 1
-    completion_tokens: int = 1
-    latency_s: float = 0.0
 
 
 class FakeAgent:
@@ -22,11 +13,22 @@ class FakeAgent:
         self.model = "fake/model"
         self.system_prompt = f"system:{name}"
         self.temperature = 0.0
+        self.max_tokens = None
+        self.reasoning_effort = None
         self.outputs = list(outputs)
 
-    def respond(self, messages):
+    def respond(self, messages, stream_callback=None):
         content = self.outputs.pop(0)
-        return content, FakeResponse(content)
+        if stream_callback:
+            stream_callback("content", content)
+        return content, LLMResponse(
+            content=content,
+            model=self.model,
+            prompt_tokens=1,
+            completion_tokens=1,
+            latency_s=0.0,
+            request_messages=[{"role": "system", "content": self.system_prompt}] + messages,
+        )
 
 
 class EmptyLiterature:
@@ -43,7 +45,7 @@ def test_theorem_lab_persists_candidate_and_audit(tmp_path: Path):
         "P",
         manager=FakeAgent("manager", ['{"decision":"KEEP","status":"OPEN","reason":"ok","next_task":"next"}']),
         proposer=FakeAgent("proposer", ['{"title":"C","claim":"claim","strategy":"s","evidence_needed":[],"tool_request":{"tool":"none"}}']),
-        critic=FakeAgent("critic", ["KEEP: no counterexample yet"]),
+        critic=FakeAgent("critic", ['{"verdict":"KEEP","reason":"no counterexample yet","counterexample":""}']),
         verifier=FakeAgent("verifier", ['{"verdict":"INCONCLUSIVE","reason":"needs proof","formal_proof_required":true,"counterexample":""}']),
         auditor=FakeAgent("auditor", ["PASS-WITH-GAPS"]),
         iterations=1,
@@ -55,7 +57,7 @@ def test_theorem_lab_persists_candidate_and_audit(tmp_path: Path):
     assert len(candidates) == 1
     assert candidates[0].status == "OPEN"
     assert state.list_items(kind="audit")
-    assert "Theorem Research Run" in report
+    assert "Teorem Araştırması Sonucu" in report
 
     trace_text = trace.path.read_text(encoding="utf-8")
     assert '"type": "agent_start"' in trace_text
@@ -82,7 +84,7 @@ def test_tropical_counterexample_automatically_kills_candidate(tmp_path: Path):
         "P",
         manager=FakeAgent("manager", ['{"decision":"KEEP","status":"OPEN","reason":"try","next_task":"next"}']),
         proposer=FakeAgent("proposer", [bad_request]),
-        critic=FakeAgent("critic", ["KEEP"]),
+        critic=FakeAgent("critic", ['{"verdict":"KEEP","reason":"tool decides","counterexample":""}']),
         verifier=FakeAgent("verifier", ['{"verdict":"INCONCLUSIVE","reason":"tool decides","formal_proof_required":true,"counterexample":""}']),
         auditor=FakeAgent("auditor", ["PASS-WITH-GAPS"]),
         iterations=1,
