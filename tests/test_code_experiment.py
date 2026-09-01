@@ -3,7 +3,7 @@ import json
 from lab.code_experiment import GuardedExperimentWorkspace, WorkspaceActionResult
 
 
-def test_workspace_writes_runs_and_captures_outputs(tmp_path):
+def test_workspace_writes_runs_and_captures_outputs(tmp_path, fake_container_runtime):
     ws = GuardedExperimentWorkspace(tmp_path / "workspace", timeout_s=5)
     written = ws.write_file(
         "exp_001.py",
@@ -18,6 +18,28 @@ def test_workspace_writes_runs_and_captures_outputs(tmp_path):
     assert result.metadata["evidence_level"] == "COMPUTATION_ONLY"
     assert (ws.root / result.metadata["stdout_file"]).read_text(encoding="utf-8").strip() == "10"
 
+    run_commands = [cmd for cmd in fake_container_runtime if len(cmd) > 1 and cmd[1] == "run"]
+    assert len(run_commands) == 1
+    command = run_commands[0]
+    assert "--network=none" in command
+    assert "--read-only" in command
+    assert "--cap-drop=ALL" in command
+    assert "--security-opt=no-new-privileges" in command
+    assert any(part.startswith("--memory=") for part in command)
+    assert any(part.startswith("--pids-limit=") for part in command)
+    assert any(part.startswith("--cpus=") for part in command)
+
+
+def test_workspace_fails_closed_without_container_engine(tmp_path, monkeypatch):
+    import lab.code_experiment as code_experiment
+
+    monkeypatch.setattr(code_experiment.shutil, "which", lambda name: None)
+    ws = GuardedExperimentWorkspace(tmp_path / "workspace", timeout_s=5, container_engine="")
+    assert ws.write_file("exp.py", "print('x')\n").ok
+    result = ws.run_python("exp.py")
+    assert not result.ok
+    assert "container" in result.error.lower()
+
 
 def test_workspace_rejects_path_escape_and_unsafe_imports(tmp_path):
     ws = GuardedExperimentWorkspace(tmp_path / "workspace")
@@ -28,6 +50,14 @@ def test_workspace_rejects_path_escape_and_unsafe_imports(tmp_path):
     unsafe = ws.write_file("bad.py", "import os\nprint(os.listdir('.'))\n")
     assert not unsafe.ok
     assert "import" in unsafe.error.lower()
+
+    alias_open = ws.write_file("alias.py", "o = open\no('outside.txt', 'w')\n")
+    assert not alias_open.ok
+    assert "isim" in alias_open.error.lower()
+
+    alias_eval = ws.write_file("eval_alias.py", "e = eval\nprint(e('1+1'))\n")
+    assert not alias_eval.ok
+    assert "isim" in alias_eval.error.lower()
 
 
 def test_workspace_patch_requires_unique_match(tmp_path):

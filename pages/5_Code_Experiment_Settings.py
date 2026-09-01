@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -8,13 +9,10 @@ from dotenv import load_dotenv
 from lab.code_experiment_settings import load_code_experiment_settings, save_code_experiment_settings
 from lab.openrouter_catalog import fetch_openrouter_models
 
-
 load_dotenv()
 st.set_page_config(page_title="Code Deneyi Ayarları", layout="wide")
 st.title("Code Experiment Agent")
-st.caption(
-    "LLM'nin proje workspace'i içinde Python deneyi yazıp çalıştırdığı kontrollü araştırma katmanını ayarla."
-)
+st.caption("LLM'nin ürettiği Python host üzerinde çalıştırılmaz; Docker/Podman içinde no-network disposable container kullanılır.")
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -31,73 +29,41 @@ except Exception as exc:
 
 query = st.text_input("Model ara", placeholder="örn. glm 5.3, kimi, coder")
 needle = query.strip().casefold()
-filtered = [
-    m for m in models
-    if not needle
-    or needle in str(m.get("id", "")).casefold()
-    or needle in str(m.get("label", "")).casefold()
-]
-if query:
-    st.caption(f"{len(filtered)} model eşleşti")
-
+filtered = [m for m in models if not needle or needle in str(m.get("id", "")).casefold() or needle in str(m.get("label", "")).casefold()]
 configured = str(settings.get("model") or os.environ.get("LAB_CODE_EXPERIMENT_MODEL") or "").strip()
 ids = [str(m.get("id")) for m in filtered if m.get("id")]
 labels = {str(m.get("id")): str(m.get("label") or m.get("id")) for m in filtered if m.get("id")}
 if configured and configured not in ids and not query:
     ids.insert(0, configured)
     labels[configured] = configured
-
+selected = configured
 if ids:
     default = configured if configured in ids else ids[0]
-    selected = st.selectbox(
-        "CodeExperimentAgent modeli",
-        ids,
-        index=ids.index(default),
-        format_func=lambda mid: labels.get(mid, mid),
-    )
-else:
-    selected = configured
-    st.info("Katalogdan model seçilemedi; aşağıya manuel slug yazabilirsin.")
-
-manual = st.text_input(
-    "Manuel model ID (opsiyonel)",
-    value="",
-    placeholder="örn. z-ai/glm-5.3",
-).strip()
+    selected = st.selectbox("CodeExperimentAgent modeli", ids, index=ids.index(default), format_func=lambda mid: labels.get(mid, mid))
+manual = st.text_input("Manuel model ID (opsiyonel)", value="", placeholder="örn. z-ai/glm-5.3").strip()
 model = manual or selected
 
-c1, c2 = st.columns(2)
-max_steps = c1.number_input(
-    "Bir deneyde maksimum LLM action sayısı",
-    min_value=1,
-    max_value=20,
-    value=int(settings.get("max_steps", 8)),
-)
-timeout_s = c2.number_input(
-    "Tek Python çalıştırması timeout (sn)",
-    min_value=5,
-    max_value=300,
-    value=int(settings.get("timeout_s", 60)),
-)
+found_docker = shutil.which("docker")
+found_podman = shutil.which("podman")
+if found_docker or found_podman:
+    st.success(f"Container engine bulundu: `{found_docker or found_podman}`")
+else:
+    st.error("Docker/Podman bulunamadı. CodeExperimentAgent kod yazabilir ama güvenlik nedeniyle run_python çalıştırılmaz.")
 
-c3, c4 = st.columns(2)
-memory_limit_mb = c3.number_input(
-    "Python process ağacı bellek limiti (MB)",
-    min_value=128,
-    max_value=8192,
-    value=int(settings.get("memory_limit_mb", 768)),
-)
-max_output_mb = c4.number_input(
-    "stdout + stderr toplam limiti (MB)",
-    min_value=1,
-    max_value=64,
-    value=int(settings.get("max_output_mb", 4)),
-)
+c1, c2, c3 = st.columns(3)
+max_steps = c1.number_input("Maksimum LLM action", 1, 20, int(settings.get("max_steps", 8)))
+timeout_s = c2.number_input("Python timeout (sn)", 5, 600, int(settings.get("timeout_s", 60)))
+memory_limit_mb = c3.number_input("Container RAM (MB)", 128, 8192, int(settings.get("memory_limit_mb", 768)), step=128)
+c4, c5, c6 = st.columns(3)
+max_output_mb = c4.number_input("Stdout+stderr limiti (MB)", 1, 64, int(settings.get("max_output_mb", 4)))
+pid_limit = c5.number_input("PID limiti", 1, 128, int(settings.get("pid_limit", 8)))
+cpu_limit = c6.number_input("CPU limiti", 0.1, 16.0, float(settings.get("cpu_limit", 1.0)), step=0.1)
+engine = st.selectbox("Container engine", ["auto", "docker", "podman"], index=0 if not settings.get("container_engine") else (["auto", "docker", "podman"].index(settings.get("container_engine")) if settings.get("container_engine") in {"docker", "podman"} else 0))
+image = st.text_input("Container image", value=str(settings.get("container_image") or "python:3.12-slim"))
 
 st.info(
-    "İzin verilen actions: write_file, patch_file, read_file, list_files, run_python, finish. "
-    "finish için en az bir gerçek başarılı run_python zorunludur ve son Python denemesi başarılı olmalıdır. "
-    "Computation evidence otomatik ispat sayılmaz."
+    "Container güvenlik profili: `--network=none`, read-only rootfs, `--cap-drop=ALL`, `no-new-privileges`, RAM/PID/CPU limitleri ve yalnız proje workspace'inin writable mount edilmesi. "
+    "AST filtresi yalnız defense-in-depth'tir; güvenlik sınırı container'dır."
 )
 
 if st.button("Code deney ayarlarını kaydet", type="primary", use_container_width=True):
@@ -108,19 +74,10 @@ if st.button("Code deney ayarlarını kaydet", type="primary", use_container_wid
             "timeout_s": int(timeout_s),
             "memory_limit_mb": int(memory_limit_mb),
             "max_output_mb": int(max_output_mb),
+            "pid_limit": int(pid_limit),
+            "cpu_limit": float(cpu_limit),
+            "container_engine": "" if engine == "auto" else engine,
+            "container_image": image.strip() or "python:3.12-slim",
         }
     )
     st.success(f"Kaydedildi: {path}")
-
-with st.expander("Güvenlik modeli", expanded=False):
-    st.markdown(
-        "- Workspace: `research_state/<project_id>/workspace/`\n"
-        "- Shell/PowerShell/CMD action yok.\n"
-        "- API key ve çoğu environment variable child process'e aktarılmaz.\n"
-        "- Python `-I` modunda, AST güvenlik kontrolünden sonra çalışır.\n"
-        "- `os`, `subprocess`, `socket`, dosya `open`, `eval/exec` ve dunder introspection engellenir.\n"
-        "- stdout/stderr RAM'de sınırsız biriktirilmez; immutable evidence dosyalarına akar ve byte limiti izlenir.\n"
-        "- Process ağacı psutil ile bellek/PID sınırına karşı izlenir; timeout veya DURDUR isteğinde terminate edilir.\n"
-        "- Opsiyonel `numpy/sympy/networkx` yalnız gerçekten kuruluysa capability listesine girer.\n"
-        "- Bu hâlâ VM/container seviyesinde network/filesystem namespace izolasyonu değildir; yüksek tehdit modeli için dış container runner tercih edilmelidir."
-    )

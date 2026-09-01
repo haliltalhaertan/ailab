@@ -40,10 +40,13 @@ def test_agent_streams_provider_deltas_into_active_trace(tmp_path):
     trace.close()
 
     events = [json.loads(line) for line in trace.path.read_text(encoding="utf-8").splitlines()]
-    stream_events = [event for event in events if event.get("type") == "agent_stream"]
+    stream_events = [
+        json.loads(line) for line in trace.stream_path.read_text(encoding="utf-8").splitlines()
+    ]
     assert content == '{"answer":"ok"}'
-    assert [event["channel"] for event in stream_events] == ["reasoning", "reasoning", "content"]
-    assert stream_events[0]["delta"] == "first thought "
+    assert [event["channel"] for event in stream_events] == ["reasoning", "content"]
+    assert stream_events[0]["delta"] == "first thought second thought"
+    assert stream_events[0]["batch_parts"] == 2
     assert stream_events[-1]["delta"] == '{"answer":"ok"}'
     final = [event for event in events if event.get("type") == "llm_call"][0]
     assert final["provider_reasoning"] == "first thought second thought"

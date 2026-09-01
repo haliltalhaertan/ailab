@@ -5,7 +5,7 @@
 Bu repo iki kullanım katmanı sunar:
 
 1. **Genel multi-agent deneyleri:** pipeline, research loop, debate, panel.
-2. **Theorem Research Lab v2:** açık matematik/teorik CS problemleri için manager + teorisyen + adversarial critic + verifier + literature scout + bağımsız auditor; kalıcı conjecture ledger, deterministic compute araçları, literature screening ve checkpoint/freeze desteği.
+2. **Theorem Research Lab:** açık matematik/teorik CS problemleri için manager + teorisyen + adversarial critic + verifier + literature scout + bağımsız auditor; kalıcı conjecture ledger, deterministic compute araçları, literature screening, checkpoint/freeze ve durdur/devam desteği.
 
 ## Kurulum
 
@@ -19,7 +19,7 @@ Copy-Item .env.example .env
 Test araçları için:
 
 ```powershell
-.venv\Scripts\pip install -e .[dev]
+.venv\Scripts\pip install -e ".[dev]"
 .venv\Scripts\pytest -q
 ```
 
@@ -34,33 +34,51 @@ OPENROUTER_API_KEY=...
 ## Mimari
 
 ```text
-lab/
-  client.py              OpenAI uyumlu LLM istemcisi + exact usage/cost yakalama
-  agent.py               Agent tanımı
-  orchestrator.py        Genel multi-agent desenleri
-  trace.py               JSONL trace + token/ücret/süre ölçümü
-  openrouter_catalog.py  Canlı OpenRouter model kataloğu ve fiyat bilgisi
-
-  research_state.py      Frozen problem + conjecture/lemma/counterexample ledger
-  literature.py          arXiv + Crossref novelty/literature screening
-  tools.py               Kontrollü compute: checked-in Python script, Z3, tropical grid, opsiyonel Lean
-  theorem_lab.py         Dinamik theorem-research workflow
-
-experiments/
-  research.py            Klasik proposer↔critic research loop
-  theorem_research.py    Açık matematik/CS problemleri için v2 workflow
-
-research_tools/           Yalnızca review edilmiş deterministic hesaplama scriptleri
-formal/                   Opsiyonel checked-in Lean dosyaları
-research_state/           Runtime araştırma hafızası; git'e alınmaz
-runs/                     LLM/tool trace'leri ve summary.json; git'e alınmaz
-templates/                Frozen problem gibi araştırma şablonları
-tests/                    Deterministic unit testler
+Streamlit UI / Research Control
+            |
+            v
+     Detached Worker
+            |
+            v
+   TheoremResearchLab
+      /    |     \
+StepStore RunController ToolRegistry
+   |          |          |
+ SQLite    lock/stop   Python/Z3/Lean
+            |
+      ResearchState
+            |
+       Trace / Audit
 ```
 
-## Theorem Research Lab v2
+Üretim theorem workflow'u yalnız `lab/theorem_engine.py` içinde bulunur. Eski theorem-lab modülleri yalnız compatibility shim'dir; araştırma mantığının ikinci kopyasını taşımaz.
 
-Amaç, LLM'leri "ispat üreten chatbot" olarak değil, kontrollü bir araştırma sistemi içinde kullanmaktır.
+Başlıca runtime dosyaları:
+
+```text
+research_state/<project_id>/
+  project.json
+  problem_frozen.json
+  state.json
+  theorem_graph.json
+  runtime.json
+  run_config.json
+  research_steps.sqlite3
+  run.lock                  # yalnız aktif run sırasında
+  checkpoints/
+  workspace/
+
+runs/
+  index.jsonl
+  <run_id>/
+    trace.jsonl
+    stream.jsonl
+    summary.json
+```
+
+## Theorem Research Lab
+
+Amaç LLM'leri "ispat üreten chatbot" olarak değil, kontrollü ve denetlenebilir bir araştırma sistemi içinde kullanmaktır.
 
 ```text
                     Research Manager
@@ -69,23 +87,21 @@ Amaç, LLM'leri "ispat üreten chatbot" olarak değil, kontrollü bir araştırm
           |               |               |
        Theorist       Adversarial       Verifier
                           Critic            |
-          |               |          Python/Z3/Lean
+          |               |        deterministic tools
           +---------------+---------------+
+                          |
+                    Evidence Guard
                           |
                  Research State / Graph
                           |
                   Literature Scout
                           |
                  Independent Auditor
-                          |
-                     Checkpoint
 ```
 
-### Güvenilirlik kuralı
+### Kanıt merdiveni
 
 Bir LLM'nin veya birden fazla LLM'nin "doğru görünüyor" demesi bir iddiayı `[PROVEN]` yapmaz.
-
-`ResearchState` bir iddianın `PROVEN` durumuna yükseltilmesi için `formal_verified=true` metadata ister. Küçük-n hesaplama yalnızca `COMPUTATION_PASS`; informal ispat en fazla `PROOF_CANDIDATE` seviyesidir.
 
 Durumlar:
 
@@ -100,96 +116,113 @@ BARRIER
 DROPPED
 ```
 
-Bir counterexample kaydedildiğinde hedef iddia otomatik `FAIL` olur ve ledger'da kalır; böylece başka bir agent aynı fikri daha sonra "yeni" diye yeniden açmaz.
+Merkezi evidence guard LLM'nin istediği status ile gerçekten mevcut evidence'ı karşılaştırır:
 
-## Araştırma hafızası
+- `COMPUTATION_PASS`: deterministic başarılı compute evidence gerekir.
+- `PROOF_CANDIDATE`: verifier/critic değerlendirmesi gerekir; formal ispat değildir.
+- `PROVEN`: başarılı formal checker sonucu ve `formal_verified=true` metadata gerekir.
+- `FAIL`: deterministic counterexample veya açık counterexample evidence gerekir.
 
-Her theorem projesinin ayrı state klasörü vardır:
+Manager daha güçlü bir status ister fakat evidence yoksa durum otomatik olarak daha düşük güven seviyesine indirilir ve trace'e kaydedilir.
+
+### Formal doğrulama yolu
+
+LLM formal bir aday üretmek isterse `lean_draft` aracıyla proje içindeki `formal/candidates/` alanına Lean dosyası yazar. Daha sonra `LeanTool` dosyayı gerçek Lean checker ile çalıştırır. Yalnız checker başarıyla tamamlanırsa `formal_verified=true` üretilebilir ve `PROVEN` gate'i açılabilir.
+
+Lean kurulu değilse formal doğrulama başarısız/inconclusive kalır; LLM görüşü bunun yerine geçmez.
+
+## Durdur / devam bütünlüğü
+
+Theorem run'ı Streamlit render thread'inde değil ayrı worker process'te çalışır. Tarayıcı kapansa bile worker yaşamaya devam edebilir. Research Control sayfasındaki STOP isteği `stop.flag` üzerinden worker'a iletilir.
+
+Tamamlanan step'ler SQLite `StepStore` içinde content fingerprint ile saklanır. Yarım provider-visible çalışma `reasoning`, `reasoning_details` ve `content` ile birlikte partial kayıt olarak tutulur.
+
+Her iteration başında ledger context, ledger revision ve next task dondurulur. Resume sırasında proposer'ın ürettiği claim dondurulmuş proposal ile uyuşmazsa yeni evidence eski conjecture'a sessizce bağlanmaz; run fail-closed biçimde `PAUSED_ERROR` durumuna geçer.
+
+Bu gerçek provider KV-cache resume değildir. Provider'ın gizli inference state'i API tarafından verilmediğinde yalnız provider-visible reasoning/content güvenli biçimde yeniden kullanılabilir.
+
+## CodeExperimentAgent güvenlik modeli
+
+LLM tarafından üretilen Python **host Python process'inde çalıştırılmaz**. CodeExperimentAgent deney çalıştırabilmek için Docker veya Podman ister.
+
+Container şu güvenlik sınırlarıyla başlatılır:
 
 ```text
-research_state/<project_id>/
-  problem_frozen.json
-  state.json
-  theorem_graph.json
-  checkpoints/
+network = none
+root filesystem = read-only
+capabilities = drop ALL
+no-new-privileges
+RAM limit
+PID limit
+CPU limit
+timeout
+stdout/stderr byte limit
+yalnız project workspace writable bind mount
 ```
 
-`problem_frozen.json` yanlışlıkla başka probleme geçilmesini engeller. `state.json` conjecture, lemma, experiment, audit ve counterexample kayıtlarını tutar. `theorem_graph.json` dependency edge'lerini çıkarır. Checkpoint'ler immutable snapshot olarak yazılır.
+Container runtime bulunamazsa sistem host execution'a düşmez; deney **fail closed** olur.
 
-Başlangıç şablonu: `templates/problem_frozen.md`.
+AST doğrulaması ayrıca defense-in-depth sağlar: `open`, `eval`, `exec`, `__import__`, `os`, `subprocess`, `socket` gibi doğrudan veya alias edilmiş riskli yollar reddedilir. Asıl security boundary AST değil container'dır.
 
-## Deterministic compute katmanı
+Agent'ın workspace araçları:
 
-`research_tools/` altındaki scriptler LLM'den bağımsız, gözden geçirilmiş hesaplama programlarıdır.
-
-Örnek:
-
-```powershell
-.venv\Scripts\python research_tools\tropical_path_counts.py 8
+```text
+write_file
+read_file
+list_files
+patch_file
+run_python
+finish
 ```
 
-çıktısı complete graph `K_8` için simple source-target path sayısını exact olarak verir.
+`finish` ancak en az bir gerçek başarılı `run_python` evidence'ı varsa kabul edilir ve son run başarısızsa başarılı deney diye kapanamaz. Evidence manifest script/stdout/stderr SHA-256 hashlerini, return code'u, süreyi ve çalışma kimliğini taşır.
 
-`ScriptTool` güvenlik nedeniyle LLM tarafından üretilen keyfi Python kodunu çalıştırmaz. Sadece `research_tools/` altına önceden eklenmiş `.py` dosyalarını çalıştırır ve child process'e API key gibi environment secret'larını taşımaz.
-
-Ek doğrulayıcılar:
-
-- **Z3Tool:** SMT-LIB sorgularını deterministic olarak kontrol eder.
-- **TropicalGridTool:** min-plus circuit adaylarını küçük n ve sonlu ağırlık gridlerinde exhaustive kontrol edip counterexample arar; PASS bir genel ispat değildir.
-- **LeanTool:** `lean` binary kuruluysa yalnızca `formal/` altındaki checked-in `.lean` dosyalarını kontrol eder.
+Hesaplamalı test ne kadar geniş olursa olsun otomatik `[PROVEN]` değildir; evidence seviyesi `COMPUTATION_ONLY` olarak tutulur.
 
 ## Literature / novelty screening
 
-`LiteratureClient` API key gerektirmeden arXiv ve Crossref üzerinde aday yayınları tarar. `LiteratureScout` bu kayıtları novelty riski ve aranacak anahtar kelimeler açısından yorumlar. Bu yalnızca novelty screen'dir; "arama sonucu bulamadım" yeni teorem kanıtı veya kesin novelty garantisi değildir. Kritik bir sonuçta bağımsız literatür audit'i yine gerekir.
+`LiteratureClient` arXiv ve Crossref üzerinde aday yayınları tarar. Uzun bir sorgu tek bir exact quoted phrase'e dönüştürülmez; birden fazla daha sağlam sorgu varyantı denenir.
 
-## Theorem research çalıştırma
-
-### Web arayüzü — önerilen
-
-```powershell
-.venv\Scripts\streamlit run app.py
-```
-
-`Deney tipi` olarak **Teorem Araştırması** seç. Arayüz OpenRouter'ın canlı text-model kataloğunu yükler. Her rol için ayrı model seçebilirsin:
-
-- ResearchManager
-- Theorist
-- AdversarialCritic
-- VerificationEngineer
-- LiteratureScout
-- IndependentAuditor
-
-Model selectbox'ı OpenRouter model adı, slug ve güncel input/output liste fiyatını gösterir. Katalogda görünmeyen/yeni bir model kullanmak için rolün altındaki **Manuel model ID** alanına örneğin `z-ai/glm-5.3` gibi doğrudan OpenRouter slug'ı yazabilirsin.
-
-`.env` içindeki `LAB_MANAGER_MODEL`, `LAB_PROPOSER_MODEL` vb. değerler yalnız arayüzün ilk açılıştaki varsayılan seçimleridir; arayüzde yaptığın seçim run için önceliklidir.
-
-### CLI
-
-Örnek tropical circuit projesi:
-
-```powershell
-.venv\Scripts\python experiments\theorem_research.py "Let P_n be the simple s-t path provenance polynomial of K_n over the min-plus tropical semiring. Improve either the O(n^3) upper bound or the Omega(n^2) lower bound." tropical-circuit 6
-```
-
-Aynı `project_id` ile tekrar çalıştırırsan ledger devam eder; farklı problem verirsen frozen-problem koruması hata üretir.
-
-CLI için rol bazlı modelleri environment üzerinden değiştirebilirsin:
+Arama sonucu sıfırsa sistem bunu:
 
 ```text
-LAB_MANAGER_MODEL=...
-LAB_PROPOSER_MODEL=...
-LAB_CRITIC_MODEL=...
-LAB_VERIFIER_MODEL=...
-LAB_LITERATURE_MODEL=...
-LAB_AUDITOR_MODEL=...
-LAB_LITERATURE_QUERY=tropical circuit reachability provenance lower bound
+INCONCLUSIVE
 ```
 
-Bağımsız auditor için mümkünse proposer/critic'ten farklı model ailesi kullan.
+olarak yorumlar. "Sonuç bulamadım" hiçbir zaman "bu sonuç yenidir" kanıtı değildir. Kritik novelty iddiasında bağımsız literatür audit'i gerekir.
 
-## Kullanım, token, ücret ve süre kayıtları
+## Structured output
 
-Her LLM çağrısı `runs/<timestamp>_<experiment>/trace.jsonl` içine aşağıdaki alanlarla kaydedilir:
+Theorem pipeline'daki yapılandırılmış LLM çıktıları fail-closed parse edilir:
+
+1. JSON doğrudan parse edilir.
+2. Yaygın bozuk JSON/LaTeX escape hataları deterministic repair ile denenir.
+3. Gerekirse yalnız formatı düzeltmek için tek bir LLM repair çağrısı yapılır.
+4. Hâlâ parse edilemiyorsa sessiz default kullanılmaz; run `PAUSED_ERROR` olur.
+
+## Deterministic tools
+
+`ToolRegistry` theorem promptuna sunulan tool şemalarıyla gerçek dispatch'in tek kaynağıdır.
+
+- **ScriptTool:** yalnız review edilmiş `research_tools/` scriptlerini çalıştırır.
+- **Z3Tool:** SMT-LIB doğrulaması; solver timeout'u vardır.
+- **TropicalGridTool:** küçük-n exhaustive counterexample araması; PASS genel ispat değildir.
+- **LeanTool:** formal checker.
+- **CodeExperimentAgent:** container içindeki yeni deney kodu döngüsü.
+
+## Araştırma state'i ve eşzamanlılık
+
+Aynı proje üzerinde aynı anda iki theorem worker çalıştırılamaz. `run.lock` atomik proje kilididir; ikinci process lock alamazsa state/cache'e yazmadan durur.
+
+Run klasörleri mikro-saniye + UUID tabanlı benzersiz `run_id` kullanır. İnsan tarafından okunabilir `project_id` yanında immutable `project_uuid` vardır; bir proje silinip aynı ID ile yeniden oluşturulursa eski run geçmişi yeni projeye bağlanmaz.
+
+## Trace / log ölçeklenmesi
+
+LLM çağrı metadata'sı, tool sonuçları, state değişimleri ve checkpoint'ler `trace.jsonl` içine yazılır. Yüksek hacimli streaming delta'ları ayrı `stream.jsonl` dosyasında buffer edilir.
+
+Ham Loglar sayfası dosyaları her yenilemede baştan okumak yerine byte offset ile tail eder. `runs/index.jsonl` proje/run geçmişini indeksler.
+
+Her LLM çağrısında mümkün olduğunda:
 
 ```text
 agent
@@ -201,53 +234,46 @@ cached_tokens
 total_tokens
 cost_usd
 latency_s
+requested reasoning effort
 ```
 
-OpenRouter kullanılıyorsa istemci `usage.include=true` ister ve `usage.cost` alanındaki **gerçek inference maliyetini** kaydeder. Böylece fiyat listesinden sonradan yaklaşık hesap yapmak yerine OpenRouter'ın o çağrı için bildirdiği ücret kullanılır.
+kaydedilir. `summary.json` run toplamlarını tutar.
 
-Her çalışma sonunda `summary.json` ayrıca şunları tutar:
+## Web arayüzü
+
+```powershell
+.venv\Scripts\streamlit run app.py
+```
+
+Yeni projeler `Projeler` sayfasından tek prompt ile ProjectPlanner kullanılarak oluşturulabilir. Theorem Research başlatıldığında UI worker request'i yazar ve detached worker'ı başlatır. Araştırma ilerlemesi Research Control ve Ham Loglar sayfalarından izlenir.
+
+CodeExperimentAgent kullanacaksan Windows'ta Docker Desktop veya uyumlu bir Podman kurulumu gerekir. Container runtime yoksa metinsel theorem araştırması çalışabilir; generated-code experiment adımı güvenlik gereği başarısız olur.
+
+## CLI
+
+Örnek:
+
+```powershell
+.venv\Scripts\python experiments\theorem_research.py "Let P_n be the simple s-t path provenance polynomial of K_n over the min-plus tropical semiring. Improve either the O(n^3) upper bound or the Omega(n^2) lower bound." tropical-circuit 6
+```
+
+Aynı `project_id` ile tekrar çalıştırılırsa frozen problem ve kalıcı state korunur.
+
+## CI / kalite kapısı
+
+GitHub Actions şu kontrolleri çalıştırır:
 
 ```text
-started_at
-finished_at
-wall_time_s
-total_calls
-total_prompt_tokens
-total_completion_tokens
-total_reasoning_tokens
-total_cached_tokens
-total_tokens
-total_cost_usd
-cost_complete
-agents -> model/token/cost/latency toplamları
+pytest: Python 3.10
+pytest: Python 3.11
+pytest: Python 3.12
+pytest: Python 3.13
+Ruff
+mypy
 ```
 
-`wall_time_s`, yalnız LLM bekleme süresini değil literatür taraması ve deterministic tool çalışmaları dahil run'ın başından sonuna gerçek geçen süreyi ölçer.
+Container execution testleri Docker Hub/network'e bağımlı değildir; external runtime deterministik test double ile doğrulanırken production command'in network/rootfs/capability/resource izolasyon flagleri ayrıca assert edilir.
 
-Streamlit'teki **Geçmiş Kayıtlar** sekmesi her run için toplam token, ücret, süre; agent bazında model/token/ücret; ayrıca tek tek API çağrılarını gösterir.
+Son audit-hardening değişiklikleri bu matrisin tamamı yeşil olmadan `main`e alınmaz.
 
-Bir provider exact cost alanı döndürmezse `cost_complete=false` olur ve arayüzde ücret minimum bilinen toplam olarak işaretlenir.
-
-## Genel multi-agent desenleri
-
-| Desen | Ne yapar | Kullanım |
-|---|---|---|
-| `pipeline` | A → B → C zinciri | araştırma → analiz → eleştiri |
-| `research_loop` | Teorisyen → Sceptik → revizyon | kısa açık uçlu araştırma |
-| `debate` | ajanlar karşılıklı tartışır | pozisyon/argüman testi |
-| `panel` | bağımsız cevaplar + sentez | fikir çeşitliliği |
-| `TheoremResearchLab` | manager + compute + ledger + literature + audit | uzun süreli matematik/teorik CS araştırması |
-
-## Trace ve denetlenebilirlik
-
-Theorem Lab literature search ve deterministic tool sonuçlarını da trace'e kaydeder. Araştırma sonucu değerlendirirken önerilen standart:
-
-```text
-[IDEA] -> [OPEN] -> [COMPUTATION_PASS] -> [PROOF_CANDIDATE]
-                                      -> formal checker / independent audit
-                                      -> [PROVEN]
-
-Her aşamada counterexample -> [FAIL]
-```
-
-Amaç çok sayıda "güzel ispat" üretmek değil, yanlış hipotezleri mümkün olduğunca erken ve ucuz biçimde öldürmektir.
+Amaç, çok sayıda ikna edici metin üretmek değil; yanlış hipotezleri mümkün olduğunca erken öldürmek ve her güçlü iddiayı gerçekten sahip olduğu evidence seviyesinde tutmaktır.

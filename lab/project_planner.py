@@ -88,7 +88,7 @@ def _object_slice(text: str) -> str:
 
 
 def _repair_string_escapes(text: str) -> str:
-    """Repair common almost-JSON emitted by LLMs without changing field content.
+    r"""Repair common almost-JSON emitted by LLMs without changing field content.
 
     The main real-world failure here is raw LaTeX such as ``\Omega`` inside a JSON
     string. JSON only permits a small set of backslash escapes, so ``\O`` is invalid.

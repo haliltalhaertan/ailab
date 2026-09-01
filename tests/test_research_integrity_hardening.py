@@ -153,7 +153,7 @@ def test_code_experiment_finish_without_run_is_rejected(tmp_path):
     assert result.metadata["successful_run_count"] == 0
 
 
-def test_code_experiment_finish_after_failed_run_is_rejected(tmp_path):
+def test_code_experiment_finish_after_failed_run_is_rejected(tmp_path, fake_container_runtime):
     ws = GuardedExperimentWorkspace(tmp_path / "workspace", timeout_s=5)
     trace = Trace("failed-gate", out_dir=tmp_path / "runs")
     runner = CodeExperimentRunner(ws, trace, max_steps=3)
@@ -174,17 +174,20 @@ def test_code_experiment_finish_after_failed_run_is_rejected(tmp_path):
         execute_cached=lambda key, action: ws.execute(action),
     )
     trace.close()
+    assert [cmd for cmd in fake_container_runtime if len(cmd) > 1 and cmd[1] == "run"]
     assert not result.ok
     assert result.metadata["successful_run_count"] == 0
     assert result.metadata["failed_run_count"] == 1
 
 
-def test_experiment_outputs_are_never_overwritten(tmp_path):
+def test_experiment_outputs_are_never_overwritten(tmp_path, fake_container_runtime):
     ws = GuardedExperimentWorkspace(tmp_path / "workspace", timeout_s=5)
     assert ws.write_file("exp.py", "print('same')\n").ok
     first = ws.run_python("exp.py")
     second = ws.run_python("exp.py")
     assert first.ok and second.ok
+    run_commands = [cmd for cmd in fake_container_runtime if len(cmd) > 1 and cmd[1] == "run"]
+    assert len(run_commands) == 2
     assert first.metadata["stdout_file"] != second.metadata["stdout_file"]
     assert (ws.root / first.metadata["stdout_file"]).read_text(encoding="utf-8").strip() == "same"
     assert (ws.root / second.metadata["stdout_file"]).read_text(encoding="utf-8").strip() == "same"
@@ -219,8 +222,7 @@ def test_reasoning_details_survive_resume(tmp_path):
     trace.close()
     assert result == "complete answer"
     assert agent.calls == 2
-    partials = json.loads((state.root / "partial_steps.json").read_text(encoding="utf-8"))
-    assert "iter:1:proposer" not in partials
+    assert lab._partial_get("iter:1:proposer") is None
 
 
 def test_reasoning_effort_is_persisted_in_run_config(tmp_path):
@@ -236,7 +238,7 @@ def test_reasoning_effort_is_persisted_in_run_config(tmp_path):
     config = json.loads((state.root / "run_config.json").read_text(encoding="utf-8"))
     trace.close()
     assert config["agents"]["Theorist"]["reasoning_effort"] == "xhigh"
-    assert config["config_version"] == 2
+    assert config["config_version"] == 3
 
 
 def test_delete_and_recreate_project_does_not_inherit_history(tmp_path):

@@ -3,10 +3,14 @@ from __future__ import annotations
 import html
 import re
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from typing import Any
 
 import httpx
+
+
+class LiteratureSearchEmpty(RuntimeError):
+    """Retrieval completed but returned no usable candidate records."""
 
 
 @dataclass
@@ -35,20 +39,45 @@ def _norm_title(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", value.lower())
 
 
-class LiteratureClient:
-    """Small zero-key literature retriever using arXiv and Crossref.
+def _query_terms(query: str, max_terms: int = 8) -> list[str]:
+    """Turn a human/LLM query into useful arXiv terms, never one giant exact phrase."""
 
-    It is a novelty *screen*, not a proof of novelty. Final novelty claims still
-    require human/independent literature review.
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9+_.-]*", str(query or ""))
+    stop = {
+        "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "in", "is", "of", "on", "or", "the", "to", "with",
+        "improve", "known", "result", "problem", "research", "prove", "show", "find",
+    }
+    terms: list[str] = []
+    for word in words:
+        value = word.strip(".-_")
+        if len(value) < 2 or value.lower() in stop:
+            continue
+        if value.lower() not in {x.lower() for x in terms}:
+            terms.append(value)
+        if len(terms) >= max_terms:
+            break
+    return terms or ["mathematics"]
+
+
+def build_arxiv_query(query: str) -> str:
+    terms = _query_terms(query)
+    return " AND ".join(f"all:{term}" for term in terms)
+
+
+class LiteratureClient:
+    """Zero-key arXiv + Crossref novelty screening.
+
+    Empty retrieval is explicitly INCONCLUSIVE. A caller must never interpret
+    zero records as evidence that a theorem/result is new.
     """
 
     def __init__(self, timeout_s: float = 15.0):
         self.timeout_s = timeout_s
-        self.headers = {"User-Agent": "ailab-research/0.2 (literature screening)"}
+        self.headers = {"User-Agent": "ailab-research/0.3 (literature screening)"}
 
     def search_arxiv(self, query: str, limit: int = 5) -> list[Paper]:
         params = {
-            "search_query": f'all:"{query}"',
+            "search_query": build_arxiv_query(query),
             "start": 0,
             "max_results": limit,
             "sortBy": "relevance",
@@ -62,10 +91,7 @@ class LiteratureClient:
         papers: list[Paper] = []
         for entry in root.findall("a:entry", ns):
             title = _clean_text(entry.findtext("a:title", default="", namespaces=ns))
-            authors = [
-                _clean_text(a.findtext("a:name", default="", namespaces=ns))
-                for a in entry.findall("a:author", ns)
-            ]
+            authors = [_clean_text(a.findtext("a:name", default="", namespaces=ns)) for a in entry.findall("a:author", ns)]
             published = entry.findtext("a:published", default="", namespaces=ns)
             year = int(published[:4]) if published[:4].isdigit() else None
             url = entry.findtext("a:id", default="", namespaces=ns)
@@ -75,7 +101,9 @@ class LiteratureClient:
         return papers
 
     def search_crossref(self, query: str, limit: int = 5) -> list[Paper]:
-        params = {"query.bibliographic": query, "rows": limit}
+        # Crossref is more tolerant of natural-language bibliographic queries than arXiv.
+        compact = " ".join(_query_terms(query, max_terms=10))
+        params = {"query.bibliographic": compact, "rows": limit}
         with httpx.Client(timeout=self.timeout_s, headers=self.headers, follow_redirects=True) as client:
             response = client.get("https://api.crossref.org/works", params=params)
             response.raise_for_status()
@@ -120,6 +148,10 @@ class LiteratureClient:
             deduped.append(paper)
             if len(deduped) >= limit:
                 break
-        if not deduped and errors:
-            raise RuntimeError("; ".join(errors))
+        if not deduped:
+            if errors:
+                raise RuntimeError("Literature retrieval failed: " + "; ".join(errors))
+            raise LiteratureSearchEmpty(
+                "Literature retrieval returned zero records. This is inconclusive and must not be used as a novelty signal."
+            )
         return deduped

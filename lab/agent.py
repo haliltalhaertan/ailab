@@ -1,7 +1,9 @@
-from dataclasses import dataclass, field
+from __future__ import annotations
+
+from dataclasses import dataclass
 from typing import Any, Callable
 
-from lab.client import LLMClient, LLMResponse
+from lab.client import LLMClient, LLMResponse, get_default_client
 from lab.reasoning_settings import get_reasoning_effort, normalize_effort
 from lab.trace import get_active_trace
 
@@ -14,14 +16,18 @@ class Agent:
     temperature: float = 0.7
     max_tokens: int | None = None
     reasoning_effort: str | None = None
-    client: LLMClient = field(default_factory=LLMClient)
+    client: LLMClient | None = None
 
     def __post_init__(self) -> None:
-        # Explicit constructor value wins. Otherwise load the persisted per-agent setting.
         if self.reasoning_effort is None:
             self.reasoning_effort = get_reasoning_effort(self.name)
         else:
             self.reasoning_effort = normalize_effort(self.reasoning_effort)
+
+    def _client(self) -> LLMClient:
+        if self.client is None:
+            self.client = get_default_client()
+        return self.client
 
     def respond(
         self,
@@ -43,23 +49,27 @@ class Agent:
                         delta=payload,
                     )
 
-        base_kwargs = {
-            "model": self.model,
-            "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
-            "stream_callback": callback,
-        }
+        client = self._client()
         try:
-            resp = self.client.complete(
+            resp = client.complete(
                 full,
+                model=self.model,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                stream_callback=callback,
                 reasoning_effort=self.reasoning_effort,
-                **base_kwargs,
             )
         except TypeError as exc:
-            # Preserve compatibility with custom/test clients that implement the
-            # older complete(...) signature and do not accept reasoning_effort.
+            # Compatibility with injected test clients implementing the older
+            # complete(...) signature.
             text = str(exc)
             if "reasoning_effort" not in text or "unexpected keyword" not in text:
                 raise
-            resp = self.client.complete(full, **base_kwargs)
+            resp = client.complete(
+                full,
+                model=self.model,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                stream_callback=callback,
+            )
         return resp.content, resp

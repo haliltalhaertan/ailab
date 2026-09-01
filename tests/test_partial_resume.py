@@ -1,5 +1,3 @@
-import json
-
 from lab.client import LLMResponse
 from lab.partial_resume_theorem_lab import TheoremResearchLab
 from lab.research_state import ResearchState
@@ -23,6 +21,7 @@ class InterruptThenFinishAgent:
         self.model = "fake/model"
         self.temperature = 0.0
         self.max_tokens = None
+        self.reasoning_effort = None
         self.calls = 0
         self.seen_messages = []
 
@@ -58,6 +57,7 @@ class PartialThen404Agent:
         self.model = "fake/critic"
         self.temperature = 0.0
         self.max_tokens = None
+        self.reasoning_effort = None
         self.fail = fail
         self.calls = 0
         self.seen_messages = []
@@ -106,11 +106,11 @@ def test_connection_retry_reuses_partial_stream(tmp_path):
 
     assert result == "complete final answer"
     assert agent.calls == 2
-    partials = json.loads((state.root / "partial_steps.json").read_text(encoding="utf-8"))
-    assert "iter:1:proposer" not in partials
-    cache = json.loads((state.root / "step_cache.json").read_text(encoding="utf-8"))
-    assert cache["iter:1:proposer"]["status"] == "COMPLETE"
-    assert cache["iter:1:proposer"]["soft_resumed"] is True
+    assert lab._partial_get("iter:1:proposer") is None
+    cache = lab._cache_get("iter:1:proposer")
+    assert cache is not None
+    assert cache["status"] == "COMPLETE"
+    assert cache["soft_resumed"] is True
 
 
 def test_new_lab_instance_soft_resumes_nonretryable_interruption(tmp_path):
@@ -125,9 +125,9 @@ def test_new_lab_instance_soft_resumes_nonretryable_interruption(tmp_path):
     finally:
         first_lab.trace.close()
 
-    partials = json.loads((state.root / "partial_steps.json").read_text(encoding="utf-8"))
-    assert "iter:1:critic" in partials
-    assert "candidate fails if n=6" in partials["iter:1:critic"]["reasoning"]
+    partial = first_lab._partial_get("iter:1:critic")
+    assert partial is not None
+    assert "candidate fails if n=6" in partial["reasoning"]
 
     second_lab = make_lab(tmp_path, state, "second", retries=1)
     fixed = PartialThen404Agent(fail=False)
@@ -137,5 +137,4 @@ def test_new_lab_instance_soft_resumes_nonretryable_interruption(tmp_path):
     assert result.startswith("KEEP")
     assert fixed.calls == 1
     assert "possible counterexample" in fixed.seen_messages[0][0]["content"]
-    partials_after = json.loads((state.root / "partial_steps.json").read_text(encoding="utf-8"))
-    assert "iter:1:critic" not in partials_after
+    assert second_lab._partial_get("iter:1:critic") is None

@@ -51,7 +51,7 @@ def test_every_experiment_explains_when_to_use_it():
 
 
 def test_tool_execution_error_is_not_labeled_counterexample():
-    label, tone = app._tool_status(
+    label, tone = app.tool_status(
         {"ok": False, "tool": "tropical_grid", "error": "grid checker için 2 ≤ n ≤ 7 gerekli"}
     )
     assert label == "HATA"
@@ -59,7 +59,7 @@ def test_tool_execution_error_is_not_labeled_counterexample():
 
 
 def test_real_counterexample_is_labeled_counterexample():
-    label, tone = app._tool_status(
+    label, tone = app.tool_status(
         {
             "ok": False,
             "tool": "tropical_grid",

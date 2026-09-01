@@ -1,113 +1,99 @@
+from __future__ import annotations
+
 import json
 from pathlib import Path
 
 import streamlit as st
 
-RUNS_DIR = Path("runs")
+from lab.ui_model import read_run_index
 
+RUNS_DIR = Path("runs")
 st.set_page_config(page_title="Ham Loglar", layout="wide")
 st.title("Ham Loglar")
 st.caption(
-    "trace.jsonl içine yazılan tüm eventleri canlı ve filtrelenmeden izler. "
-    "Provider gizli reasoning metnini API'de vermiyorsa o içerik alınamaz; "
-    "provider'ın döndürdüğü reasoning/reasoning_details ise aynen görünür."
+    "Ana olaylar `trace.jsonl`, yüksek hacimli reasoning/content stream'i ayrı `stream.jsonl` dosyasındadır. "
+    "Sayfa her saniye dosyaları baştan okumaz; yalnız yeni byte'ları tail eder."
 )
 
 
-def runs() -> list[Path]:
-    if not RUNS_DIR.exists():
-        return []
-    return sorted(
-        [p.parent for p in RUNS_DIR.glob("*/trace.jsonl")],
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
+def indexed_runs() -> list[Path]:
+    rows = read_run_index(RUNS_DIR)
+    result = []
+    for row in rows:
+        path = Path(str(row.get("run_dir") or ""))
+        if (path / "trace.jsonl").exists():
+            result.append(path)
+    if result:
+        return result
+    # Compatibility fallback for runs created before index.jsonl.
+    return sorted([p.parent for p in RUNS_DIR.glob("*/trace.jsonl")], key=lambda p: p.stat().st_mtime, reverse=True) if RUNS_DIR.exists() else []
 
 
-def read_trace(path: Path) -> tuple[str, list[dict]]:
+def tail_file(path: Path, state_key: str) -> tuple[str, list[dict]]:
+    state = st.session_state.setdefault(state_key, {"path": "", "offset": 0, "raw": "", "events": []})
+    if state.get("path") != str(path):
+        state.clear()
+        state.update({"path": str(path), "offset": 0, "raw": "", "events": []})
     if not path.exists():
-        return "", []
-    raw = path.read_text(encoding="utf-8")
-    events = []
-    for line in raw.splitlines():
-        try:
-            value = json.loads(line)
-            events.append(value if isinstance(value, dict) else {"raw": line})
-        except json.JSONDecodeError:
-            events.append({"type": "INVALID_JSON", "raw": line})
-    return raw, events
+        return state["raw"], state["events"]
+    size = path.stat().st_size
+    if int(state.get("offset", 0)) > size:
+        state.update({"offset": 0, "raw": "", "events": []})
+    with path.open("rb") as handle:
+        handle.seek(int(state.get("offset", 0)))
+        chunk = handle.read()
+        state["offset"] = handle.tell()
+    if chunk:
+        text = chunk.decode("utf-8", errors="replace")
+        state["raw"] += text
+        for line in text.splitlines():
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                value = {"type": "INVALID_JSON", "raw": line}
+            state["events"].append(value if isinstance(value, dict) else {"raw": line})
+    return state["raw"], state["events"]
 
 
-all_runs = runs()
+all_runs = indexed_runs()
 if not all_runs:
-    st.info("Henüz run kaydı yok. Ana sayfadan araştırmayı başlat.")
+    st.info("Henüz run kaydı yok.")
     st.stop()
 
 auto_latest = st.toggle("En yeni run'ı otomatik takip et", value=True)
-show_all = st.toggle("Tüm logu göster", value=True)
-show_json_events = st.toggle("Eventleri tek tek açılabilir JSON olarak da göster", value=False)
-last_n = 200
-if not show_all:
-    last_n = int(st.number_input("Son kaç event?", 10, 10000, 200, 10))
-
-selected: Path | None = None
-if not auto_latest:
-    selected = st.selectbox("Run", all_runs, format_func=lambda p: p.name)
+selected = None if auto_latest else st.selectbox("Run", all_runs, format_func=lambda p: p.name)
+show_all = st.toggle("Tüm logu göster", value=False)
+last_n = int(st.number_input("Son kaç event?", 10, 5000, 250, 10)) if not show_all else 0
 
 
 @st.fragment(run_every=1.0)
 def live_view() -> None:
-    current = runs()
+    current = indexed_runs()
     if not current:
-        st.info("Run bekleniyor...")
         return
-
     run = current[0] if auto_latest else selected
     if run is None:
         return
-
-    trace_path = run / "trace.jsonl"
-    raw, events = read_trace(trace_path)
-    visible = events if show_all else events[-last_n:]
-    visible_raw = raw if show_all else "\n".join(
-        json.dumps(ev, ensure_ascii=False) for ev in visible
-    )
-
-    size = trace_path.stat().st_size if trace_path.exists() else 0
-    c1, c2, c3 = st.columns(3)
+    trace_raw, trace_events = tail_file(run / "trace.jsonl", "raw_trace_tail")
+    stream_raw, stream_events = tail_file(run / "stream.jsonl", "raw_stream_tail")
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Run", run.name)
-    c2.metric("Event", f"{len(events):,}")
-    c3.metric("Log boyutu", f"{size / 1024:.1f} KB")
+    c2.metric("Core event", f"{len(trace_events):,}")
+    c3.metric("Stream batch", f"{len(stream_events):,}")
+    total_size = sum(p.stat().st_size for p in (run / "trace.jsonl", run / "stream.jsonl") if p.exists())
+    c4.metric("Toplam log", f"{total_size / 1024:.1f} KB")
 
-    st.text_area(
-        "Canlı trace.jsonl — her satır tek JSON eventidir",
-        value=visible_raw,
-        height=720,
-        disabled=True,
-        key=f"raw_{run.name}_{len(events)}_{show_all}_{last_n}",
-    )
-
-    if show_json_events and visible:
-        st.subheader("Tam Event JSON'ları")
-        start = 1 if show_all else len(events) - len(visible) + 1
-        for idx, event in enumerate(visible, start):
-            label = f"#{idx} · {event.get('type', '?')}"
-            if event.get("agent"):
-                label += f" · {event['agent']}"
-            request = event.get("request", {}) or {}
-            tool = event.get("tool") or request.get("tool")
-            if tool:
-                label += f" · {tool}"
-            with st.expander(label, expanded=False):
-                st.json(event)
-
-    st.download_button(
-        "trace.jsonl indir",
-        data=raw.encode("utf-8"),
-        file_name=f"{run.name}_trace.jsonl",
-        mime="application/x-ndjson",
-        use_container_width=True,
-    )
+    t1, t2 = st.tabs(["Core trace", "Stream"])
+    with t1:
+        visible = trace_events if show_all else trace_events[-last_n:]
+        visible_raw = trace_raw if show_all else "\n".join(json.dumps(ev, ensure_ascii=False) for ev in visible)
+        st.text_area("trace.jsonl", value=visible_raw, height=620, disabled=True, key=f"trace_view_{run.name}_{len(trace_events)}_{show_all}")
+        st.download_button("trace.jsonl indir", data=trace_raw.encode("utf-8"), file_name=f"{run.name}_trace.jsonl", mime="application/x-ndjson", use_container_width=True)
+    with t2:
+        visible = stream_events if show_all else stream_events[-last_n:]
+        visible_raw = stream_raw if show_all else "\n".join(json.dumps(ev, ensure_ascii=False) for ev in visible)
+        st.text_area("stream.jsonl", value=visible_raw, height=620, disabled=True, key=f"stream_view_{run.name}_{len(stream_events)}_{show_all}")
+        st.download_button("stream.jsonl indir", data=stream_raw.encode("utf-8"), file_name=f"{run.name}_stream.jsonl", mime="application/x-ndjson", use_container_width=True)
 
 
 live_view()
