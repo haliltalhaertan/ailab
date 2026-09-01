@@ -35,7 +35,10 @@ def _tool_is_successful_computation(tool_result: ToolResult | None) -> bool:
             assertion_count = int(metadata.get("assertion_count", 0) or 0)
         except Exception:
             assertion_count = 0
-        return assertion_count > 0 and str(metadata.get("result") or "").lower() in {"sat", "unsat"}
+        return assertion_count > 0 and str(metadata.get("result") or "").lower() in {
+            "sat",
+            "unsat",
+        }
     if tool_result.tool == "script":
         return True
     return False
@@ -65,16 +68,25 @@ def choose_status(
         and tmeta.get("source_clean") is True
         and tmeta.get("axioms_verified") is True
         and tmeta.get("formal_binding_verified") is True
-        and (expected_item_id is None or str(tmeta.get("item_id") or "") == str(expected_item_id))
-        and (expected_iteration is None or int(tmeta.get("iteration", -1)) == int(expected_iteration))
+        and (
+            expected_item_id is None
+            or str(tmeta.get("item_id") or "") == str(expected_item_id)
+        )
+        and (
+            expected_iteration is None
+            or int(tmeta.get("iteration", -1)) == int(expected_iteration)
+        )
     )
     computation_ok = _tool_is_successful_computation(tool_result)
+    tropical_status = str(tmeta.get("status") or "").upper()
     deterministic_counterexample = bool(
         tool_result
         and tool_result.tool == "tropical_grid"
-        and str(tmeta.get("status") or "").upper() == "COUNTEREXAMPLE"
+        and tropical_status in {"COUNTEREXAMPLE", "STRUCTURE_MISMATCH"}
     )
-    verifier_counterexample = verifier_verdict == "FAIL" and bool(str(verifier.get("counterexample") or "").strip())
+    verifier_counterexample = verifier_verdict == "FAIL" and bool(
+        str(verifier.get("counterexample") or "").strip()
+    )
 
     metadata = {
         "formal_verified": formal_verified,
@@ -85,13 +97,22 @@ def choose_status(
         "verifier_verdict": verifier_verdict,
         "critic_verdict": critic_verdict,
         "deterministic_counterexample": deterministic_counterexample,
+        "deterministic_counterexample_type": tropical_status
+        if deterministic_counterexample
+        else "",
         "verifier_counterexample": verifier_counterexample,
         "expected_item_id": expected_item_id,
         "expected_iteration": expected_iteration,
     }
 
     if deterministic_counterexample or verifier_counterexample:
-        return GuardDecision(requested, "FAIL", "Counterexample evidence forces FAIL.", requested != "FAIL", metadata)
+        return GuardDecision(
+            requested,
+            "FAIL",
+            "Counterexample/structural refutation evidence forces FAIL.",
+            requested != "FAIL",
+            metadata,
+        )
 
     if requested == "PROVEN":
         if formal_verified and verifier_verdict == "PASS" and critic_verdict != "KILL":
@@ -112,13 +133,37 @@ def choose_status(
 
     if requested == "PROOF_CANDIDATE":
         if verifier_verdict == "PASS" and critic_verdict != "KILL":
-            return GuardDecision(requested, "PROOF_CANDIDATE", "Verifier PASS and critic did not KILL.", False, metadata)
-        return GuardDecision(requested, "OPEN", "PROOF_CANDIDATE rejected by verifier/critic guard.", True, metadata)
+            return GuardDecision(
+                requested,
+                "PROOF_CANDIDATE",
+                "Verifier PASS and critic did not KILL.",
+                False,
+                metadata,
+            )
+        return GuardDecision(
+            requested,
+            "OPEN",
+            "PROOF_CANDIDATE rejected by verifier/critic guard.",
+            True,
+            metadata,
+        )
 
     if requested == "COMPUTATION_PASS":
         if computation_ok:
-            return GuardDecision(requested, "COMPUTATION_PASS", "Successful non-empty deterministic computation evidence exists.", False, metadata)
-        return GuardDecision(requested, "OPEN", "COMPUTATION_PASS rejected: no meaningful successful deterministic tool evidence.", True, metadata)
+            return GuardDecision(
+                requested,
+                "COMPUTATION_PASS",
+                "Successful non-empty deterministic computation evidence exists.",
+                False,
+                metadata,
+            )
+        return GuardDecision(
+            requested,
+            "OPEN",
+            "COMPUTATION_PASS rejected: no meaningful successful deterministic tool evidence.",
+            True,
+            metadata,
+        )
 
     if requested == "FAIL":
         if critic_verdict == "KILL" or verifier_verdict == "FAIL":
@@ -129,9 +174,27 @@ def choose_status(
                 True,
                 metadata,
             )
-        return GuardDecision(requested, "OPEN", "FAIL rejected: insufficient failure evidence.", True, metadata)
+        return GuardDecision(
+            requested,
+            "OPEN",
+            "FAIL rejected: insufficient failure evidence.",
+            True,
+            metadata,
+        )
 
     if requested == "DROPPED":
-        return GuardDecision(requested, "DROPPED", "Manager explicitly closed the research direction.", False, metadata)
+        return GuardDecision(
+            requested,
+            "DROPPED",
+            "Manager explicitly closed the research direction.",
+            False,
+            metadata,
+        )
 
-    return GuardDecision(requested, "OPEN", "OPEN is always admissible.", requested != "OPEN", metadata)
+    return GuardDecision(
+        requested,
+        "OPEN",
+        "OPEN is always admissible.",
+        requested != "OPEN",
+        metadata,
+    )
