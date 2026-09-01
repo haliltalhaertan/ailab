@@ -1,10 +1,15 @@
 from __future__ import annotations
 
-import json
+import os
 from typing import Any
 
 from lab.agent import Agent
-from lab.code_experiment import CodeExperimentRunner, GuardedExperimentWorkspace, WorkspaceActionResult
+from lab.code_experiment import (
+    CODE_EXPERIMENT_SYSTEM_PROMPT,
+    CodeExperimentRunner,
+    GuardedExperimentWorkspace,
+    WorkspaceActionResult,
+)
 from lab.partial_resume_theorem_lab import TheoremResearchLab as PartialResumeTheoremResearchLab
 from lab.tools import ToolResult
 
@@ -36,11 +41,22 @@ class TheoremResearchLab(PartialResumeTheoremResearchLab):
         super()._save_config(problem, iterations, literature_query, checkpoint_every, augmented)
 
     def run(self, problem: str, *, code_agent: Agent | None = None, proposer: Agent, **kwargs) -> str:
+        if code_agent is None:
+            code_agent = Agent(
+                name="CodeExperimentAgent",
+                system_prompt=CODE_EXPERIMENT_SYSTEM_PROMPT,
+                model=os.environ.get("LAB_CODE_EXPERIMENT_MODEL") or proposer.model,
+                temperature=0.2,
+                max_tokens=proposer.max_tokens,
+            )
+        elif not code_agent.system_prompt.strip():
+            code_agent.system_prompt = CODE_EXPERIMENT_SYSTEM_PROMPT
         self.code_agent = code_agent
+
         # The base workflow has an older enum in the proposal JSON schema. A system-level
         # instruction makes the new experimental tool available without duplicating the
         # large, well-tested theorem loop.
-        if code_agent is not None and "code_experiment" not in proposer.system_prompt:
+        if "code_experiment" not in proposer.system_prompt:
             proposer.system_prompt = (
                 proposer.system_prompt.rstrip()
                 + "\n\nTOOL UPDATE: Hesaplamalı deney gerekiyorsa tool_request içinde "
