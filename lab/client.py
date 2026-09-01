@@ -21,6 +21,7 @@ class LLMResponse:
     cached_tokens: int = 0
     provider_reasoning: str = ""
     reasoning_details: Any = None
+    request_messages: list[dict] | None = None
 
     @property
     def total_tokens(self) -> int:
@@ -92,8 +93,6 @@ class LLMClient:
         }
         if max_tokens:
             kwargs["max_tokens"] = max_tokens
-        # OpenRouter can return exact billed cost in usage.cost. Reasoning fields,
-        # when a provider exposes them, are read back from the assistant message.
         if self.is_openrouter:
             kwargs["extra_body"] = {"usage": {"include": True}}
 
@@ -127,4 +126,5 @@ class LLMClient:
             cached_tokens=_detail_token_count(prompt_details, "cached_tokens"),
             provider_reasoning=str(provider_reasoning),
             reasoning_details=reasoning_details,
+            request_messages=[dict(m) for m in messages],
         )
