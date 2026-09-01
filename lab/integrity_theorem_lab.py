@@ -191,8 +191,8 @@ class TheoremResearchLab(CoreTheoremResearchLab):
             return result
         if name == "lean_draft":
             return self._formal_tool(dict(request or {}), step_key)
-        result = super()._tool(request, step_key)
-        return self._normalize_structural_counterexample(result)
+        tool_result = super()._tool(request, step_key)
+        return self._normalize_structural_counterexample(tool_result)
 
     def run(self, *args: Any, **kwargs: Any) -> str:
         try:
