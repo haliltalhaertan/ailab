@@ -13,7 +13,16 @@ from lab.openrouter_catalog import fetch_openrouter_models
 from lab.project_manager import ProjectInfo, ProjectManager
 from lab.prompts import ROLE_LIBRARY as THEOREM_ROLE_LIBRARY
 from lab.reasoning_settings import get_reasoning_effort
-from lab.ui_model import cost_text, event_summary, filter_models, load_run_events, runs_for_project, tool_status, usage_rows
+from lab.ui_model import (
+    cost_text,
+    event_summary,
+    filter_models,
+    load_live_run_events,
+    load_run_events,
+    runs_for_project,
+    tool_status,
+    usage_rows,
+)
 from lab.worker_launcher import build_request_from_ui, launch_theorem_worker, write_worker_request
 
 load_dotenv()
@@ -92,8 +101,15 @@ EXPERIMENTS = {
     "Teorem Araştırması": {
         "method": "theorem_lab",
         "slug": "theorem",
-        "description": "Uzun theorem run'ı ayrı worker process'te çalışır. Tarayıcı kapanabilir; durdur/devam Research Control sayfasından yapılır.",
-        "roles": ["ResearchManager", "Theorist", "AdversarialCritic", "VerificationEngineer", "LiteratureScout", "IndependentAuditor"],
+        "description": "Uzun theorem run'ı ayrı worker process'te çalışır; canlı akışı bu sayfada izleyebilirsin.",
+        "roles": [
+            "ResearchManager",
+            "Theorist",
+            "AdversarialCritic",
+            "VerificationEngineer",
+            "LiteratureScout",
+            "IndependentAuditor",
+        ],
         "optional_roles": [],
         "param_label": "Tur sayısı",
         "param_default": 6,
@@ -180,16 +196,25 @@ def build_sidebar(exp_name: str, model_ids: list[str], model_labels: dict[str, s
     prompt = st.sidebar.text_area(exp["prompt_label"], value=prompt_default, height=145)
     param = None
     if exp["param_label"]:
-        param = st.sidebar.number_input(exp["param_label"], min_value=1, max_value=100 if exp["method"] == "theorem_lab" else 10, value=exp["param_default"])
+        param = st.sidebar.number_input(
+            exp["param_label"],
+            min_value=1,
+            max_value=100 if exp["method"] == "theorem_lab" else 10,
+            value=exp["param_default"],
+        )
     extras = {"project_id": active.project_id, "project_title": active.title}
     if exp["method"] == "theorem_lab":
         extras["literature_query"] = st.sidebar.text_input(
             "Literatür arama sorgusu",
-            value=active.literature_query or os.environ.get("LAB_LITERATURE_QUERY", "tropical circuit reachability provenance lower bound"),
+            value=active.literature_query
+            or os.environ.get("LAB_LITERATURE_QUERY", "tropical circuit reachability provenance lower bound"),
         )
-        extras["checkpoint_every"] = st.sidebar.number_input("Checkpoint sıklığı (tur)", min_value=1, max_value=20, value=2)
+        extras["checkpoint_every"] = st.sidebar.number_input(
+            "Checkpoint sıklığı (tur)", min_value=1, max_value=20, value=2
+        )
 
-    agents, optional = [], {}
+    agents: list[dict] = []
+    optional: dict[str, dict] = {}
     role_counts: dict[str, int] = {}
     for i, role in enumerate(exp["roles"]):
         role_counts[role] = role_counts.get(role, 0) + 1
@@ -199,9 +224,18 @@ def build_sidebar(exp_name: str, model_ids: list[str], model_labels: dict[str, s
         if is_optional and not st.sidebar.checkbox(f"{display_role} dahil et", value=True, key=f"inc_{key}"):
             continue
         with st.sidebar.expander(display_role, expanded=exp["method"] == "theorem_lab"):
-            sys_prompt = st.text_area("Sistem promptu", ROLE_LIBRARY.get(role, ROLE_LIBRARY["Panelist"]), key=f"p_{key}", height=110)
+            sys_prompt = st.text_area(
+                "Sistem promptu",
+                ROLE_LIBRARY.get(role, ROLE_LIBRARY["Panelist"]),
+                key=f"p_{key}",
+                height=110,
+            )
             wanted_default = default_model(role)
-            query = st.text_input("Model ara", placeholder="örn. 5.3, glm, kimi, flash", key=f"search_{key}")
+            query = st.text_input(
+                "Model ara",
+                placeholder="örn. 5.3, glm, kimi, flash",
+                key=f"search_{key}",
+            )
             choices = filter_models(model_ids, model_labels, query)
             if not query and wanted_default not in choices:
                 choices.insert(0, wanted_default)
@@ -210,17 +244,35 @@ def build_sidebar(exp_name: str, model_ids: list[str], model_labels: dict[str, s
                 st.caption(f"{len(choices)} model eşleşti")
             if choices:
                 preferred = wanted_default if wanted_default in choices else choices[0]
-                model = st.selectbox("OpenRouter modeli", choices, index=choices.index(preferred), format_func=lambda mid: model_labels.get(mid, mid), key=f"m_{key}_{query.casefold()}")
+                model = st.selectbox(
+                    "OpenRouter modeli",
+                    choices,
+                    index=choices.index(preferred),
+                    format_func=lambda mid: model_labels.get(mid, mid),
+                    key=f"m_{key}_{query.casefold()}",
+                )
             else:
                 st.warning("Eşleşen model yok. Manuel model ID girebilirsin.")
                 model = wanted_default
             manual = st.text_input("Manuel model ID (opsiyonel)", key=f"manual_{key}").strip()
             if manual:
                 model = manual
-            temp = st.slider("Sıcaklık", 0.0, 1.5, ROLE_TEMPS.get(role, 0.7), 0.05, key=f"t_{key}")
+            temp = st.slider(
+                "Sıcaklık",
+                0.0,
+                1.5,
+                ROLE_TEMPS.get(role, 0.7),
+                0.05,
+                key=f"t_{key}",
+            )
             st.caption(f"Kullanılacak model: `{model}`")
-        cfg = {"role": role, "display_role": display_role, "prompt": sys_prompt, "model": model, "temp": temp}
-        (optional if is_optional else agents if False else agents)
+        cfg = {
+            "role": role,
+            "display_role": display_role,
+            "prompt": sys_prompt,
+            "model": model,
+            "temp": temp,
+        }
         if is_optional:
             optional[display_role] = cfg
         else:
@@ -229,7 +281,12 @@ def build_sidebar(exp_name: str, model_ids: list[str], model_labels: dict[str, s
 
 
 def _agent(cfg: dict) -> Agent:
-    return Agent(name=cfg["display_role"], system_prompt=cfg["prompt"], model=cfg["model"], temperature=cfg["temp"])
+    return Agent(
+        name=cfg["display_role"],
+        system_prompt=cfg["prompt"],
+        model=cfg["model"],
+        temperature=cfg["temp"],
+    )
 
 
 def _event_time(event: dict) -> str:
@@ -245,16 +302,35 @@ def render_timeline_event(target, event: dict) -> None:
     if kind == "iteration_start":
         target.markdown(f"{stamp}**Tur {event.get('iteration')}** — başladı · {event.get('next_task', '')}")
     elif kind == "iteration_end":
-        target.markdown(f"{stamp}**Tur {event.get('iteration')}** — `{event.get('item_id', '')}` · **{event.get('status', '')}**")
+        target.markdown(
+            f"{stamp}**Tur {event.get('iteration')}** — `{event.get('item_id', '')}` · **{event.get('status', '')}**"
+        )
     elif kind == "status_downgraded_by_guard":
-        target.warning(f"Evidence guard: `{event.get('requested')}` → `{event.get('granted')}` · {event.get('reason', '')}")
+        target.warning(
+            f"Evidence guard: `{event.get('requested')}` → `{event.get('granted')}` · {event.get('reason', '')}"
+        )
     elif kind == "literature_search_inconclusive":
         target.warning("Literatür taraması sonuçsuz kaldı; novelty hakkında sonuç çıkarılmadı.")
     elif kind == "literature_search":
         target.markdown(f"{stamp}**Literatür** — {len(event.get('results', []))} aday kayıt")
+    elif kind == "tool_start":
+        request = event.get("request") or {}
+        target.markdown(f"{stamp}**Araç** · `{request.get('tool', '')}` — çalışıyor")
     elif kind == "tool_result":
         label, _ = tool_status(event)
         target.markdown(f"{stamp}**Araç** · `{event.get('tool', '')}` — **{label}**")
+        with target.expander(f"{event.get('tool', 'tool')} · çıktı", expanded=False):
+            if event.get("output"):
+                st.code(str(event["output"]), language=None)
+            if event.get("error"):
+                st.error(str(event["error"]))
+            if event.get("metadata"):
+                st.json(event["metadata"])
+    elif kind == "state_change":
+        target.markdown(
+            f"{stamp}**Research State** — `{event.get('item_id', '')}` · "
+            f"`{event.get('old_status', '')}` → **{event.get('new_status', event.get('status', ''))}**"
+        )
     elif kind == "checkpoint":
         target.markdown(f"{stamp}**Checkpoint** — kaydedildi")
     elif kind == "step_reused":
@@ -268,8 +344,11 @@ def render_timeline_event(target, event: dict) -> None:
 
 
 class LiveTimelineRenderer:
+    """OpenCode-style readable agent cards; raw events stay in the log files."""
+
     REASONING_HEIGHT = 360
     ANSWER_HEIGHT = 360
+    TASK_HEIGHT = 260
 
     def __init__(self, target):
         self.target = target
@@ -288,17 +367,42 @@ class LiveTimelineRenderer:
         if key in self.cards:
             return self.cards[key]
         agent = str(event.get("agent") or "Agent")
+        model = str(event.get("model") or "")
         card = self.target.container(border=True)
         header = card.empty()
-        header.markdown(f"⏳ **{agent}** · `{event.get('model', '')}`")
-        rtab, atab = card.tabs(["🧠 Reasoning", "✍️ Cevap"])
+        header.markdown(f"⏳ **{agent}** · `{model}` — çalışıyor")
+        rtab, atab, ttab = card.tabs(["🧠 Reasoning", "✍️ Cevap", "📋 Görev"])
         with rtab:
             with st.container(height=self.REASONING_HEIGHT, border=False):
                 rslot = st.empty()
+                rslot.caption("Provider reasoning gönderirse burada canlı görünecek.")
         with atab:
             with st.container(height=self.ANSWER_HEIGHT, border=False):
                 aslot = st.empty()
-        state = {"key": key, "agent": agent, "header": header, "rslot": rslot, "aslot": aslot, "reasoning": "", "content": ""}
+                aslot.caption("Yanıt bekleniyor…")
+        with ttab:
+            with st.container(height=self.TASK_HEIGHT, border=False):
+                if event.get("system_prompt"):
+                    st.markdown("**System prompt**")
+                    st.code(str(event.get("system_prompt") or ""), language=None)
+                if event.get("prompt"):
+                    st.markdown("**User/task prompt**")
+                    st.code(str(event.get("prompt") or ""), language=None)
+                if not event.get("system_prompt") and not event.get("prompt"):
+                    st.caption("Görev ayrıntısı bu event içinde yok.")
+        footer = card.empty()
+        footer.caption(f"Adım: `{key}`")
+        state = {
+            "key": key,
+            "agent": agent,
+            "model": model,
+            "header": header,
+            "rslot": rslot,
+            "aslot": aslot,
+            "footer": footer,
+            "reasoning": "",
+            "content": "",
+        }
         self.cards[key] = state
         self.latest_by_agent[agent] = key
         return state
@@ -307,7 +411,10 @@ class LiveTimelineRenderer:
         kind = str(event.get("type") or "")
         if kind == "agent_start":
             state = self._card(event)
-            state["header"].markdown(f"⏳ **{event.get('agent')}** · `{event.get('model', '')}` — çalışıyor")
+            effort = event.get("reasoning_effort") or "provider-default"
+            state["header"].markdown(
+                f"⏳ **{event.get('agent')}** · `{event.get('model', '')}` — çalışıyor · reasoning `{effort}`"
+            )
             return
         if kind == "agent_stream":
             state = self._card(event)
@@ -327,7 +434,29 @@ class LiveTimelineRenderer:
             if event.get("output"):
                 state["content"] = str(event["output"])
                 state["aslot"].markdown(state["content"])
-            state["header"].markdown(f"✅ **{event.get('agent')}** · `{event.get('model', '')}` · {int(event.get('total_tokens', 0) or 0):,} token")
+            reasoning_tokens = int(event.get("reasoning_tokens", 0) or 0)
+            if not state["reasoning"] and reasoning_tokens:
+                state["rslot"].caption(
+                    f"Model {reasoning_tokens:,} reasoning token kullandı fakat provider reasoning metnini göstermedi."
+                )
+            cost = event.get("cost_usd")
+            cost_label = f"${float(cost):.6f}" if cost is not None else "ücret N/A"
+            state["header"].markdown(
+                f"✅ **{event.get('agent')}** · `{event.get('model', '')}` — "
+                f"{int(event.get('total_tokens', 0) or 0):,} token · {cost_label} · "
+                f"{float(event.get('latency_s', 0) or 0):.1f} sn"
+            )
+            state["footer"].caption(
+                f"input={int(event.get('prompt_tokens', 0) or 0):,} · "
+                f"output={int(event.get('completion_tokens', 0) or 0):,} · "
+                f"reasoning={reasoning_tokens:,} · cached={int(event.get('cached_tokens', 0) or 0):,} · "
+                f"adım `{state['key']}`"
+            )
+            return
+        if kind == "agent_error":
+            state = self._card(event)
+            state["header"].markdown(f"❌ **{event.get('agent')}** · `{event.get('model', '')}` — hata")
+            state["footer"].error(str(event.get("error") or "Bilinmeyen hata"))
             return
         render_timeline_event(self.target, event)
 
@@ -360,20 +489,87 @@ def render_history(active: ProjectInfo) -> None:
         renderer.handle(event)
 
 
-def execute_inline(exp_name: str, prompt: str, param, agents: list[dict], optional: dict[str, dict], extras: dict) -> dict | None:
+def _read_json(path: Path, default):
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+@st.fragment(run_every=1.0)
+def render_live_theorem(active: ProjectInfo) -> None:
+    """Keep the old live agent-card UX while the theorem engine runs in a safe worker."""
+
+    project_root = PROJECTS.project_root(active.project_id)
+    runtime = _read_json(project_root / "runtime.json", {})
+    worker = _read_json(project_root / "worker.json", {})
+    status = str(runtime.get("status") or worker.get("status") or active.status or "READY")
+
+    st.subheader("Canlı Araştırma Akışı")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Durum", status)
+    c2.metric("Tur", runtime.get("current_iteration", 0))
+    c3.metric("Tamamlanan", runtime.get("completed_iterations", 0))
+    c4.metric("Aktif adım", str(runtime.get("current_step") or "-")[:32])
+    if runtime.get("next_task"):
+        st.caption(f"Sonraki hedef: {runtime['next_task']}")
+    if runtime.get("last_error"):
+        st.error(str(runtime["last_error"]))
+
+    run_dirs = runs_for_project(RUNS_DIR, active.project_id, active.project_uuid)
+    if not run_dirs:
+        if status == "RUNNING":
+            st.info("Worker başladı. İlk trace event'i bekleniyor…")
+        return
+
+    latest = run_dirs[0]
+    st.caption(f"Run: `{latest.name}` · canlı görünüm stream logunun son 2 MB bölümünü kullanır; tam kayıt Proje Geçmişi'nde durur.")
+    events = load_live_run_events(latest)
+    renderer = LiveTimelineRenderer(st.container(border=True))
+    for event in events:
+        renderer.handle(event)
+
+    result_path = project_root / "worker_result.md"
+    if result_path.exists() and status in {"COMPLETED", "STOPPED", "PAUSED_ERROR"}:
+        with st.expander("Sonuç", expanded=status == "COMPLETED"):
+            st.markdown(result_path.read_text(encoding="utf-8"))
+
+
+def execute_inline(
+    exp_name: str,
+    prompt: str,
+    param,
+    agents: list[dict],
+    optional: dict[str, dict],
+    extras: dict,
+) -> dict | None:
     exp = EXPERIMENTS[exp_name]
     project_id = extras["project_id"]
     PROJECTS.touch(project_id, experiment=exp_name, status="RUNNING")
     trace = Trace(exp["slug"])
     info = PROJECTS.get(project_id)
-    trace.log("project_context", project_id=project_id, project_uuid=info.project_uuid, title=info.title, experiment=exp_name)
+    trace.log(
+        "project_context",
+        project_id=project_id,
+        project_uuid=info.project_uuid,
+        title=info.title,
+        experiment=exp_name,
+    )
     try:
         a_objs = [_agent(c) for c in agents]
         o_objs = {r: _agent(c) for r, c in optional.items()}
         orch = Orchestrator(trace)
         method = exp["method"]
         if method == "research_loop":
-            result = orch.research_loop(prompt, a_objs[0], a_objs[1], iterations=int(param), synthesizer=o_objs.get("Raporcu"))
+            result = orch.research_loop(
+                prompt,
+                a_objs[0],
+                a_objs[1],
+                iterations=int(param),
+                synthesizer=o_objs.get("Raporcu"),
+            )
         elif method == "debate":
             result = orch.debate(prompt, a_objs[:2], rounds=int(param), judge=o_objs.get("Hakem"))
         elif method == "pipeline":
@@ -420,7 +616,9 @@ def active_project_header(active: ProjectInfo) -> None:
     with st.container(border=True):
         c1, c2 = st.columns([4, 1])
         c1.markdown(f"### Aktif Proje · {active.title}")
-        c1.caption(f"`{active.project_id}` · durum **{active.status}** · {active.run_count} run · ${active.total_cost_usd:.4f}")
+        c1.caption(
+            f"`{active.project_id}` · durum **{active.status}** · {active.run_count} run · ${active.total_cost_usd:.4f}"
+        )
         if c2.button("Projeyi Değiştir", use_container_width=True):
             st.switch_page("pages/1_Projeler.py")
         if active.status in {"RUNNING", "PAUSED_ERROR", "STOPPED", "PAUSED"}:
@@ -465,15 +663,27 @@ def main() -> None:
     tab_run, tab_hist = st.tabs(["Deney", "Proje Geçmişi"])
     with tab_run:
         if exp_name == "Teorem Araştırması":
-            st.info("Teorem araştırması ayrı worker process'te çalışır. Bu sayfayı veya tarayıcıyı kapatabilirsin.")
-        if st.button("Deneyi Çalıştır", type="primary", disabled=not api_ok, use_container_width=True):
+            st.info(
+                "Teorem araştırması güvenli worker process'te çalışır; fakat canlı reasoning/cevap kartları yine burada görünür. "
+                "İstersen sayfayı kapatıp sonra geri dönebilirsin."
+            )
+        running = exp_name == "Teorem Araştırması" and active.status == "RUNNING"
+        button_label = "Araştırma Çalışıyor" if running else "Deneyi Çalıştır"
+        if st.button(
+            button_label,
+            type="primary",
+            disabled=not api_ok or running,
+            use_container_width=True,
+        ):
             if not prompt.strip():
                 st.warning("Lütfen bir problem/konu gir.")
             elif exp_name == "Teorem Araştırması":
                 try:
                     pid = launch_theorem(prompt, int(param), agents, extras)
                     st.session_state["worker_pid"] = pid
-                    st.switch_page("pages/3_Research_Control.py")
+                    st.session_state["live_theorem_project"] = active.project_id
+                    st.success(f"Araştırma worker'ı başlatıldı · PID {pid}")
+                    st.rerun()
                 except Exception as exc:
                     PROJECTS.touch(active.project_id, status="PAUSED_ERROR")
                     st.exception(exc)
@@ -486,6 +696,14 @@ def main() -> None:
                     if data:
                         st.success("Deney tamamlandı.")
                         st.markdown(data["result"])
+
+        show_live = exp_name == "Teorem Araştırması" and (
+            active.status == "RUNNING"
+            or st.session_state.get("live_theorem_project") == active.project_id
+        )
+        if show_live:
+            render_live_theorem(active)
+
     with tab_hist:
         render_history(active)
 
