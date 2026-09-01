@@ -1,203 +1,59 @@
-# AI Lab
+# LLM Lab
 
-Çok ajanlı, doğrulama ve kalıcı araştırma hafızası destekli LLM araştırma laboratuvarı. OpenAI-uyumlu API sağlayıcılarıyla çalışır; varsayılan kullanım OpenRouter'dır.
+Çok ajanlı, doğrulama ve kalıcı araştırma hafızası destekli LLM araştırma laboratuvarı. OpenAI uyumlu herhangi bir API sağlayıcısıyla çalışır (varsayılan: OpenRouter).
 
-Repo iki ayrı kullanım katmanı sunar:
+Bu repo iki kullanım katmanı sunar:
 
 1. **Genel multi-agent deneyleri:** pipeline, research loop, debate, panel.
-2. **Theorem Research Lab:** açık matematik/teorik CS problemleri için kalıcı ledger, literatür screening, deterministic tools, adversarial verification, stop/resume, ayrı worker process ve evidence-gated proof ladder.
+2. **Theorem Research Lab:** açık matematik/teorik CS problemleri için manager + teorisyen + adversarial critic + verifier + literature scout + bağımsız auditor; kalıcı conjecture ledger, deterministic compute araçları, literature screening, checkpoint/freeze ve durdur/devam desteği.
 
 ## Kurulum
 
 ```powershell
 cd ailab
 python -m venv .venv
-.venv\Scripts\pip install -e ".[dev]"
+.venv\Scripts\pip install -e .
 Copy-Item .env.example .env
 ```
 
-`.env` içine API anahtarını ekle:
+Test araçları için:
+
+```powershell
+.venv\Scripts\pip install -e ".[dev]"
+.venv\Scripts\pytest -q
+```
+
+`.env` içine en az bir API anahtarı koy:
 
 ```text
 OPENROUTER_API_KEY=...
 ```
 
-Web arayüzü:
+`LAB_*_MODEL` değişkenleri yalnız varsayılan model seçimleridir. Streamlit arayüzünde her agent için OpenRouter modelini ayrı seçebilirsin.
 
-```powershell
-.venv\Scripts\streamlit run app.py
-```
-
-### CodeExperiment için Docker/Podman
-
-LLM tarafından üretilen Python artık **host üzerinde çalıştırılmaz**. `CodeExperimentAgent` ile gerçek Python execution istiyorsan Docker veya Podman kurulu olmalıdır. Container engine yoksa sistem `run_python` için fail-closed davranır; kodu host Python'a düşürmez.
-
-Varsayılan image:
+## Mimari
 
 ```text
-python:3.12-slim
+Streamlit UI / Research Control
+            |
+            v
+     Detached Worker
+            |
+            v
+   TheoremResearchLab
+      /    |     \
+StepStore RunController ToolRegistry
+   |          |          |
+ SQLite    lock/stop   Python/Z3/Lean
+            |
+      ResearchState
+            |
+       Trace / Audit
 ```
 
-İstersen Code Experiment Agent ayar sayfasından image/engine/resource limitlerini değiştirebilirsin.
+Üretim theorem workflow'u yalnız `lab/theorem_engine.py` içinde bulunur. Eski theorem-lab modülleri yalnız compatibility shim'dir; araştırma mantığının ikinci kopyasını taşımaz.
 
-## Güncel mimari
-
-```text
-Streamlit UI
-   |
-   +-- Project Hub / ProjectPlanner
-   |
-   +-- theorem start/resume
-          |
-          v
-   detached lab.worker process
-          |
-          v
-   TheoremResearchLab (tek production engine)
-      |
-      +-- RunController     run.lock, stop, runtime cursor, retry policy
-      +-- StepStore         SQLite step cache, partial resume, iteration snapshots
-      +-- ResearchState     insan-okunabilir state.json + theorem graph + checkpoints
-      +-- ToolRegistry      tek tool şeması + dispatch kaynağı
-      +-- LiteratureClient  arXiv + Crossref screening
-      +-- CodeExperiment    container-only generated Python
-      +-- Z3 / Lean / TropicalGrid / reviewed ScriptTool
-      |
-      +-- Trace
-           +-- trace.jsonl   core events
-           +-- stream.jsonl  buffered reasoning/content stream
-           +-- summary.json
-
-runs/index.jsonl            run ↔ project index
-```
-
-Eski `theorem_lab.py`, `resumable_theorem_lab.py`, `partial_resume_theorem_lab.py`, `code_experiment_theorem_lab.py` ve `hardened_theorem_lab.py` artık ikinci bir workflow implementasyonu içermez; yalnız geriye-dönük import uyumluluğu için ince shim'lerdir. Üretim akışı `lab/theorem_engine.py` içindedir.
-
-## Projeler ve ProjectPlanner
-
-Araştırmalar project-centric yönetilir. **Projeler** sayfasında yeni proje oluşturabilir, arşivleyebilir, klonlayabilir, açabilir ve durdurulmuş projeye devam edebilirsin.
-
-Yeni proje oluştururken yalnız doğal dil promptu vermen yeterlidir. `ProjectPlanner` şu alanlar için düzenlenebilir taslak üretir:
-
-- proje adı ve immutable olmayan insan-okunur `project_id`,
-- kısa açıklama,
-- deney türü,
-- ayrıntılı frozen problem,
-- literatür sorgusu,
-- etiketler.
-
-Her proje ayrıca immutable bir `project_uuid` alır. Aynı `project_id` silinip daha sonra yeniden kullanılırsa eski run geçmişi yeni projeye otomatik bağlanmaz.
-
-## Teorem araştırması ajanları
-
-Varsayılan roller:
-
-- `ResearchManager`
-- `Theorist`
-- `AdversarialCritic`
-- `VerificationEngineer`
-- `LiteratureScout`
-- `IndependentAuditor`
-- gerektiğinde `CodeExperimentAgent`
-
-Her rol için ayrı model ve reasoning effort seçilebilir. Run sırasında kullanılan model/system prompt/temperature/reasoning effort `run_config.json` içine kaydedilir.
-
-## Proof ladder: status LLM kararı değildir
-
-Bir veya yüz LLM'in “doğru” demesi bir iddiayı `PROVEN` yapmaz. Manager yalnız **status isteği** yapar; gerçek status kod tarafındaki evidence guard tarafından belirlenir.
-
-```text
-OPEN
-  |
-  +-- successful deterministic computation ----------> COMPUTATION_PASS
-  |
-  +-- Verifier PASS + Critic != KILL ----------------> PROOF_CANDIDATE
-  |
-  +-- successful Lean checker
-      + Verifier PASS
-      + Critic != KILL ------------------------------> PROVEN
-
-concrete counterexample --------------------------------> FAIL
-research direction intentionally abandoned --------------> DROPPED
-```
-
-Kurallar:
-
-- `COMPUTATION_PASS`: aynı aday için gerçekten başarılı deterministic computation gerekir. Manager metni yeterli değildir.
-- `PROOF_CANDIDATE`: verifier `PASS` vermeli ve critic `KILL` etmemelidir.
-- `PROVEN`: yalnız başarılı `LeanTool` sonucu `formal_verified=true` üretebilir; ayrıca verifier PASS ve critic not-KILL gerekir.
-- `FAIL`: somut counterexample evidence ile kullanılır. Sadece “bu fikir kötü” LLM görüşü matematiksel FAIL yerine `DROPPED` olabilir.
-- Guard bir status isteğini düşürürse trace'e `status_downgraded_by_guard` olayı yazılır.
-
-## Formal doğrulama yolu
-
-Formal adaylar şu akışla ilerler:
-
-```text
-Theorist / Verifier
-   |
-   +-- lean_draft
-   v
-formal/candidates/<name>.lean
-   |
-   +-- lean
-   v
-LeanTool / lake env lean
-   |
-   +-- returncode == 0
-   v
-formal_verified=true
-```
-
-Generated Lean host execution varsayılan olarak **kapalıdır**. Trusted/containerized Lean kurulumu yaptıysan açıkça:
-
-```text
-LAB_ALLOW_HOST_LEAN=1
-```
-
-verebilirsin. `LeanTool`, `lake` varsa `lake env lean` kullanır; böylece mathlib/lake projeleri çıplak `lean file.lean` yaklaşımına göre daha doğru çözülür. Generated Lean için obvious IO/process/metaprogramming özellikleri ayrıca reddedilir, fakat en güçlü kurulum formal checker'ı da container içinde çalıştırmaktır.
-
-## CodeExperiment güvenlik modeli
-
-İki Python mekanizmasını karıştırma:
-
-### ScriptTool
-
-`research_tools/` altındaki **insan tarafından review edilmiş** `.py` scriptlerini çalıştırır. LLM bu dizine keyfi script yazmaz.
-
-### CodeExperimentAgent
-
-LLM kendi proje workspace'ine deney scripti yazabilir/patch edebilir/okuyabilir. Fakat execution güvenlik sınırı AST filtresi değildir. Generated Python yalnız disposable container içinde çalışır:
-
-```text
---network=none
---read-only
---cap-drop=ALL
---security-opt=no-new-privileges
---memory=...
---pids-limit=...
---cpus=...
---tmpfs /tmp:rw,noexec,nosuid
---mount <project workspace>:/workspace
-```
-
-Host home dizini, repo kökü, `.env` veya Docker socket container'a mount edilmez. Container'a API key aktarılmaz. Container engine yoksa execution reddedilir.
-
-AST filtresi yalnız **defense in depth** katmanıdır. `open`, `eval`, `exec`, `__import__` vb. blocked isimler alias ataması dahil her load noktasında reddedilir; fakat Python AST filtresi tek başına sandbox olarak kabul edilmez.
-
-`CodeExperimentAgent` `finish` diyebilmek için en az bir gerçek başarılı `run_python` kanıtına sahip olmalı ve son Python run'ı başarılı olmalıdır. Evidence manifest script/stdout/stderr hashleri ve immutable output dosyalarını içerir. Finite computation hiçbir zaman tek başına proof değildir.
-
-## Stop / resume ve worker process
-
-Uzun theorem run'ları Streamlit render thread'inde çalışmaz. UI yalnız worker process başlatır ve durum dosyalarını/trace'i izler. Bunun sonucu:
-
-- tarayıcı sekmesini kapatabilirsin;
-- Streamlit rerun araştırmayı öldürmez;
-- aynı sayfadan/başka sekmeden `DURDUR` kullanılabilir;
-- farklı projeler ayrı worker process'lerde paralel çalışabilir;
-- aynı proje için `ProjectRunLock` ikinci eşzamanlı run'ı reddeder.
-
-Kalıcı dosyalar:
+Başlıca runtime dosyaları:
 
 ```text
 research_state/<project_id>/
@@ -205,93 +61,172 @@ research_state/<project_id>/
   problem_frozen.json
   state.json
   theorem_graph.json
-  research_steps.sqlite3
   runtime.json
   run_config.json
-  worker.json
-  worker_request.json
-  worker_result.md
+  research_steps.sqlite3
+  run.lock                  # yalnız aktif run sırasında
   checkpoints/
   workspace/
+
+runs/
+  index.jsonl
+  <run_id>/
+    trace.jsonl
+    stream.jsonl
+    summary.json
 ```
 
-`StepStore` SQLite içinde completed step cache, partial response ve frozen iteration snapshot tutar. Eski `step_cache.json` / `partial_steps.json` bulunursa bir kez migrate edilir.
+## Theorem Research Lab
 
-### Resume bütünlüğü
+Amaç LLM'leri "ispat üreten chatbot" olarak değil, kontrollü ve denetlenebilir bir araştırma sistemi içinde kullanmaktır.
 
-Her iterasyon başında ledger context ve ledger revision **dondurulur**. Resume aynı iteration snapshot'ını kullanır. Proposal ayrıca content hash ile item'a bağlanır. Resume sonrası yeniden üretilmiş bir proposal mevcut ledger item'ıyla eşleşmiyorsa sistem evidence'ı yanlış claim'e yapıştırmak yerine `PAUSED_ERROR` ile durur.
+```text
+                    Research Manager
+                          |
+          +---------------+---------------+
+          |               |               |
+       Theorist       Adversarial       Verifier
+                          Critic            |
+          |               |        deterministic tools
+          +---------------+---------------+
+                          |
+                    Evidence Guard
+                          |
+                 Research State / Graph
+                          |
+                  Literature Scout
+                          |
+                 Independent Auditor
+```
 
-Tamamlanmış LLM step fingerprint'inde model adı bilinçli olarak yoktur. Resume ekranında bozuk/deprecated model slug'ını değiştirirsen yalnız incomplete çalışma yeni modele geçer; bitmiş adımlar yeniden ücretlendirilmez. System prompt, temperature veya reasoning effort değiştirmek ise davranışı gerçekten değiştirdiği için ilgili fingerprint'i değiştirebilir.
+### Kanıt merdiveni
 
-Partial resume sırasında provider-visible `reasoning_details` model değişmemişse structured continuation olarak korunur. Model değiştiyse provider-specific structured state yeni modele gönderilmez; yalnız görünür reasoning/content soft context olarak kullanılır.
+Bir LLM'nin veya birden fazla LLM'nin "doğru görünüyor" demesi bir iddiayı `[PROVEN]` yapmaz.
 
-## Research ledger
+Durumlar:
 
-`state.json` insan tarafından okunabilir bilimsel ledger'dır. High-frequency cache/partial data SQLite'a taşınmıştır.
+```text
+OPEN
+COMPUTATION_PASS
+PROOF_CANDIDATE
+PROVEN
+FAIL
+KNOWN
+BARRIER
+DROPPED
+```
 
-Prompt context kronolojik “son 20 kayıt” değildir. Sistem:
+Merkezi evidence guard LLM'nin istediği status ile gerçekten mevcut evidence'ı karşılaştırır:
 
-- bütün `FAIL`/`DROPPED` conjecture'ları kompakt tombstone olarak **daima** taşır;
-- bütün aktif conjecture'ları taşır;
-- known/audit/counterexample kayıtlarında yalnız yakın geçmişi pencereye alır.
+- `COMPUTATION_PASS`: deterministic başarılı compute evidence gerekir.
+- `PROOF_CANDIDATE`: verifier/critic değerlendirmesi gerekir; formal ispat değildir.
+- `PROVEN`: başarılı formal checker sonucu ve `formal_verified=true` metadata gerekir.
+- `FAIL`: deterministic counterexample veya açık counterexample evidence gerekir.
 
-Böylece yüzlerce tur sonra eski bir ölü fikir sessizce prompt penceresinden kaybolmaz.
+Manager daha güçlü bir status ister fakat evidence yoksa durum otomatik olarak daha düşük güven seviyesine indirilir ve trace'e kaydedilir.
 
-## Structured output
+### Formal doğrulama yolu
 
-Theorem workflow için JSON parse hataları artık sessizce `OPEN/REVISE` default'una dönüşmez. Ortak `lab/json_io.py`:
+LLM formal bir aday üretmek isterse `lean_draft` aracıyla proje içindeki `formal/candidates/` alanına Lean dosyası yazar. Daha sonra `LeanTool` dosyayı gerçek Lean checker ile çalıştırır. Yalnız checker başarıyla tamamlanırsa `formal_verified=true` üretilebilir ve `PROVEN` gate'i açılabilir.
 
-1. code fence/object çıkarımı yapar;
-2. raw LaTeX backslash, control character ve trailing comma gibi yaygın almost-JSON hatalarını deterministic olarak düzeltir;
-3. yine parse olmazsa aynı ajanla **bir kez formatting-only repair çağrısı** yapar;
-4. repair de başarısızsa araştırmayı fail-closed `PAUSED_ERROR` durumuna alır.
+Lean kurulu değilse formal doğrulama başarısız/inconclusive kalır; LLM görüşü bunun yerine geçmez.
 
-Belirsiz structured output bilimsel karar olarak kabul edilmez.
+## Durdur / devam bütünlüğü
+
+Theorem run'ı Streamlit render thread'inde değil ayrı worker process'te çalışır. Tarayıcı kapansa bile worker yaşamaya devam edebilir. Research Control sayfasındaki STOP isteği `stop.flag` üzerinden worker'a iletilir.
+
+Tamamlanan step'ler SQLite `StepStore` içinde content fingerprint ile saklanır. Yarım provider-visible çalışma `reasoning`, `reasoning_details` ve `content` ile birlikte partial kayıt olarak tutulur.
+
+Her iteration başında ledger context, ledger revision ve next task dondurulur. Resume sırasında proposer'ın ürettiği claim dondurulmuş proposal ile uyuşmazsa yeni evidence eski conjecture'a sessizce bağlanmaz; run fail-closed biçimde `PAUSED_ERROR` durumuna geçer.
+
+Bu gerçek provider KV-cache resume değildir. Provider'ın gizli inference state'i API tarafından verilmediğinde yalnız provider-visible reasoning/content güvenli biçimde yeniden kullanılabilir.
+
+## CodeExperimentAgent güvenlik modeli
+
+LLM tarafından üretilen Python **host Python process'inde çalıştırılmaz**. CodeExperimentAgent deney çalıştırabilmek için Docker veya Podman ister.
+
+Container şu güvenlik sınırlarıyla başlatılır:
+
+```text
+network = none
+root filesystem = read-only
+capabilities = drop ALL
+no-new-privileges
+RAM limit
+PID limit
+CPU limit
+timeout
+stdout/stderr byte limit
+yalnız project workspace writable bind mount
+```
+
+Container runtime bulunamazsa sistem host execution'a düşmez; deney **fail closed** olur.
+
+AST doğrulaması ayrıca defense-in-depth sağlar: `open`, `eval`, `exec`, `__import__`, `os`, `subprocess`, `socket` gibi doğrudan veya alias edilmiş riskli yollar reddedilir. Asıl security boundary AST değil container'dır.
+
+Agent'ın workspace araçları:
+
+```text
+write_file
+read_file
+list_files
+patch_file
+run_python
+finish
+```
+
+`finish` ancak en az bir gerçek başarılı `run_python` evidence'ı varsa kabul edilir ve son run başarısızsa başarılı deney diye kapanamaz. Evidence manifest script/stdout/stderr SHA-256 hashlerini, return code'u, süreyi ve çalışma kimliğini taşır.
+
+Hesaplamalı test ne kadar geniş olursa olsun otomatik `[PROVEN]` değildir; evidence seviyesi `COMPUTATION_ONLY` olarak tutulur.
 
 ## Literature / novelty screening
 
-`LiteratureClient` arXiv ve Crossref kullanır. arXiv sorgusu artık tüm cümleyi `all:"..."` exact phrase haline getirmez; problem/query içinden kompakt terimler çıkarıp `AND` ile alan sorgusu üretir.
+`LiteratureClient` arXiv ve Crossref üzerinde aday yayınları tarar. Uzun bir sorgu tek bir exact quoted phrase'e dönüştürülmez; birden fazla daha sağlam sorgu varyantı denenir.
 
-Sıfır kayıt:
+Arama sonucu sıfırsa sistem bunu:
 
 ```text
-NOVEL değildir
-INCONCLUSIVE'dur
+INCONCLUSIVE
 ```
 
-Trace'e `literature_search_inconclusive` yazılır ve LiteratureScout'a açıkça “boş sonuç novelty kanıtı değildir” denir. Screening yine kesin novelty ispatı değildir; yayın öncesi bağımsız literatür audit'i gerekir.
+olarak yorumlar. "Sonuç bulamadım" hiçbir zaman "bu sonuç yenidir" kanıtı değildir. Kritik novelty iddiasında bağımsız literatür audit'i gerekir.
+
+## Structured output
+
+Theorem pipeline'daki yapılandırılmış LLM çıktıları fail-closed parse edilir:
+
+1. JSON doğrudan parse edilir.
+2. Yaygın bozuk JSON/LaTeX escape hataları deterministic repair ile denenir.
+3. Gerekirse yalnız formatı düzeltmek için tek bir LLM repair çağrısı yapılır.
+4. Hâlâ parse edilemiyorsa sessiz default kullanılmaz; run `PAUSED_ERROR` olur.
 
 ## Deterministic tools
 
-`ToolRegistry` tool şeması ve dispatch için tek kaynaktır. Mevcut araçlar:
+`ToolRegistry` theorem promptuna sunulan tool şemalarıyla gerçek dispatch'in tek kaynağıdır.
 
-- `script`: review edilmiş `research_tools/*.py`;
-- `z3`: SMT-LIB; solver timeout varsayılan 30 saniye;
-- `tropical_grid`: küçük-n finite exact grid / counterexample search;
-- `lean_draft`: `formal/candidates/*.lean` oluşturur;
-- `lean`: formal candidate'ı kontrol eder;
-- `code_experiment`: container içinde LLM-authored Python experiment loop.
+- **ScriptTool:** yalnız review edilmiş `research_tools/` scriptlerini çalıştırır.
+- **Z3Tool:** SMT-LIB doğrulaması; solver timeout'u vardır.
+- **TropicalGridTool:** küçük-n exhaustive counterexample araması; PASS genel ispat değildir.
+- **LeanTool:** formal checker.
+- **CodeExperimentAgent:** container içindeki yeni deney kodu döngüsü.
 
-Tool listesi prompt içine runtime string ekleyerek Agent nesnesini mutasyona uğratmaz; proposal schema `ToolRegistry` üzerinden üretilir.
+## Araştırma state'i ve eşzamanlılık
 
-## Trace, token, ücret ve performans
+Aynı proje üzerinde aynı anda iki theorem worker çalıştırılamaz. `run.lock` atomik proje kilididir; ikinci process lock alamazsa state/cache'e yazmadan durur.
 
-Her run collision-proof UUID'li klasör alır:
+Run klasörleri mikro-saniye + UUID tabanlı benzersiz `run_id` kullanır. İnsan tarafından okunabilir `project_id` yanında immutable `project_uuid` vardır; bir proje silinip aynı ID ile yeniden oluşturulursa eski run geçmişi yeni projeye bağlanmaz.
 
-```text
-runs/<timestamp_microseconds>_<uuid>_<experiment>/
-  trace.jsonl
-  stream.jsonl
-  summary.json
-```
+## Trace / log ölçeklenmesi
 
-`trace.jsonl` core olayları ve tamamlanmış LLM çağrılarını içerir. Token-level stream core trace'e yazılmaz; reasoning/content delta'ları `stream.jsonl` içinde yaklaşık 200 ms / 4 KB batch'ler halinde tutulur. Ham Loglar sayfası her saniye dosyayı baştan okumak yerine byte offset ile tail-read yapar.
+LLM çağrı metadata'sı, tool sonuçları, state değişimleri ve checkpoint'ler `trace.jsonl` içine yazılır. Yüksek hacimli streaming delta'ları ayrı `stream.jsonl` dosyasında buffer edilir.
 
-`runs/index.jsonl` proje ↔ run eşlemesini indeksler; UI geçmiş listelemek için her run'ın trace dosyasını tekrar tekrar taramak zorunda değildir.
+Ham Loglar sayfası dosyaları her yenilemede baştan okumak yerine byte offset ile tail eder. `runs/index.jsonl` proje/run geçmişini indeksler.
 
-OpenRouter `usage.cost` sağlıyorsa gerçek çağrı maliyeti kaydedilir. Kayıtlar arasında:
+Her LLM çağrısında mümkün olduğunda:
 
 ```text
+agent
+model
 prompt_tokens
 completion_tokens
 reasoning_tokens
@@ -299,47 +234,44 @@ cached_tokens
 total_tokens
 cost_usd
 latency_s
-wall_time_s
+requested reasoning effort
 ```
 
-bulunur.
+kaydedilir. `summary.json` run toplamlarını tutar.
 
-## Retry politikası
+## Web arayüzü
 
-OpenAI SDK'nın gizli retry katmanı kapalıdır:
+```powershell
+.venv\Scripts\streamlit run app.py
+```
+
+Yeni projeler `Projeler` sayfasından tek prompt ile ProjectPlanner kullanılarak oluşturulabilir. Theorem Research başlatıldığında UI worker request'i yazar ve detached worker'ı başlatır. Araştırma ilerlemesi Research Control ve Ham Loglar sayfalarından izlenir.
+
+CodeExperimentAgent kullanacaksan Windows'ta Docker Desktop veya uyumlu bir Podman kurulumu gerekir. Container runtime yoksa metinsel theorem araştırması çalışabilir; generated-code experiment adımı güvenlik gereği başarısız olur.
+
+## CLI
+
+Örnek:
+
+```powershell
+.venv\Scripts\python experiments\theorem_research.py "Let P_n be the simple s-t path provenance polynomial of K_n over the min-plus tropical semiring. Improve either the O(n^3) upper bound or the Omega(n^2) lower bound." tropical-circuit 6
+```
+
+Aynı `project_id` ile tekrar çalıştırılırsa frozen problem ve kalıcı state korunur.
+
+## CI / kalite kapısı
+
+GitHub Actions şu kontrolleri çalıştırır:
 
 ```text
-max_retries=0
+pytest: Python 3.10
+pytest: Python 3.11
+pytest: Python 3.12
+pytest: Python 3.13
+Ruff
+mypy
 ```
 
-ve explicit request timeout kullanılır. Retry/backoff yalnız research RunController/TheoremResearchLab katmanında yapılır ve her deneme trace'e girer. Böylece tek adımın görünmez SDK retry'ları nedeniyle beklenmedik şekilde katlanması engellenir.
+Container execution testleri Docker Hub/network'e bağımlı değildir; external runtime deterministik test double ile doğrulanırken production command'in network/rootfs/capability/resource izolasyon flagleri ayrıca assert edilir.
 
-## CI ve kalite
-
-GitHub Actions bütün branch push'larında ve PR'larda çalışır:
-
-- pytest: Python 3.10, 3.11, 3.12, 3.13;
-- Ruff;
-- mypy.
-
-`pandas` artık doğrudan dependency'dir. Runtime-local `reasoning_settings.json`, `code_experiment_settings.json`, `runs/` ve `research_state/` git'e alınmaz.
-
-## Güven sınırlarının kısa özeti
-
-AI Lab şu iddiaları **yapar**:
-
-- LLM opinion tek başına proof status veremez.
-- Generated Python host üzerinde çalıştırılmaz.
-- Generated Python container içinde network'süz/resource-limited çalışır.
-- Tamamlanmış step'ler resume'da korunur.
-- Claim/evidence resume uyuşmazlığı fail-closed olur.
-- Bozuk JSON bilimsel karar olarak sessizce kabul edilmez.
-- Boş literature search novelty sinyali değildir.
-
-Şu iddiaları **yapmaz**:
-
-- finite testing genel matematiksel proof'tur;
-- literature screening kesin novelty proof'tur;
-- LLM reasoning güvenilir formal proof'tur;
-- AST filtre tek başına sandbox'tır;
-- Lean checker'ın kendisi theorem statement'ın araştırma niyetiyle semantik olarak aynı olduğunu otomatik garanti eder. Bu bağ hâlâ audit edilebilir metadata + verifier/critic katmanıyla kontrol edilir.
+Amaç, çok sayıda ikna edici metin üretmek değil; yanlış hipotezleri mümkün olduğunca erken öldürmek ve her güçlü iddiayı gerçekten sahip olduğu evidence seviyesinde tutmaktır.
