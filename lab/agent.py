@@ -49,18 +49,15 @@ class Agent:
                         delta=payload,
                     )
 
-        base_kwargs = {
-            "model": self.model,
-            "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
-            "stream_callback": callback,
-        }
         client = self._client()
         try:
             resp = client.complete(
                 full,
+                model=self.model,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                stream_callback=callback,
                 reasoning_effort=self.reasoning_effort,
-                **base_kwargs,
             )
         except TypeError as exc:
             # Compatibility with injected test clients implementing the older
@@ -68,5 +65,11 @@ class Agent:
             text = str(exc)
             if "reasoning_effort" not in text or "unexpected keyword" not in text:
                 raise
-            resp = client.complete(full, **base_kwargs)
+            resp = client.complete(
+                full,
+                model=self.model,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                stream_callback=callback,
+            )
         return resp.content, resp
