@@ -1,97 +1,82 @@
 from __future__ import annotations
 
 import json
-import os
 import re
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import asdict, dataclass
+from typing import Any, Callable
 
 from lab.agent import Agent
-from lab.client import LLMClient, LLMResponse
-from lab.trace import Trace
+from lab.client import LLMResponse
+from lab.trace import get_active_trace
 
 
-PROJECT_PLANNER_SYSTEM_PROMPT = """You are ProjectPlanner for an autonomous mathematical/scientific research lab.
-Your job is NOT to solve the user's research problem. Convert the user's short research idea into a clean project configuration for the research agents.
-
-Rules:
-- Return ONLY one JSON object. No markdown fences and no prose before/after it.
-- Preserve the user's actual intent; do not replace it with a different problem.
-- Make the initial_problem detailed enough that a ResearchManager can act on it without asking the user basic setup questions.
-- Do not claim that a problem is open, novel, proven, impossible, best-known, or state-of-the-art unless that claim was explicitly supplied by the user. Phrase uncertain literature status as something to verify.
-- literature_query should be a concise English scholarly search query, not a conclusion.
-- Use 'Teorem Araştırması' for proof/theorem/open-math/theoretical-CS style work; otherwise select the closest supported experiment type.
-- project_id must be lowercase ASCII kebab-case and reasonably short.
-- tags must be a JSON array of short strings.
-- description should be one or two compact sentences in the user's language.
-- initial_problem should preserve important equations, bounds, constraints, verification requirements, stop rules, and definitions from the user's prompt.
-
-JSON schema:
-{
-  "title": "human readable project title",
-  "project_id": "lowercase-kebab-case",
-  "description": "short description",
-  "experiment": "Teorem Araştırması | Araştırma Döngüsü | Tartışma | Zincir | Panel",
-  "initial_problem": "detailed frozen starting problem for the research team",
-  "literature_query": "English scholarly search query",
-  "tags": ["tag1", "tag2"]
-}
-"""
-
-SUPPORTED_EXPERIMENTS = {
+EXPERIMENTS = (
     "Teorem Araştırması",
     "Araştırma Döngüsü",
     "Tartışma",
     "Zincir",
     "Panel",
+)
+
+PROJECT_PLANNER_SYSTEM_PROMPT = """Sen AI Lab için ProjectPlanner ajanısın.
+Kullanıcının tek bir doğal dil promptundan düzenlenebilir bir araştırma projesi taslağı üret.
+
+Amaç:
+- Kullanıcının gerçek niyetini koru; istemediği yeni hedefler uydurma.
+- Problem araştırma için yeterince açık, sınırları belli ve yürütülebilir olsun.
+- Kullanıcı matematik/teorik CS açık problemi araştırmak istiyorsa Teorem Araştırması seç.
+- Hızlı fikir-eleştiri keşfi ise Araştırma Döngüsü; iki karşıt görüş ise Tartışma;
+  tek yönlü iş akışı ise Zincir; bağımsız çoklu görüş ise Panel seç.
+- Bir problemin literatürde açık olduğunu doğrulamadan 'çözülmemiştir' diye ilan etme.
+  Gerekirse problem metnine 'literatür taramasıyla doğrulanacak' yaz.
+- literature_query kısa, arama motoruna uygun İngilizce sorgu olsun.
+- tags 3-8 kısa etiketten oluşsun.
+- project_id yalnızca küçük ASCII harf, rakam ve tire içersin.
+- JSON stringlerinde LaTeX kullanman gerekirse backslash karakterlerini JSON standardına göre çift kaçır
+  (ör. \\Omega metinde \\\\Omega olarak bulunmalı). Daha güvenlisi, proje metadata alanlarında LaTeX
+  komutları yerine düz Unicode/metin kullanmaktır.
+
+SADECE geçerli JSON döndür. Markdown/code fence/açıklama kullanma.
+Şema:
+{
+  "title": "kısa proje adı",
+  "project_id": "ascii-slug",
+  "description": "1-3 cümle kısa açıklama",
+  "experiment": "Teorem Araştırması | Araştırma Döngüsü | Tartışma | Zincir | Panel",
+  "problem": "ajanlara verilecek ayrıntılı başlangıç problemi",
+  "literature_query": "English search query",
+  "tags": ["tag1", "tag2"]
 }
+"""
 
 
-@dataclass
+@dataclass(frozen=True)
 class ProjectDraft:
     title: str
     project_id: str
     description: str
     experiment: str
-    initial_problem: str
+    problem: str
     literature_query: str
     tags: list[str]
 
     def as_dict(self) -> dict[str, Any]:
-        return {
-            "title": self.title,
-            "project_id": self.project_id,
-            "description": self.description,
-            "experiment": self.experiment,
-            "initial_problem": self.initial_problem,
-            "literature_query": self.literature_query,
-            "tags": self.tags,
-        }
+        return asdict(self)
 
 
-def _slugify(value: str) -> str:
-    raw = value.casefold()
-    translit = str.maketrans(
-        {
-            "ç": "c",
-            "ğ": "g",
-            "ı": "i",
-            "ö": "o",
-            "ş": "s",
-            "ü": "u",
-        }
-    )
-    raw = raw.translate(translit)
-    raw = re.sub(r"[^a-z0-9]+", "-", raw)
-    raw = re.sub(r"-+", "-", raw).strip("-")
-    return raw[:64].strip("-") or "research-project"
+def _slug(value: str) -> str:
+    value = value.strip().lower()
+    value = value.replace("ı", "i").replace("ğ", "g").replace("ü", "u")
+    value = value.replace("ş", "s").replace("ö", "o").replace("ç", "c")
+    value = re.sub(r"[^a-z0-9]+", "-", value).strip("-")
+    return value[:60] or "research-project"
 
 
-def _strip_fence(text: str) -> str:
-    raw = (text or "").strip()
+def _strip_code_fence(text: str) -> str:
+    raw = text.strip().lstrip("\ufeff")
     if raw.startswith("```"):
-        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
-        raw = re.sub(r"\s*```$", "", raw)
+        raw = re.sub(r"^```(?:json|javascript|js)?\s*", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\s*```\s*$", "", raw)
     return raw.strip()
 
 
@@ -139,132 +124,189 @@ def _repair_string_escapes(text: str) -> str:
                 continue
             nxt = text[i + 1]
             if nxt in simple_escapes:
-                out.append(ch)
-                out.append(nxt)
+                out.extend(("\\", nxt))
                 i += 2
                 continue
             if nxt == "u" and i + 5 < len(text) and all(c in hex_digits for c in text[i + 2 : i + 6]):
                 out.append(text[i : i + 6])
                 i += 6
                 continue
+            # Invalid JSON escape (for example \Omega, \(, \Theta, \underbrace).
+            # Emit a JSON-escaped literal backslash and process the next char normally.
             out.append("\\\\")
             i += 1
             continue
 
-        if ch == "\n":
-            out.append("\\n")
-        elif ch == "\r":
-            out.append("\\r")
-        elif ch == "\t":
-            out.append("\\t")
-        elif ord(ch) < 0x20:
-            out.append(f"\\u{ord(ch):04x}")
+        code = ord(ch)
+        if code < 0x20:
+            controls = {"\n": "\\n", "\r": "\\r", "\t": "\\t", "\b": "\\b", "\f": "\\f"}
+            out.append(controls.get(ch, f"\\u{code:04x}"))
         else:
             out.append(ch)
         i += 1
+
     return "".join(out)
 
 
-def _json_candidates(text: str) -> list[str]:
-    raw = _strip_fence(text)
+def _repair_json_text(text: str) -> str:
+    repaired = _repair_string_escapes(text)
+    # A frequent LLM formatting mistake: a trailing comma before ] or }.
+    repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
+    return repaired
+
+
+def _extract_json(text: str) -> dict[str, Any]:
+    raw = _strip_code_fence(text)
+    sliced = _object_slice(raw)
     candidates: list[str] = []
-    for candidate in (raw, _object_slice(raw)):
-        if not candidate:
-            continue
-        candidates.append(candidate)
-        repaired = _repair_string_escapes(candidate)
-        candidates.append(repaired)
-        candidates.append(re.sub(r",\s*([}\]])", r"\1", repaired))
-    return list(dict.fromkeys(candidates))
+    for candidate in (raw, sliced, _repair_json_text(sliced)):
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
 
-
-def _parse_object(text: str) -> dict[str, Any] | None:
-    for candidate in _json_candidates(text):
+    last_error: json.JSONDecodeError | None = None
+    for candidate in candidates:
         try:
             value = json.loads(candidate)
-        except Exception:
+        except json.JSONDecodeError as exc:
+            last_error = exc
             continue
-        if isinstance(value, dict):
-            return value
-    return None
+        if not isinstance(value, dict):
+            raise ValueError("ProjectPlanner çıktısı JSON object olmalı.")
+        return value
+
+    if "{" not in raw or "}" not in raw:
+        raise ValueError("ProjectPlanner geçerli JSON döndürmedi.")
+    detail = f" (satır {last_error.lineno}, sütun {last_error.colno})" if last_error else ""
+    raise ValueError(f"ProjectPlanner JSON çıktısı ayrıştırılamadı{detail}.")
 
 
-def _repair_prompt(raw: str) -> str:
-    return (
-        "The previous ProjectPlanner response was intended to be JSON but could not be parsed. "
-        "Repair ONLY its formatting. Return exactly one valid JSON object, with no markdown fences or prose. "
-        "Preserve the same field meanings and text. Escape all backslashes that appear inside JSON strings correctly, "
-        "including LaTeX commands. Required keys: title, project_id, description, experiment, initial_problem, "
-        "literature_query, tags.\n\nBROKEN OUTPUT:\n" + raw
-    )
-
-
-def _normalize(data: dict[str, Any], *, user_prompt: str) -> ProjectDraft:
-    title = str(data.get("title") or "").strip()
-    if not title:
-        title = "Research Project"
-    project_id = _slugify(str(data.get("project_id") or title))
-    description = str(data.get("description") or "").strip()
+def parse_project_draft(text: str, user_prompt: str) -> ProjectDraft:
+    data = _extract_json(text)
+    title = str(data.get("title") or "Yeni Araştırma Projesi").strip()
+    project_id = _slug(str(data.get("project_id") or title))
+    description = str(data.get("description") or user_prompt).strip()
     experiment = str(data.get("experiment") or "Teorem Araştırması").strip()
-    if experiment not in SUPPORTED_EXPERIMENTS:
+    if experiment not in EXPERIMENTS:
         experiment = "Teorem Araştırması"
-    initial_problem = str(data.get("initial_problem") or "").strip()
-    if not initial_problem:
-        initial_problem = user_prompt.strip()
+    problem = str(data.get("problem") or user_prompt).strip()
+    if not problem:
+        problem = user_prompt.strip()
     literature_query = str(data.get("literature_query") or "").strip()
     raw_tags = data.get("tags") or []
     if isinstance(raw_tags, str):
-        tags = [part.strip() for part in raw_tags.split(",") if part.strip()]
-    elif isinstance(raw_tags, list):
-        tags = [str(part).strip() for part in raw_tags if str(part).strip()]
-    else:
-        tags = []
+        raw_tags = [x.strip() for x in raw_tags.split(",")]
+    tags = []
+    if isinstance(raw_tags, list):
+        for value in raw_tags:
+            tag = str(value).strip().lower()
+            if tag and tag not in tags:
+                tags.append(tag)
+            if len(tags) >= 8:
+                break
     return ProjectDraft(
-        title=title,
+        title=title[:120],
         project_id=project_id,
         description=description,
         experiment=experiment,
-        initial_problem=initial_problem,
+        problem=problem,
         literature_query=literature_query,
-        tags=tags[:12],
+        tags=tags,
     )
 
 
-def plan_project(
+def _initial_messages(prompt: str) -> list[dict[str, str]]:
+    return [
+        {
+            "role": "user",
+            "content": (
+                "Aşağıdaki kullanıcı isteğinden proje taslağını üret. "
+                "Araştırma problemi, kullanıcının tek promptundan bağımsız olarak çalışabilecek kadar açık olsun.\n\n"
+                f"KULLANICI PROMPTU:\n{prompt}"
+            ),
+        }
+    ]
+
+
+def _repair_messages(user_prompt: str, invalid_output: str, parse_error: Exception) -> list[dict[str, str]]:
+    return [
+        {
+            "role": "user",
+            "content": (
+                "Önceki proje taslağı çıktın JSON olarak ayrıştırılamadı. İçeriğin anlamını koruyarak "
+                "çıktıyı SADECE geçerli JSON object olarak yeniden yaz. Markdown/code fence/açıklama ekleme. "
+                "JSON stringlerinde ham LaTeX backslash kullanma: mümkünse Ω, Θ, ω gibi Unicode semboller "
+                "ve düz metin kullan; backslash gerekiyorsa JSON için çift kaçır. Trailing comma kullanma.\n\n"
+                f"AYRIŞTIRMA HATASI:\n{parse_error}\n\n"
+                f"ORİJİNAL KULLANICI PROMPTU:\n{user_prompt}\n\n"
+                f"GEÇERSİZ ÇIKTI:\n{invalid_output}"
+            ),
+        }
+    ]
+
+
+PlannerCallCallback = Callable[[str, list[dict[str, str]], LLMResponse], None]
+
+
+def _trace_failed_initial_call(
+    agent: Agent,
+    messages: list[dict[str, str]],
+    response: LLMResponse,
+    error: Exception,
+) -> None:
+    """Preserve the failed paid call when the caller uses the legacy return API."""
+
+    trace = get_active_trace()
+    if trace is None:
+        return
+    trace.agent_call(agent.name, response.model, agent.temperature, messages, response)
+    trace.log(
+        "project_planner_parse_error",
+        stage="initial",
+        agent=agent.name,
+        model=response.model,
+        error=str(error),
+    )
+    trace.log("project_planner_repair_start", agent=agent.name, model=agent.model)
+
+
+def generate_project_draft(
     user_prompt: str,
+    agent: Agent,
     *,
-    model: str | None = None,
-    reasoning_effort: str | None = None,
-    trace: Trace | None = None,
-    client: LLMClient | None = None,
-) -> ProjectDraft:
-    prompt = (user_prompt or "").strip()
+    on_call: PlannerCallCallback | None = None,
+) -> tuple[ProjectDraft, LLMResponse, list[dict[str, str]]]:
+    """Generate a project draft, automatically repairing malformed JSON once.
+
+    ``on_call`` is invoked for every paid LLM call (stage ``initial`` or ``repair``),
+    allowing custom callers to retain both attempts. With the legacy UI path, a
+    failed initial call is written to the active Trace automatically; the caller
+    then records the returned successful repair call as before. The public return
+    shape remains backward compatible.
+    """
+
+    prompt = user_prompt.strip()
     if not prompt:
         raise ValueError("Proje promptu boş olamaz.")
 
-    model_id = (model or os.environ.get("LAB_PROJECT_PLANNER_MODEL") or "openai/gpt-4o-mini").strip()
-    agent = Agent(
-        name="ProjectPlanner",
-        system_prompt=PROJECT_PLANNER_SYSTEM_PROMPT,
-        model=model_id,
-        temperature=0.2,
-        max_tokens=4000,
-        reasoning_effort=reasoning_effort,
-        client=client,
-    )
-    messages = [{"role": "user", "content": prompt}]
+    messages = _initial_messages(prompt)
     content, response = agent.respond(messages)
-    if trace is not None:
-        trace.agent_call(agent.name, response.model, agent.temperature, messages, response)
-        trace.log("project_planner_output", model=response.model, reasoning_effort=agent.reasoning_effort, raw_output=content)
-    data = _parse_object(content)
-    if data is None:
-        repair_messages = [{"role": "user", "content": _repair_prompt(content)}]
+    if on_call:
+        on_call("initial", messages, response)
+    try:
+        draft = parse_project_draft(content, prompt)
+        return draft, response, messages
+    except ValueError as first_error:
+        if on_call is None:
+            _trace_failed_initial_call(agent, messages, response, first_error)
+        repair_messages = _repair_messages(prompt, content, first_error)
         repaired_content, repaired_response = agent.respond(repair_messages)
-        if trace is not None:
-            trace.log("project_planner_json_repair", original_output=content, repaired_output=repaired_content)
-            trace.agent_call(agent.name, repaired_response.model, agent.temperature, repair_messages, repaired_response)
-        data = _parse_object(repaired_content)
-        if data is None:
-            raise ValueError("ProjectPlanner JSON çıktısı iki aşamalı onarımdan sonra da ayrıştırılamadı.")
-    return _normalize(data, user_prompt=prompt)
+        if on_call:
+            on_call("repair", repair_messages, repaired_response)
+        try:
+            draft = parse_project_draft(repaired_content, prompt)
+        except ValueError as second_error:
+            raise ValueError(
+                "ProjectPlanner çıktısı iki denemede de geçerli JSON'a dönüştürülemedi. "
+                f"Son hata: {second_error}"
+            ) from second_error
+        return draft, repaired_response, repair_messages
