@@ -140,9 +140,9 @@ class LeanTool:
     """Project-local formal proof candidate writer/checker.
 
     A successful Lean exit code is necessary but not sufficient. Generated source
-    must be explicitly bound to one ledger item/iteration and formal statement,
-    must contain no sorry/admit/axiom-style escape hatches, and ``#print axioms``
-    must report only the configured trusted Lean axioms.
+    is bound to one ledger item/iteration/claim hash and formal statement, escape
+    hatches are rejected before execution, compiler warnings are errors, and
+    ``#print axioms`` must report only configured trusted Lean axioms.
     """
 
     FORBIDDEN_PATTERNS = (
@@ -152,16 +152,18 @@ class LeanTool:
         r"\bopaque\b",
         r"\bnative_decide\b",
         r"\bset_option\b",
+        r"\bpartial\s+def\b",
         r"\brun_cmd\b",
         r"#eval\b",
         r"\bunsafe\b",
-        r"\bSystem\.",
-        r"\bIO\.",
+        r"\bSystem\s*\.",
+        r"\bIO\s*\.",
         r"\bProcess\b",
         r"\bimplemented_by\b",
         r"@\[extern",
     )
     DECLARATION = re.compile(r"(?m)^\s*(theorem|lemma)\s+([A-Za-z_][A-Za-z0-9_'.]*)\b")
+    CLAIM_MARKER = re.compile(r"(?m)^\s*--\s*ailab-claim:\s*([0-9a-f]{64})\s*$", re.I)
 
     def __init__(self, root: str | Path = "formal", timeout_s: int = 120):
         self.root = Path(root).resolve()
@@ -171,9 +173,6 @@ class LeanTool:
 
     @staticmethod
     def _strip_comments(source: str) -> str:
-        # Conservative comment stripping for policy checks. Nested Lean comments
-        # are uncommon in generated candidates; any missed token is rechecked in
-        # compiler output as well.
         text = re.sub(r"/\*.*?\*/", " ", source, flags=re.S)
         text = re.sub(r"/-.*?-\/", " ", text, flags=re.S)
         text = re.sub(r"--[^\n]*", " ", text)
@@ -217,6 +216,7 @@ class LeanTool:
         theorem_type: str = "",
         item_id: str = "",
         iteration: int | None = None,
+        claim_hash: str = "",
         claim_sha256: str = "",
     ) -> ToolResult:
         try:
@@ -226,10 +226,15 @@ class LeanTool:
             ok, reason = self._guard_source(text, theorem_name, theorem_type)
             if not ok:
                 raise ValueError(reason)
-            if not item_id or iteration is None or not claim_sha256:
-                raise ValueError("Formal candidate item_id/iteration/claim_sha256 binding olmadan yazılamaz.")
+            binding_hash = str(claim_hash or claim_sha256).strip().lower()
+            if not item_id or iteration is None or not re.fullmatch(r"[0-9a-f]{64}", binding_hash):
+                raise ValueError("Formal candidate item_id/iteration/claim hash binding olmadan yazılamaz.")
+            # Never trust a model-provided marker. Remove any existing marker and
+            # write the engine-supplied binding as the first line.
+            text = self.CLAIM_MARKER.sub("", text).lstrip("\n")
+            bound_text = f"-- ailab-claim: {binding_hash}\n{text}"
             target = self._candidate(name)
-            target.write_text(text, encoding="utf-8")
+            target.write_text(bound_text, encoding="utf-8")
             digest = sha256_file(target)
             return ToolResult(
                 True,
@@ -244,6 +249,7 @@ class LeanTool:
                     "theorem_type": self._compact(theorem_type),
                     "item_id": item_id,
                     "iteration": int(iteration),
+                    "claim_hash": binding_hash,
                     "claim_sha256": claim_sha256,
                 },
             )
@@ -254,9 +260,9 @@ class LeanTool:
         lake = shutil.which("lake")
         lean = shutil.which("lean")
         if lake:
-            return [lake, "env", "lean", str(candidate)], "lake env lean"
+            return [lake, "env", "lean", "-DwarningAsError=true", str(candidate)], "lake env lean"
         if lean:
-            return [lean, str(candidate)], "lean"
+            return [lean, "-DwarningAsError=true", str(candidate)], "lean"
         raise RuntimeError("lean/lake binary PATH üzerinde bulunamadı")
 
     def _run_lean(self, candidate: Path) -> tuple[subprocess.CompletedProcess[str], str]:
@@ -278,9 +284,11 @@ class LeanTool:
         return proc, checker
 
     @staticmethod
-    def _warning_mentions_unsafe_proof(text: str) -> bool:
+    def _compiler_mentions_unsafe_proof(text: str) -> bool:
         lowered = text.lower()
-        return "declaration uses 'sorry'" in lowered or "declaration uses \"sorry\"" in lowered
+        if "declaration uses 'sorry'" in lowered or 'declaration uses "sorry"' in lowered:
+            return True
+        return bool(re.search(r"\baxiom\b", lowered))
 
     def _axioms_ok(self, source: str, theorem_name: str) -> tuple[bool, str, list[str]]:
         audit = self.candidates / f".axioms-{uuid.uuid4().hex}.lean"
@@ -322,6 +330,7 @@ class LeanTool:
         expected_sha256: str = "",
         expected_item_id: str = "",
         expected_iteration: int | None = None,
+        expected_claim_hash: str = "",
         expected_claim_sha256: str = "",
         expected_theorem_name: str = "",
         expected_theorem_type: str = "",
@@ -331,6 +340,7 @@ class LeanTool:
             "source_clean": False,
             "axioms_verified": False,
             "formal_binding_verified": False,
+            "claim_hash": "",
         }
         try:
             candidate = self._candidate(name)
@@ -338,6 +348,9 @@ class LeanTool:
                 raise FileNotFoundError(candidate)
             source = candidate.read_text(encoding="utf-8")
             actual_sha = sha256_file(candidate)
+            marker = self.CLAIM_MARKER.search(source)
+            actual_claim_hash = marker.group(1).lower() if marker else ""
+            expected_binding_hash = str(expected_claim_hash or expected_claim_sha256).strip().lower()
             metadata.update(
                 {
                     "file": candidate.name,
@@ -346,6 +359,7 @@ class LeanTool:
                     "theorem_type": self._compact(expected_theorem_type),
                     "item_id": expected_item_id,
                     "iteration": expected_iteration,
+                    "claim_hash": actual_claim_hash,
                     "claim_sha256": expected_claim_sha256,
                 }
             )
@@ -355,8 +369,10 @@ class LeanTool:
             metadata["source_clean"] = True
             if not expected_sha256 or actual_sha != expected_sha256:
                 raise ValueError("Lean source SHA-256 draft binding ile eşleşmiyor.")
-            if not expected_item_id or expected_iteration is None or not expected_claim_sha256:
+            if not expected_item_id or expected_iteration is None or not expected_binding_hash:
                 raise ValueError("Lean check ledger item/iteration/claim binding olmadan kabul edilemez.")
+            if actual_claim_hash != expected_binding_hash:
+                raise ValueError("Lean ailab-claim marker current ledger claim hash ile eşleşmiyor.")
             metadata["formal_binding_verified"] = True
             if os.environ.get("LAB_ALLOW_HOST_LEAN", "0") != "1":
                 return ToolResult(
@@ -370,8 +386,8 @@ class LeanTool:
             metadata.update({"returncode": proc.returncode, "checker": checker})
             if proc.returncode != 0:
                 return ToolResult(False, "lean", output=proc.stdout.strip(), error=proc.stderr.strip(), metadata=metadata)
-            if self._warning_mentions_unsafe_proof(combined):
-                return ToolResult(False, "lean", error="Lean reported a declaration using sorry.", metadata=metadata)
+            if self._compiler_mentions_unsafe_proof(combined):
+                return ToolResult(False, "lean", error="Lean compiler output mentions sorry/axiom; formal verification rejected.", metadata=metadata)
             axioms_ok, axioms_output, axioms = self._axioms_ok(source, expected_theorem_name)
             metadata["axioms"] = axioms
             metadata["axioms_verified"] = axioms_ok
@@ -627,6 +643,7 @@ class ResearchToolbox:
                 theorem_type=str(request.get("theorem_type") or ""),
                 item_id=str(request.get("item_id") or ""),
                 iteration=int(request["iteration"]) if request.get("iteration") is not None else None,
+                claim_hash=str(request.get("claim_hash") or ""),
                 claim_sha256=str(request.get("claim_sha256") or ""),
             )
         if tool == "lean":
