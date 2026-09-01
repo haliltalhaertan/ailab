@@ -1,5 +1,3 @@
-from types import SimpleNamespace
-
 from lab.client import LLMResponse
 from lab.research_state import ResearchState
 from lab.resumable_theorem_lab import TheoremResearchLab
@@ -23,6 +21,7 @@ class FakeAgent:
         self.model = f"fake/{name}"
         self.temperature = 0.0
         self.max_tokens = None
+        self.reasoning_effort = None
         self.output = output
         self.fail = fail
         self.calls = 0
@@ -55,7 +54,11 @@ def make_agents(*, critic_fail=False):
             "Theorist",
             '{"title":"T","claim":"C","strategy":"S","evidence_needed":[],"tool_request":{"tool":"none"}}',
         ),
-        "critic": FakeAgent("AdversarialCritic", "KEEP", fail=critic_fail),
+        "critic": FakeAgent(
+            "AdversarialCritic",
+            '{"verdict":"KEEP","reason":"no counterexample","counterexample":""}',
+            fail=critic_fail,
+        ),
         "verifier": FakeAgent(
             "VerificationEngineer",
             '{"verdict":"PASS","reason":"ok","formal_proof_required":true,"counterexample":""}',
@@ -103,7 +106,7 @@ def test_failure_pauses_and_resume_reuses_completed_steps(tmp_path):
     second = make_agents(critic_fail=False)
     result2 = run_once(tmp_path, state, second, "second")
 
-    assert "Final independent audit" in result2
+    assert "Final Bağımsız Audit" in result2
     # proposer/verifier were completed before the crash and must come from cache.
     assert second["proposer"].calls == 0
     assert second["verifier"].calls == 0
