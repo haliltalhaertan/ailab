@@ -1,7 +1,8 @@
 from lab.agent import Agent
 from lab.client import LLMClient
 from lab.code_experiment import CodeExperimentRunner, GuardedExperimentWorkspace
-from lab.code_experiment_theorem_lab import TheoremResearchLab
+from lab.hardened_theorem_lab import TheoremResearchLab
+from lab.integrity import ProjectBusyError, ProjectRunLock
 from lab.literature import LiteratureClient, Paper
 from lab.orchestrator import Orchestrator
 from lab.research_state import ResearchItem, ResearchState
@@ -20,6 +21,8 @@ __all__ = [
     "TheoremResearchLab",
     "ResearchPaused",
     "ResearchStopped",
+    "ProjectBusyError",
+    "ProjectRunLock",
     "ResearchToolbox",
     "ScriptTool",
     "Z3Tool",
