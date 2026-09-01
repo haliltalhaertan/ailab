@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import sys
@@ -73,6 +74,7 @@ def main() -> None:
     trace = Trace(f"theorem_{project_id}")
     state = ResearchState(f"research_state/{project_id}")
     lab = TheoremResearchLab(trace, state, toolbox=ResearchToolbox())
+    summary_path = None
     try:
         report = lab.run(
             problem,
@@ -87,11 +89,25 @@ def main() -> None:
             checkpoint_every=2,
         )
     finally:
-        trace.close()
+        summary_path = trace.close()
+
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    cost_prefix = "" if summary.get("cost_complete") else ">="
 
     print(report)
     print(f"\nResearch state: {state.root}")
     print(f"Trace: {trace.run_dir}")
+    print("\nUSAGE")
+    print(f"Calls: {summary['total_calls']}")
+    print(f"Tokens: {summary['total_tokens']:,}")
+    print(f"Cost: {cost_prefix}${summary['total_cost_usd']:.6f}")
+    print(f"Wall time: {summary['wall_time_s']:.1f} s")
+    for agent_name, usage in summary.get("agents", {}).items():
+        models = ", ".join(usage.get("models", []))
+        print(
+            f"- {agent_name}: {models} | {usage['total_tokens']:,} tokens | "
+            f"${usage['cost_usd']:.6f} | {usage['latency_s']:.1f} s"
+        )
 
 
 if __name__ == "__main__":

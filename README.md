@@ -29,16 +29,17 @@ Test araçları için:
 OPENROUTER_API_KEY=...
 ```
 
-İstersen `LLM_BASE_URL`, `LAB_MODEL` veya theorem araştırmasındaki rol bazlı model environment değişkenlerini de ayarlayabilirsin.
+`LAB_*_MODEL` değişkenleri yalnız varsayılan model seçimleridir. Streamlit arayüzünde her agent için OpenRouter modelini ayrı seçebilirsin.
 
 ## Mimari
 
 ```text
 lab/
-  client.py              OpenAI uyumlu LLM istemcisi
+  client.py              OpenAI uyumlu LLM istemcisi + exact usage/cost yakalama
   agent.py               Agent tanımı
   orchestrator.py        Genel multi-agent desenleri
-  trace.py               JSONL trace + token/gecikme ölçümü
+  trace.py               JSONL trace + token/ücret/süre ölçümü
+  openrouter_catalog.py  Canlı OpenRouter model kataloğu ve fiyat bilgisi
 
   research_state.py      Frozen problem + conjecture/lemma/counterexample ledger
   literature.py          arXiv + Crossref novelty/literature screening
@@ -52,7 +53,7 @@ experiments/
 research_tools/           Yalnızca review edilmiş deterministic hesaplama scriptleri
 formal/                   Opsiyonel checked-in Lean dosyaları
 research_state/           Runtime araştırma hafızası; git'e alınmaz
-runs/                     LLM/tool trace'leri; git'e alınmaz
+runs/                     LLM/tool trace'leri ve summary.json; git'e alınmaz
 templates/                Frozen problem gibi araştırma şablonları
 tests/                    Deterministic unit testler
 ```
@@ -143,6 +144,27 @@ Ek doğrulayıcılar:
 
 ## Theorem research çalıştırma
 
+### Web arayüzü — önerilen
+
+```powershell
+.venv\Scripts\streamlit run app.py
+```
+
+`Deney tipi` olarak **Teorem Araştırması** seç. Arayüz OpenRouter'ın canlı text-model kataloğunu yükler. Her rol için ayrı model seçebilirsin:
+
+- ResearchManager
+- Theorist
+- AdversarialCritic
+- VerificationEngineer
+- LiteratureScout
+- IndependentAuditor
+
+Model selectbox'ı OpenRouter model adı, slug ve güncel input/output liste fiyatını gösterir. Katalogda görünmeyen/yeni bir model kullanmak için rolün altındaki **Manuel model ID** alanına örneğin `z-ai/glm-5.3` gibi doğrudan OpenRouter slug'ı yazabilirsin.
+
+`.env` içindeki `LAB_MANAGER_MODEL`, `LAB_PROPOSER_MODEL` vb. değerler yalnız arayüzün ilk açılıştaki varsayılan seçimleridir; arayüzde yaptığın seçim run için önceliklidir.
+
+### CLI
+
 Örnek tropical circuit projesi:
 
 ```powershell
@@ -151,7 +173,7 @@ Ek doğrulayıcılar:
 
 Aynı `project_id` ile tekrar çalıştırırsan ledger devam eder; farklı problem verirsen frozen-problem koruması hata üretir.
 
-Rol bazlı modelleri environment üzerinden değiştirebilirsin:
+CLI için rol bazlı modelleri environment üzerinden değiştirebilirsin:
 
 ```text
 LAB_MANAGER_MODEL=...
@@ -165,6 +187,47 @@ LAB_LITERATURE_QUERY=tropical circuit reachability provenance lower bound
 
 Bağımsız auditor için mümkünse proposer/critic'ten farklı model ailesi kullan.
 
+## Kullanım, token, ücret ve süre kayıtları
+
+Her LLM çağrısı `runs/<timestamp>_<experiment>/trace.jsonl` içine aşağıdaki alanlarla kaydedilir:
+
+```text
+agent
+model
+prompt_tokens
+completion_tokens
+reasoning_tokens
+cached_tokens
+total_tokens
+cost_usd
+latency_s
+```
+
+OpenRouter kullanılıyorsa istemci `usage.include=true` ister ve `usage.cost` alanındaki **gerçek inference maliyetini** kaydeder. Böylece fiyat listesinden sonradan yaklaşık hesap yapmak yerine OpenRouter'ın o çağrı için bildirdiği ücret kullanılır.
+
+Her çalışma sonunda `summary.json` ayrıca şunları tutar:
+
+```text
+started_at
+finished_at
+wall_time_s
+total_calls
+total_prompt_tokens
+total_completion_tokens
+total_reasoning_tokens
+total_cached_tokens
+total_tokens
+total_cost_usd
+cost_complete
+agents -> model/token/cost/latency toplamları
+```
+
+`wall_time_s`, yalnız LLM bekleme süresini değil literatür taraması ve deterministic tool çalışmaları dahil run'ın başından sonuna gerçek geçen süreyi ölçer.
+
+Streamlit'teki **Geçmiş Kayıtlar** sekmesi her run için toplam token, ücret, süre; agent bazında model/token/ücret; ayrıca tek tek API çağrılarını gösterir.
+
+Bir provider exact cost alanı döndürmezse `cost_complete=false` olur ve arayüzde ücret minimum bilinen toplam olarak işaretlenir.
+
 ## Genel multi-agent desenleri
 
 | Desen | Ne yapar | Kullanım |
@@ -175,21 +238,9 @@ Bağımsız auditor için mümkünse proposer/critic'ten farklı model ailesi ku
 | `panel` | bağımsız cevaplar + sentez | fikir çeşitliliği |
 | `TheoremResearchLab` | manager + compute + ledger + literature + audit | uzun süreli matematik/teorik CS araştırması |
 
-## Web arayüzü
-
-Mevcut genel deneyler Streamlit arayüzünden çalışır:
-
-```powershell
-.venv\Scripts\streamlit run app.py
-```
-
-Theorem Research Lab v2 ilk sürümde CLI/state-first tasarlanmıştır; bunun nedeni uzun araştırmalarda proje ID, checkpoint ve ledger sürekliliğinin UI'dan daha kritik olmasıdır.
-
 ## Trace ve denetlenebilirlik
 
-Her LLM çağrısı `runs/<timestamp>_<experiment>/trace.jsonl` içine model, prompt, çıktı, token ve gecikme ile yazılır. Theorem Lab ayrıca literature search ve deterministic tool sonuçlarını da trace'e kaydeder.
-
-Araştırma sonucu değerlendirirken önerilen standart:
+Theorem Lab literature search ve deterministic tool sonuçlarını da trace'e kaydeder. Araştırma sonucu değerlendirirken önerilen standart:
 
 ```text
 [IDEA] -> [OPEN] -> [COMPUTATION_PASS] -> [PROOF_CANDIDATE]
