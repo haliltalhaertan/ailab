@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import os
+from pathlib import Path
 from typing import Any
 
-from lab.integrity import content_fingerprint
+from lab.integrity import content_fingerprint, sha256_file
 from lab.research_state import ResearchState
 from lab.run_controller import ResearchPaused, ResearchStopped, now_iso
 from lab.theorem_engine import TheoremResearchLab as CoreTheoremResearchLab
@@ -38,16 +39,66 @@ class TheoremResearchLab(CoreTheoremResearchLab):
         self._active_item_id = ""
         self._active_claim_sha256 = ""
 
-    def _ensure_item_matches_proposal(self, iteration: int, proposal: dict[str, Any], snapshot: dict[str, Any]):
+    def _ensure_item_matches_proposal(
+        self,
+        iteration: int,
+        proposal: dict[str, Any],
+        snapshot: dict[str, Any],
+    ):
         item = super()._ensure_item_matches_proposal(iteration, proposal, snapshot)
         self._active_iteration = int(iteration)
         self._active_item_id = item.id
         self._active_claim_sha256 = hashlib.sha256(item.claim.encode("utf-8")).hexdigest()
         return item
 
+    def _persist_formal_metadata(self, result: ToolResult) -> None:
+        metadata = dict(result.metadata or {})
+        if not (
+            result.ok
+            and result.tool == "lean"
+            and metadata.get("formal_verified") is True
+            and self._active_item_id
+        ):
+            return
+        metadata["lean_file"] = str(metadata.get("file") or "")
+        # Persist the complete machine-produced binding while status is still OPEN.
+        # The core engine later supplies only a small formal summary; ResearchState
+        # merges it with these fields and creates the HMAC proof seal at PROVEN.
+        self.state.update_item(self._active_item_id, metadata=metadata)
+
+    def _cached_formal_result(self, raw: dict[str, Any]) -> ToolResult:
+        result = ToolResult(
+            bool(raw.get("ok")),
+            str(raw.get("tool") or "lean"),
+            str(raw.get("output") or ""),
+            str(raw.get("error") or ""),
+            dict(raw.get("metadata") or {}),
+        )
+        metadata = dict(result.metadata or {})
+        if result.ok and metadata.get("formal_verified") is True:
+            filename = Path(str(metadata.get("file") or "")).name
+            candidate = self.state.root / "formal" / "candidates" / filename
+            if (
+                not filename
+                or not candidate.is_file()
+                or sha256_file(candidate) != str(metadata.get("lean_sha256") or "")
+            ):
+                return ToolResult(
+                    False,
+                    "lean",
+                    error="Cached formal evidence rejected: bound Lean file is missing or its SHA-256 changed.",
+                    metadata={**metadata, "formal_verified": False},
+                )
+        self._persist_formal_metadata(result)
+        return result
+
     def _formal_tool(self, request: dict[str, Any], step_key: str) -> ToolResult:
         if self._active_iteration is None or not self._active_item_id:
-            return ToolResult(False, "lean", error="Formal tool current iteration/item binding olmadan çalışamaz.")
+            return ToolResult(
+                False,
+                "lean",
+                error="Formal tool current iteration/item binding olmadan çalışamaz.",
+            )
 
         theorem_name = str(request.get("theorem_name") or "").strip()
         theorem_type = str(request.get("theorem_type") or "").strip()
@@ -65,21 +116,23 @@ class TheoremResearchLab(CoreTheoremResearchLab):
         }
         fingerprint = content_fingerprint("bound_formal_tool:v1", enriched)
         cached = self._cache_get(step_key)
-        if isinstance(cached, dict) and cached.get("status") == "COMPLETE" and cached.get("fingerprint") == fingerprint:
+        if (
+            isinstance(cached, dict)
+            and cached.get("status") == "COMPLETE"
+            and cached.get("fingerprint") == fingerprint
+        ):
             raw = cached.get("result")
             if isinstance(raw, dict):
                 self.trace.log("step_reused", step_key=step_key, tool=raw.get("tool"))
-                return ToolResult(
-                    bool(raw.get("ok")),
-                    str(raw.get("tool") or "lean"),
-                    str(raw.get("output") or ""),
-                    str(raw.get("error") or ""),
-                    dict(raw.get("metadata") or {}),
-                )
+                return self._cached_formal_result(raw)
 
         self._check_stop()
         self._set_runtime(current_step=step_key)
-        self.trace.log("tool_start", request={k: v for k, v in enriched.items() if k != "source"}, step_key=step_key)
+        self.trace.log(
+            "tool_start",
+            request={k: v for k, v in enriched.items() if k != "source"},
+            step_key=step_key,
+        )
         draft = self.toolbox.lean.draft_source(
             filename,
             source,
@@ -106,6 +159,7 @@ class TheoremResearchLab(CoreTheoremResearchLab):
             merged.update(result.metadata or {})
             merged["draft_checked_same_step"] = True
             result.metadata = merged
+        self._persist_formal_metadata(result)
         self.trace.log("tool_result", step_key=step_key, **result.as_dict())
         self._cache_put(
             step_key,
@@ -124,7 +178,10 @@ class TheoremResearchLab(CoreTheoremResearchLab):
             result = ToolResult(
                 False,
                 "lean",
-                error="Direct lean check disabled. Use lean_draft; the engine checks the exact bound draft automatically.",
+                error=(
+                    "Direct lean check disabled. Use lean_draft; the engine checks "
+                    "the exact bound draft automatically."
+                ),
             )
             self.trace.log("tool_result", step_key=step_key, **result.as_dict())
             return result
