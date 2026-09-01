@@ -23,7 +23,7 @@ def object_slice(text: str) -> str:
 
 
 def repair_string_escapes(text: str) -> str:
-    """Repair common almost-JSON while preserving the actual field text.
+    r"""Repair common almost-JSON while preserving the actual field text.
 
     In particular, LLMs often emit raw LaTeX (``\Omega``) inside JSON strings.
     JSON does not allow ``\O``, so invalid in-string backslashes are escaped.
