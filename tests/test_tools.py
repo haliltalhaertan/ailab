@@ -50,9 +50,11 @@ def test_tropical_grid_checker_accepts_k3_shortest_path_circuit():
     result = TropicalGridTool().check(circuit, [0, 1, 2])
     assert result.ok
     assert result.metadata["cases_checked"] == 27
+    assert result.metadata["provenance_structure_ok"] is True
+    assert result.metadata["gate_count"] == 5
 
 
-def test_tropical_grid_checker_finds_counterexample():
+def test_tropical_grid_checker_finds_structural_refutation():
     bad = {
         "n": 3,
         "gates": [{"id": "e13", "op": "edge", "u": 1, "v": 3}],
@@ -60,4 +62,5 @@ def test_tropical_grid_checker_finds_counterexample():
     }
     result = TropicalGridTool().check(bad, [0, 1, 2])
     assert not result.ok
-    assert result.metadata["status"] == "COUNTEREXAMPLE"
+    assert result.metadata["status"] == "STRUCTURE_MISMATCH"
+    assert result.metadata["provenance_structure_ok"] is False
