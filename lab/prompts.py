@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from lab.tool_registry import ToolRegistry
+
 
 ROLE_LIBRARY = {
     "ResearchManager": "Araştırmayı yönet; kanıt merdivenini kodun zorladığını varsay. FAIL/DROPPED fikirleri kapalı tut ve tek sonraki görev ver.",
@@ -13,17 +15,16 @@ ROLE_LIBRARY = {
     "IndependentAuditor": "Sıfır-güven bağımsız denetçi ol; OPEN, COMPUTATION_PASS, PROOF_CANDIDATE ve PROVEN basamaklarını kesin ayır.",
 }
 
-TOOL_NAMES = ("none", "script", "z3", "lean_draft", "lean", "tropical_grid", "code_experiment")
 
-
-def proposal_schema() -> dict[str, Any]:
+def proposal_schema(registry: ToolRegistry | None = None) -> dict[str, Any]:
+    registry = registry or ToolRegistry()
     return {
         "title": "...",
         "claim": "...",
         "strategy": "...",
         "evidence_needed": ["..."],
         "tool_request": {
-            "tool": "|".join(TOOL_NAMES),
+            "tool": registry.schema_string(),
             "name": "",
             "args": [],
             "smt2": "",
@@ -49,7 +50,7 @@ def literature_prompt(problem: str, context: str, *, reliable: bool) -> str:
     )
 
 
-def proposal_prompt(problem: str, literature: str, ledger: str, next_task: str) -> str:
+def proposal_prompt(problem: str, literature: str, ledger: str, next_task: str, registry: ToolRegistry | None = None) -> str:
     return (
         f"PROBLEM (frozen):\n{problem}\n\n"
         f"LITERATURE SCREEN:\n{literature}\n\n"
@@ -57,7 +58,7 @@ def proposal_prompt(problem: str, literature: str, ledger: str, next_task: str) 
         f"CURRENT TASK:\n{next_task}\n\n"
         "Produce exactly one research candidate. Do not reopen a FAIL/DROPPED idea listed in the ledger. "
         "Separate proved facts from assumptions. If computation/formal checking is useful, request one tool. "
-        "Return ONLY this JSON schema:\n" + json.dumps(proposal_schema(), ensure_ascii=False)
+        "Return ONLY this JSON schema:\n" + json.dumps(proposal_schema(registry), ensure_ascii=False)
     )
 
 
