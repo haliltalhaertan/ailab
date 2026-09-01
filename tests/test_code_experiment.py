@@ -18,7 +18,9 @@ def test_workspace_writes_runs_and_captures_outputs(tmp_path, fake_container_run
     assert result.metadata["evidence_level"] == "COMPUTATION_ONLY"
     assert (ws.root / result.metadata["stdout_file"]).read_text(encoding="utf-8").strip() == "10"
 
-    command = fake_container_runtime[-1]
+    run_commands = [cmd for cmd in fake_container_runtime if len(cmd) > 1 and cmd[1] == "run"]
+    assert len(run_commands) == 1
+    command = run_commands[0]
     assert "--network=none" in command
     assert "--read-only" in command
     assert "--cap-drop=ALL" in command
