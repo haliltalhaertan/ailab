@@ -48,3 +48,28 @@ def test_model_search_filters_slug_and_label_case_insensitive():
 def test_every_experiment_explains_when_to_use_it():
     for experiment in app.EXPERIMENTS.values():
         assert experiment.get("description")
+
+
+def test_tool_execution_error_is_not_labeled_counterexample():
+    label, tone = app._tool_status(
+        {"ok": False, "tool": "tropical_grid", "error": "grid checker için 2 ≤ n ≤ 7 gerekli"}
+    )
+    assert label == "HATA"
+    assert tone == "error"
+
+
+def test_real_counterexample_is_labeled_counterexample():
+    label, tone = app._tool_status(
+        {
+            "ok": False,
+            "tool": "tropical_grid",
+            "error": "",
+            "metadata": {"status": "COUNTEREXAMPLE"},
+        }
+    )
+    assert label == "COUNTEREXAMPLE"
+    assert tone == "error"
+
+
+def test_compact_live_renderer_is_available():
+    assert hasattr(app, "LiveTimelineRenderer")
