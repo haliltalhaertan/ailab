@@ -34,6 +34,8 @@ class Trace:
             temperature=temperature,
             messages=messages,
             output=response.content,
+            provider_reasoning=getattr(response, "provider_reasoning", ""),
+            reasoning_details=getattr(response, "reasoning_details", None),
             prompt_tokens=response.prompt_tokens,
             completion_tokens=response.completion_tokens,
             reasoning_tokens=getattr(response, "reasoning_tokens", 0),
@@ -101,7 +103,6 @@ class Trace:
         finished_at = datetime.now(timezone.utc).isoformat()
         wall_time_s = round(time.perf_counter() - self._started_perf, 3)
 
-        # Round only at serialization time so repeated tiny request costs are not lost.
         for t in agents.values():
             t["cost_usd"] = round(t["cost_usd"], 8)
             t["latency_s"] = round(t["latency_s"], 3)
