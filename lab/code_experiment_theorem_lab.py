@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import json
 import os
-from typing import Any, Callable
+from typing import Any
 
 from lab.agent import Agent
 from lab.code_experiment import (
@@ -12,97 +11,31 @@ from lab.code_experiment import (
     WorkspaceActionResult,
 )
 from lab.code_experiment_settings import load_code_experiment_settings
+from lab.integrity import content_fingerprint
 from lab.partial_resume_theorem_lab import TheoremResearchLab as PartialResumeTheoremResearchLab
-from lab.theorem_lab import extract_json_object
 from lab.tools import ToolResult
 
 
-class TheoremCodeExperimentRunner(CodeExperimentRunner):
-    """CodeExperimentRunner variant whose trace payload keeps action/result separate."""
-
-    def run(
-        self,
-        *,
-        agent: Agent,
-        task: str,
-        step_key: str,
-        call_agent: Callable[[Agent, str, str], str],
-        execute_cached: Callable[[str, dict[str, Any]], WorkspaceActionResult],
-    ) -> ToolResult:
-        observation = self.workspace.list_files().output
-        last_result: WorkspaceActionResult | None = None
-        for turn in range(1, self.max_steps + 1):
-            prompt = (
-                f"EXPERIMENT TASK:\n{task}\n\n"
-                f"WORKSPACE / PREVIOUS OBSERVATION:\n{observation[-self.observation_limit:]}\n\n"
-                "Choose exactly one next action. Return only the JSON action object. "
-                "Use finish only after you have actually run enough code to support the computational conclusion."
-            )
-            raw = call_agent(agent, prompt, f"{step_key}:plan:{turn}")
-            action = extract_json_object(raw)
-            action_name = str(action.get("action") or "").lower()
-            self.trace.log(
-                "code_experiment_action",
-                step_key=step_key,
-                turn=turn,
-                agent=agent.name,
-                model=agent.model,
-                action=self._action_for_trace(action),
-            )
-            if action_name == "finish":
-                summary = str(action.get("summary") or "Deney tamamlandı.")
-                files = self.workspace.list_files()
-                payload = {
-                    "status": "EXPERIMENT_COMPLETE",
-                    "evidence_level": "COMPUTATION_ONLY",
-                    "summary": summary,
-                    "turns": turn,
-                    "workspace": str(self.workspace.root),
-                    "files": json.loads(files.output) if files.ok else [],
-                    "warning": "Computational evidence is not a proof.",
-                }
-                self.trace.log("code_experiment_complete", step_key=step_key, **payload)
-                return ToolResult(True, "code_experiment", output=summary, metadata=payload)
-
-            last_result = execute_cached(f"{step_key}:action:{turn}", action)
-            result_payload = last_result.as_dict()
-            self.trace.log(
-                "code_experiment_result",
-                step_key=step_key,
-                turn=turn,
-                executed_action=action_name,
-                result=result_payload,
-            )
-            observation = json.dumps(result_payload, ensure_ascii=False, indent=2)
-
-        return ToolResult(
-            False,
-            "code_experiment",
-            output=(last_result.output if last_result else ""),
-            error=f"CodeExperimentAgent {self.max_steps} action limitine ulaştı; finish üretmedi.",
-            metadata={
-                "status": "STEP_LIMIT",
-                "evidence_level": "COMPUTATION_ONLY",
-                "workspace": str(self.workspace.root),
-            },
-        )
-
-
 class TheoremResearchLab(PartialResumeTheoremResearchLab):
-    """Partial-resumable theorem lab with an autonomous guarded code-experiment loop."""
+    """Partial-resumable theorem lab with autonomous computational experiments."""
 
     def __init__(self, *args, code_experiment_steps: int | None = None, **kwargs):
         super().__init__(*args, **kwargs)
         settings = load_code_experiment_settings()
         steps = int(code_experiment_steps or settings.get("max_steps", 8))
         timeout_s = int(settings.get("timeout_s", 60))
+        memory_limit_mb = int(settings.get("memory_limit_mb", 768))
+        max_output_bytes = int(settings.get("max_output_mb", 4)) * 1024 * 1024
         self.code_settings = settings
         self.code_agent: Agent | None = None
         self.code_workspace = GuardedExperimentWorkspace(
             self.state.root / "workspace",
             timeout_s=timeout_s,
+            memory_limit_mb=memory_limit_mb,
+            max_output_bytes=max_output_bytes,
+            cancel_check=lambda: self.stop_path.exists(),
         )
-        self.code_runner = TheoremCodeExperimentRunner(
+        self.code_runner = CodeExperimentRunner(
             self.code_workspace,
             self.trace,
             max_steps=steps,
@@ -127,11 +60,7 @@ class TheoremResearchLab(PartialResumeTheoremResearchLab):
             code_agent = Agent(
                 name="CodeExperimentAgent",
                 system_prompt=CODE_EXPERIMENT_SYSTEM_PROMPT,
-                model=(
-                    configured_model
-                    or os.environ.get("LAB_CODE_EXPERIMENT_MODEL")
-                    or proposer.model
-                ),
+                model=(configured_model or os.environ.get("LAB_CODE_EXPERIMENT_MODEL") or proposer.model),
                 temperature=0.2,
                 max_tokens=proposer.max_tokens,
             )
@@ -144,14 +73,19 @@ class TheoremResearchLab(PartialResumeTheoremResearchLab):
                 proposer.system_prompt.rstrip()
                 + "\n\nTOOL UPDATE: Hesaplamalı deney gerekiyorsa tool_request içinde "
                 + "{\"tool\":\"code_experiment\",\"task\":\"deney hedefi\"} kullanabilirsin. "
-                + "Bu seçenek, görev mesajındaki eski tool enum listesinde görünmese bile geçerlidir. "
-                + "CodeExperimentAgent kod yazıp çalıştıracak; finite computation ispat değildir."
+                + "CodeExperimentAgent kod yazıp gerçekten çalıştıracak. Finite computation ispat değildir; "
+                + "finish ancak gerçek başarılı execution evidence sonrası kabul edilir."
             )
         return super().run(problem, proposer=proposer, **kwargs)
 
     def _cached_workspace_action(self, cache_key: str, action: dict[str, Any]) -> WorkspaceActionResult:
+        fingerprint = content_fingerprint("code_experiment_action:v2", action)
         cached = self._cache_get(cache_key)
-        if isinstance(cached, dict) and cached.get("status") == "COMPLETE":
+        if (
+            isinstance(cached, dict)
+            and cached.get("status") == "COMPLETE"
+            and cached.get("fingerprint") == fingerprint
+        ):
             raw = cached.get("result") or {}
             self.trace.log("step_reused", step_key=cache_key, tool="code_experiment_action")
             return WorkspaceActionResult(
@@ -161,14 +95,13 @@ class TheoremResearchLab(PartialResumeTheoremResearchLab):
                 str(raw.get("error") or ""),
                 dict(raw.get("metadata") or {}),
             )
+        if isinstance(cached, dict) and cached.get("status") == "COMPLETE":
+            self.trace.log("cache_fingerprint_miss", step_key=cache_key, kind="code_experiment_action")
 
         result = self.code_workspace.execute(action)
         self._cache_put(
             cache_key,
-            {
-                "status": "COMPLETE",
-                "result": result.as_dict(),
-            },
+            {"status": "COMPLETE", "fingerprint": fingerprint, "result": result.as_dict()},
         )
         return result
 
@@ -177,8 +110,23 @@ class TheoremResearchLab(PartialResumeTheoremResearchLab):
         if tool != "code_experiment":
             return super()._tool(request, step_key)
 
+        fingerprint = content_fingerprint(
+            "code_experiment_tool:v2",
+            {
+                "request": request or {},
+                "agent_model": getattr(self.code_agent, "model", None),
+                "agent_system_prompt": getattr(self.code_agent, "system_prompt", None),
+                "reasoning_effort": getattr(self.code_agent, "reasoning_effort", None),
+                "max_steps": self.code_runner.max_steps,
+                "capabilities": self.code_workspace.capability_summary(),
+            },
+        )
         cached = self._cache_get(step_key)
-        if isinstance(cached, dict) and cached.get("status") == "COMPLETE":
+        if (
+            isinstance(cached, dict)
+            and cached.get("status") == "COMPLETE"
+            and cached.get("fingerprint") == fingerprint
+        ):
             raw = cached.get("result")
             if isinstance(raw, dict):
                 self.trace.log("step_reused", step_key=step_key, tool="code_experiment")
@@ -189,6 +137,8 @@ class TheoremResearchLab(PartialResumeTheoremResearchLab):
                     str(raw.get("error") or ""),
                     dict(raw.get("metadata") or {}),
                 )
+        elif isinstance(cached, dict) and cached.get("status") == "COMPLETE":
+            self.trace.log("cache_fingerprint_miss", step_key=step_key, kind="code_experiment")
 
         self._check_stop()
         self._set_runtime(current_step=step_key)
@@ -219,9 +169,6 @@ class TheoremResearchLab(PartialResumeTheoremResearchLab):
         self.trace.log("tool_result", step_key=step_key, **result.as_dict())
         self._cache_put(
             step_key,
-            {
-                "status": "COMPLETE",
-                "result": result.as_dict(),
-            },
+            {"status": "COMPLETE", "fingerprint": fingerprint, "result": result.as_dict()},
         )
         return result
