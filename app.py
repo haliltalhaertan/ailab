@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -201,13 +202,23 @@ def build_sidebar(exp_name, model_ids, model_labels):
     prompt = st.sidebar.text_area(exp["prompt_label"], value=exp["default_prompt"], height=145)
     param = None
     if exp["param_label"]:
-        param = st.sidebar.number_input(exp["param_label"], min_value=1, max_value=100 if exp["method"] == "theorem_lab" else 10, value=exp["param_default"])
+        param = st.sidebar.number_input(
+            exp["param_label"],
+            min_value=1,
+            max_value=100 if exp["method"] == "theorem_lab" else 10,
+            value=exp["param_default"],
+        )
 
     extras = {}
     if exp["method"] == "theorem_lab":
         extras["project_id"] = slugify(st.sidebar.text_input("Project ID", value="tropical-circuit"))
-        extras["literature_query"] = st.sidebar.text_input("Literatür arama sorgusu", value=os.environ.get("LAB_LITERATURE_QUERY", "tropical circuit reachability provenance lower bound"))
-        extras["checkpoint_every"] = st.sidebar.number_input("Checkpoint sıklığı (tur)", min_value=1, max_value=20, value=2)
+        extras["literature_query"] = st.sidebar.text_input(
+            "Literatür arama sorgusu",
+            value=os.environ.get("LAB_LITERATURE_QUERY", "tropical circuit reachability provenance lower bound"),
+        )
+        extras["checkpoint_every"] = st.sidebar.number_input(
+            "Checkpoint sıklığı (tur)", min_value=1, max_value=20, value=2
+        )
 
     agents, optional = [], {}
     role_counts = {}
@@ -216,13 +227,22 @@ def build_sidebar(exp_name, model_ids, model_labels):
         display_role = role if role_counts[role] == 1 else f"{role} {role_counts[role]}"
         key = f"{exp_name}_{i}_{role_counts[role]}"
         is_optional = role in exp["optional_roles"]
-        if is_optional and not st.sidebar.checkbox(f"{display_role} dahil et", value=True, key=f"inc_{key}"):
+        if is_optional and not st.sidebar.checkbox(
+            f"{display_role} dahil et", value=True, key=f"inc_{key}"
+        ):
             continue
 
         with st.sidebar.expander(display_role, expanded=exp["method"] == "theorem_lab"):
-            sys_prompt = st.text_area("Sistem promptu", ROLE_LIBRARY.get(role, ROLE_LIBRARY["Panelist"]), key=f"p_{key}", height=110)
+            sys_prompt = st.text_area(
+                "Sistem promptu",
+                ROLE_LIBRARY.get(role, ROLE_LIBRARY["Panelist"]),
+                key=f"p_{key}",
+                height=110,
+            )
             wanted_default = default_model(role)
-            query = st.text_input("Model ara", placeholder="örn. 5.3, glm, kimi, flash", key=f"search_{key}")
+            query = st.text_input(
+                "Model ara", placeholder="örn. 5.3, glm, kimi, flash", key=f"search_{key}"
+            )
             choices = filter_models(model_ids, model_labels, query)
             if not query and wanted_default not in choices:
                 choices.insert(0, wanted_default)
@@ -232,18 +252,36 @@ def build_sidebar(exp_name, model_ids, model_labels):
 
             if choices:
                 preferred = wanted_default if wanted_default in choices else choices[0]
-                model = st.selectbox("OpenRouter modeli", choices, index=choices.index(preferred), format_func=lambda mid: model_labels.get(mid, mid), key=f"m_{key}_{query.casefold()}")
+                model = st.selectbox(
+                    "OpenRouter modeli",
+                    choices,
+                    index=choices.index(preferred),
+                    format_func=lambda mid: model_labels.get(mid, mid),
+                    key=f"m_{key}_{query.casefold()}",
+                )
             else:
                 st.warning("Eşleşen model yok. Aramayı değiştir veya manuel model ID gir.")
                 model = wanted_default
 
-            manual = st.text_input("Manuel model ID (opsiyonel)", placeholder="örn. z-ai/glm-5.3", key=f"manual_{key}").strip()
+            manual = st.text_input(
+                "Manuel model ID (opsiyonel)",
+                placeholder="örn. z-ai/glm-5.3",
+                key=f"manual_{key}",
+            ).strip()
             if manual:
                 model = manual
-            temp = st.slider("Sıcaklık", 0.0, 1.5, ROLE_TEMPS.get(role, 0.7), 0.05, key=f"t_{key}")
+            temp = st.slider(
+                "Sıcaklık", 0.0, 1.5, ROLE_TEMPS.get(role, 0.7), 0.05, key=f"t_{key}"
+            )
             st.caption(f"Kullanılacak model: `{model}`")
 
-        cfg = {"role": role, "display_role": display_role, "prompt": sys_prompt, "model": model, "temp": temp}
+        cfg = {
+            "role": role,
+            "display_role": display_role,
+            "prompt": sys_prompt,
+            "model": model,
+            "temp": temp,
+        }
         if is_optional:
             optional[display_role] = cfg
         else:
@@ -252,7 +290,12 @@ def build_sidebar(exp_name, model_ids, model_labels):
 
 
 def _agent(cfg):
-    return Agent(name=cfg["display_role"], system_prompt=cfg["prompt"], model=cfg["model"], temperature=cfg["temp"])
+    return Agent(
+        name=cfg["display_role"],
+        system_prompt=cfg["prompt"],
+        model=cfg["model"],
+        temperature=cfg["temp"],
+    )
 
 
 def _event_time(event: dict) -> str:
@@ -275,7 +318,10 @@ def _event_summary(event: dict) -> str:
     if kind == "tool_result":
         return f"Tool sonucu: {event.get('tool')} ok={event.get('ok')}"
     if kind == "state_change":
-        return f"State: {event.get('item_id')} {event.get('old_status', '')}→{event.get('new_status', event.get('status', ''))}"
+        return (
+            f"State: {event.get('item_id')} {event.get('old_status', '')}→"
+            f"{event.get('new_status', event.get('status', ''))}"
+        )
     if kind == "checkpoint":
         return "Checkpoint kaydedildi"
     if kind == "literature_search":
@@ -283,10 +329,27 @@ def _event_summary(event: dict) -> str:
     return kind
 
 
+def _tool_status(event: dict) -> tuple[str, str]:
+    error = str(event.get("error") or "").strip()
+    metadata = event.get("metadata") or {}
+    metadata_status = str(metadata.get("status") or "").upper()
+    if error:
+        return "HATA", "error"
+    if metadata_status == "COUNTEREXAMPLE":
+        return "COUNTEREXAMPLE", "error"
+    if bool(event.get("ok")):
+        return "PASS", "success"
+    return "FAIL", "error"
+
+
 def render_timeline_event(target, event: dict) -> None:
+    """Render non-stream events. Stream/runtime events are handled by LiveTimelineRenderer."""
     kind = str(event.get("type", "event"))
     clock = _event_time(event)
     stamp = f"`{clock}` " if clock else ""
+
+    if kind in {"agent_stream", "runtime_state", "agent_start", "llm_call", "agent_error", "agent_retry"}:
+        return
 
     if kind == "run_config":
         target.markdown(f"{stamp}**Sistem** — çalışma yapılandırması yüklendi")
@@ -301,7 +364,10 @@ def render_timeline_event(target, event: dict) -> None:
         return
 
     if kind == "iteration_start":
-        target.markdown(f"{stamp}**Tur {event.get('iteration')}** — başladı · sonraki hedef: {event.get('next_task', '')}")
+        target.markdown(
+            f"{stamp}**Tur {event.get('iteration')}** — başladı · sonraki hedef: "
+            f"{event.get('next_task', '')}"
+        )
         return
 
     if kind == "iteration_end":
@@ -332,55 +398,6 @@ def render_timeline_event(target, event: dict) -> None:
         target.error(f"{clock} Literatür araması hata verdi: {event.get('error', '')}")
         return
 
-    if kind == "agent_start":
-        agent = str(event.get("agent", "Agent"))
-        target.markdown(f"{stamp}**{agent}** · `{event.get('model', '')}` — çalışmaya başladı")
-        with target.expander(f"{agent} · verilen görev", expanded=False):
-            if event.get("system_prompt"):
-                st.markdown("**System prompt**")
-                st.code(str(event["system_prompt"]), language=None)
-            st.markdown("**User/task prompt**")
-            st.code(str(event.get("prompt", "")), language=None)
-        return
-
-    if kind == "llm_call":
-        agent = str(event.get("agent", "Agent"))
-        cost = event.get("cost_usd")
-        cost_text_value = f"${float(cost):.6f}" if cost is not None else "ücret N/A"
-        target.markdown(
-            f"{stamp}**{agent}** · `{event.get('model', '')}` — tamamlandı · "
-            f"{int(event.get('total_tokens', 0) or 0):,} token · {cost_text_value} · "
-            f"{float(event.get('latency_s', 0) or 0):.1f} sn"
-        )
-        with target.expander(f"{agent} · tam çağrı ayrıntıları", expanded=False):
-            st.markdown("**API'ye gönderilen tam messages**")
-            for msg in event.get("messages", []) or []:
-                role = str(msg.get("role", "?"))
-                st.markdown(f"`{role}`")
-                st.code(str(msg.get("content", "")), language=None)
-
-            reasoning = str(event.get("provider_reasoning") or "").strip()
-            reasoning_details = event.get("reasoning_details")
-            reasoning_tokens = int(event.get("reasoning_tokens", 0) or 0)
-            if reasoning or reasoning_details:
-                st.markdown("**Provider tarafından döndürülen reasoning**")
-                if reasoning:
-                    st.code(reasoning, language=None)
-                if reasoning_details:
-                    st.json(reasoning_details)
-            elif reasoning_tokens:
-                st.caption(
-                    f"Model {reasoning_tokens:,} reasoning token bildirdi ancak provider reasoning metnini expose etmedi."
-                )
-
-            st.markdown("**Final cevap**")
-            st.code(str(event.get("output", "")), language=None)
-            st.caption(
-                f"input={event.get('prompt_tokens', 0):,} · output={event.get('completion_tokens', 0):,} · "
-                f"reasoning={reasoning_tokens:,} · cached={event.get('cached_tokens', 0):,}"
-            )
-        return
-
     if kind == "tool_start":
         request = event.get("request", {}) or {}
         tool = str(request.get("tool", "tool"))
@@ -391,10 +408,9 @@ def render_timeline_event(target, event: dict) -> None:
 
     if kind == "tool_result":
         tool = str(event.get("tool", "tool"))
-        ok = bool(event.get("ok"))
-        status = "PASS" if ok else "FAIL/COUNTEREXAMPLE"
-        target.markdown(f"{stamp}**Araç** · `{tool}` — **{status}**")
-        with target.expander(f"{tool} · çıktı", expanded=False):
+        label, tone = _tool_status(event)
+        target.markdown(f"{stamp}**Araç** · `{tool}` — **{label}**")
+        with target.expander(f"{tool} · çıktı", expanded=label in {"HATA", "COUNTEREXAMPLE"}):
             if event.get("output"):
                 st.code(str(event["output"]), language=None)
             if event.get("error"):
@@ -409,16 +425,22 @@ def render_timeline_event(target, event: dict) -> None:
         old_status = event.get("old_status")
         new_status = event.get("new_status", event.get("status"))
         if action == "create":
-            target.markdown(f"{stamp}**Research State** — `{item_id}` oluşturuldu · **{new_status or event.get('status', '')}**")
+            target.markdown(
+                f"{stamp}**Research State** — `{item_id}` oluşturuldu · "
+                f"**{new_status or event.get('status', '')}**"
+            )
             if event.get("claim"):
                 target.caption(str(event["claim"]))
         elif action == "counterexample":
-            target.markdown(f"{stamp}**Counterexample** — `{event.get('target_id', '')}` için karşıörnek kaydedildi")
+            target.markdown(
+                f"{stamp}**Counterexample** — `{event.get('target_id', '')}` için karşıörnek kaydedildi"
+            )
             with target.expander("Counterexample ayrıntısı", expanded=False):
                 st.json(event.get("detail"))
         else:
             target.markdown(
-                f"{stamp}**Research State** — `{item_id}` · `{old_status or '?'}` → **{new_status or '?'}**"
+                f"{stamp}**Research State** — `{item_id}` · `{old_status or '?'}` → "
+                f"**{new_status or '?'}**"
                 + (f" · karar `{event.get('decision')}`" if event.get("decision") else "")
             )
             if event.get("reason"):
@@ -435,7 +457,241 @@ def render_timeline_event(target, event: dict) -> None:
                 st.code(str(event["audit"]), language=None)
         return
 
-    target.caption(f"{stamp}{kind}: {json.dumps({k: v for k, v in event.items() if k not in {'type', 'ts', '_live_time'}}, ensure_ascii=False)[:500]}")
+    if kind == "step_reused":
+        target.caption(
+            f"♻️ `{event.get('step_key', '')}` tamamlanmış kayıttan yeniden kullanıldı"
+        )
+        return
+
+    if kind == "run_paused":
+        target.warning(f"Araştırma hata nedeniyle beklemeye alındı: {event.get('error', '')}")
+        return
+
+    if kind == "run_stopped":
+        target.warning("Araştırma kullanıcı isteğiyle durduruldu; tamamlanan adımlar korundu.")
+        return
+
+    if kind in {"agent_retry"}:
+        return
+
+    target.caption(
+        f"{stamp}{kind}: "
+        + json.dumps(
+            {k: v for k, v in event.items() if k not in {"type", "ts", "_live_time"}},
+            ensure_ascii=False,
+        )[:500]
+    )
+
+
+class LiveTimelineRenderer:
+    """OpenCode-like readable timeline while preserving raw events in trace.jsonl."""
+
+    def __init__(self, target, *, live: bool):
+        self.target = target
+        self.live = live
+        self.runtime_slot = target.empty()
+        self.cards: dict[str, dict] = {}
+        self.latest_by_agent: dict[str, str] = {}
+
+    def _key(self, event: dict) -> str:
+        explicit = str(event.get("step_key") or "").strip()
+        if explicit:
+            return explicit
+        agent = str(event.get("agent") or "Agent")
+        return self.latest_by_agent.get(agent, f"{agent}:{len(self.cards) + 1}")
+
+    def _ensure_card(self, event: dict) -> dict:
+        key = self._key(event)
+        if key in self.cards:
+            return self.cards[key]
+
+        agent = str(event.get("agent") or "Agent")
+        model = str(event.get("model") or "")
+        card = self.target.container(border=True)
+        header = card.empty()
+        header.markdown(f"⏳ **{agent}** · `{model}` — çalışıyor")
+        reasoning_tab, answer_tab, task_tab = card.tabs(["🧠 Reasoning", "✍️ Cevap", "📋 Görev"])
+        with reasoning_tab:
+            reasoning_slot = st.empty()
+            reasoning_slot.caption("Provider reasoning gönderirse burada canlı görünecek.")
+        with answer_tab:
+            answer_slot = st.empty()
+            answer_slot.caption("Yanıt bekleniyor…")
+        with task_tab:
+            if event.get("system_prompt"):
+                st.markdown("**System prompt**")
+                st.code(str(event.get("system_prompt") or ""), language=None)
+            if event.get("prompt"):
+                st.markdown("**User/task prompt**")
+                st.code(str(event.get("prompt") or ""), language=None)
+            if not event.get("system_prompt") and not event.get("prompt"):
+                st.caption("Görev ayrıntısı bu event içinde yok.")
+        footer = card.empty()
+        attempt = event.get("attempt")
+        footer.caption(f"Adım: `{key}`" + (f" · deneme {attempt}" if attempt else ""))
+
+        state = {
+            "key": key,
+            "agent": agent,
+            "model": model,
+            "header": header,
+            "reasoning_slot": reasoning_slot,
+            "answer_slot": answer_slot,
+            "footer": footer,
+            "reasoning": "",
+            "content": "",
+            "last_reasoning_render": 0.0,
+            "last_content_render": 0.0,
+            "complete": False,
+        }
+        self.cards[key] = state
+        self.latest_by_agent[agent] = key
+        return state
+
+    def _render_buffer(self, state: dict, channel: str, *, force: bool = False) -> None:
+        now = time.monotonic()
+        if channel == "reasoning":
+            text = state["reasoning"]
+            last_key = "last_reasoning_render"
+            slot = state["reasoning_slot"]
+        else:
+            text = state["content"]
+            last_key = "last_content_render"
+            slot = state["answer_slot"]
+        if not text:
+            return
+        if not force and self.live and now - float(state[last_key]) < 0.08:
+            return
+        state[last_key] = now
+        slot.markdown(text)
+
+    def _runtime(self, event: dict) -> None:
+        status = str(event.get("status") or "")
+        iteration = int(event.get("current_iteration", 0) or 0)
+        step = str(event.get("current_step") or "-")
+        completed = int(event.get("completed_iterations", 0) or 0)
+        self.runtime_slot.caption(
+            f"**Durum:** `{status}` · **Tur:** {iteration} · **Tamamlanan:** {completed} · "
+            f"**Aktif adım:** `{step}`"
+        )
+
+    def _start(self, event: dict) -> None:
+        state = self._ensure_card(event)
+        agent = str(event.get("agent") or state["agent"])
+        model = str(event.get("model") or state["model"])
+        attempt = event.get("attempt")
+        state["agent"] = agent
+        state["model"] = model
+        state["header"].markdown(
+            f"⏳ **{agent}** · `{model}` — çalışıyor"
+            + (f" · deneme {attempt}" if attempt and int(attempt) > 1 else "")
+        )
+        self.latest_by_agent[agent] = state["key"]
+
+    def _stream(self, event: dict) -> None:
+        state = self._ensure_card(event)
+        channel = str(event.get("channel") or "")
+        delta = event.get("delta")
+        if channel == "reasoning" and isinstance(delta, str):
+            state["reasoning"] += delta
+            if self.live:
+                self._render_buffer(state, "reasoning")
+        elif channel == "content" and isinstance(delta, str):
+            state["content"] += delta
+            if self.live:
+                self._render_buffer(state, "content")
+        # reasoning_details are intentionally kept in raw logs instead of cluttering this view.
+
+    def _complete(self, event: dict) -> None:
+        agent = str(event.get("agent") or "Agent")
+        key = self.latest_by_agent.get(agent)
+        state = self.cards.get(key) if key else None
+        if state is None:
+            state = self._ensure_card(event)
+
+        full_reasoning = str(event.get("provider_reasoning") or "")
+        full_content = str(event.get("output") or "")
+        if full_reasoning:
+            state["reasoning"] = full_reasoning
+        if full_content:
+            state["content"] = full_content
+        self._render_buffer(state, "reasoning", force=True)
+        self._render_buffer(state, "content", force=True)
+
+        reasoning_tokens = int(event.get("reasoning_tokens", 0) or 0)
+        if not state["reasoning"] and reasoning_tokens:
+            state["reasoning_slot"].caption(
+                f"Model {reasoning_tokens:,} reasoning token kullandı ancak provider reasoning metnini expose etmedi."
+            )
+        elif not state["reasoning"]:
+            state["reasoning_slot"].caption("Bu model/provider görünür reasoning metni göndermedi.")
+
+        cost = event.get("cost_usd")
+        cost_text_value = f"${float(cost):.6f}" if cost is not None else "ücret N/A"
+        total_tokens = int(event.get("total_tokens", 0) or 0)
+        latency = float(event.get("latency_s", 0) or 0)
+        state["header"].markdown(
+            f"✅ **{agent}** · `{event.get('model', state['model'])}` — tamamlandı · "
+            f"{total_tokens:,} token · {cost_text_value} · {latency:.1f} sn"
+        )
+        state["footer"].caption(
+            f"input={int(event.get('prompt_tokens', 0) or 0):,} · "
+            f"output={int(event.get('completion_tokens', 0) or 0):,} · "
+            f"reasoning={reasoning_tokens:,} · cached={int(event.get('cached_tokens', 0) or 0):,} · "
+            f"adım `{state['key']}`"
+        )
+        state["complete"] = True
+
+    def _error(self, event: dict) -> None:
+        state = self._ensure_card(event)
+        retrying = bool(event.get("retrying"))
+        error = str(event.get("error") or "Bilinmeyen hata")
+        if retrying:
+            state["header"].markdown(
+                f"⚠️ **{state['agent']}** · `{state['model']}` — çağrı hatası, yeniden denenecek"
+            )
+            state["footer"].warning(error)
+        else:
+            state["header"].markdown(
+                f"❌ **{state['agent']}** · `{state['model']}` — bu adım tamamlanamadı"
+            )
+            state["footer"].error(error)
+
+    def _retry(self, event: dict) -> None:
+        key = str(event.get("step_key") or "")
+        state = self.cards.get(key)
+        if state:
+            state["footer"].caption(
+                f"Geçici hata sonrası {event.get('wait_s', '?')} sn bekleniyor · "
+                f"sonraki deneme {event.get('next_attempt', '?')}"
+            )
+
+    def handle(self, event: dict) -> None:
+        kind = str(event.get("type") or "event")
+        if kind == "runtime_state":
+            self._runtime(event)
+            return
+        if kind == "agent_start":
+            self._start(event)
+            return
+        if kind == "agent_stream":
+            self._stream(event)
+            return
+        if kind == "llm_call":
+            self._complete(event)
+            return
+        if kind == "agent_error":
+            self._error(event)
+            return
+        if kind == "agent_retry":
+            self._retry(event)
+            return
+        render_timeline_event(self.target, event)
+
+    def finalize(self) -> None:
+        for state in self.cards.values():
+            self._render_buffer(state, "reasoning", force=True)
+            self._render_buffer(state, "content", force=True)
 
 
 def load_trace_events(path: Path) -> list[dict]:
@@ -450,6 +706,16 @@ def load_trace_events(path: Path) -> list[dict]:
     return events
 
 
+def _read_runtime(state: ResearchState) -> dict:
+    path = state.root / "runtime.json"
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
 def execute(exp_name, prompt, param, agents, optional, extras):
     exp = EXPERIMENTS[exp_name]
     steps = []
@@ -458,11 +724,14 @@ def execute(exp_name, prompt, param, agents, optional, extras):
         st.write(prompt)
     st.subheader("Canlı Araştırma Akışı")
     timeline = st.container(border=True)
+    renderer = LiveTimelineRenderer(timeline, live=True)
     run_status = st.status("Araştırma çalışıyor...", expanded=False)
+    theorem_state = None
 
     def on_event(event: dict):
-        steps.append(_event_summary(event))
-        render_timeline_event(timeline, event)
+        if event.get("type") not in {"agent_stream", "runtime_state"}:
+            steps.append(_event_summary(event))
+        renderer.handle(event)
 
     trace = ObservedTrace(exp["slug"], on_event=on_event)
     try:
@@ -471,7 +740,7 @@ def execute(exp_name, prompt, param, agents, optional, extras):
         method = exp["method"]
         if method == "theorem_lab":
             by_role = {cfg["role"]: _agent(cfg) for cfg in agents}
-            state = ResearchState(f"research_state/{extras['project_id']}")
+            theorem_state = ResearchState(f"research_state/{extras['project_id']}")
             trace.log(
                 "run_config",
                 experiment=exp_name,
@@ -479,7 +748,7 @@ def execute(exp_name, prompt, param, agents, optional, extras):
                 iterations=int(param),
                 models={r: a.model for r, a in by_role.items()},
             )
-            result = TheoremResearchLab(trace, state, toolbox=ResearchToolbox()).run(
+            result = TheoremResearchLab(trace, theorem_state, toolbox=ResearchToolbox()).run(
                 prompt,
                 manager=by_role["ResearchManager"],
                 proposer=by_role["Theorist"],
@@ -494,7 +763,13 @@ def execute(exp_name, prompt, param, agents, optional, extras):
         else:
             orch = Orchestrator(trace)
             if method == "research_loop":
-                result = orch.research_loop(prompt, a_objs[0], a_objs[1], iterations=int(param), synthesizer=o_objs.get("Raporcu"))
+                result = orch.research_loop(
+                    prompt,
+                    a_objs[0],
+                    a_objs[1],
+                    iterations=int(param),
+                    synthesizer=o_objs.get("Raporcu"),
+                )
             elif method == "debate":
                 result = orch.debate(prompt, a_objs[:2], rounds=int(param), judge=o_objs.get("Hakem"))
             elif method == "pipeline":
@@ -506,9 +781,18 @@ def execute(exp_name, prompt, param, agents, optional, extras):
         st.error(f"Deney başarısız: {exc}")
         return None
     finally:
+        renderer.finalize()
         summary_path = trace.close()
 
-    run_status.update(label="Araştırma tamamlandı", state="complete")
+    runtime = _read_runtime(theorem_state) if theorem_state is not None else {}
+    runtime_status = str(runtime.get("status") or "")
+    if runtime_status == "PAUSED_ERROR":
+        run_status.update(label="Araştırma hata nedeniyle beklemede", state="error", expanded=True)
+    elif runtime_status == "STOPPED":
+        run_status.update(label="Araştırma güvenli biçimde durduruldu", state="complete")
+    else:
+        run_status.update(label="Araştırma tamamlandı", state="complete")
+
     return {
         "exp": exp_name,
         "result": result,
@@ -561,7 +845,11 @@ def render_result(last):
 
 
 def render_history():
-    traces = sorted(RUNS_DIR.glob("*/trace.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True) if RUNS_DIR.exists() else []
+    traces = (
+        sorted(RUNS_DIR.glob("*/trace.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if RUNS_DIR.exists()
+        else []
+    )
     if not traces:
         st.info("Henüz kayıt yok.")
         return
@@ -599,10 +887,14 @@ def render_history():
         )
 
     st.subheader("Tam Araştırma Timeline'ı")
-    st.caption("Promptlar, agent cevapları, provider reasoning (varsa), tool çağrıları, state değişiklikleri ve checkpointler kronolojik sırada.")
+    st.caption(
+        "Okunabilir görünüm: stream parçaları ajan kartlarında birleştirilir. Tam ham JSON için Ham Loglar sayfasını kullan."
+    )
     timeline = st.container(border=True)
+    renderer = LiveTimelineRenderer(timeline, live=False)
     for event in all_events:
-        render_timeline_event(timeline, event)
+        renderer.handle(event)
+    renderer.finalize()
 
 
 def main():
@@ -615,7 +907,9 @@ def main():
 
     model_ids, model_labels, catalog_error = model_catalog()
     if catalog_error:
-        st.sidebar.warning("Canlı OpenRouter listesi alınamadı; fallback liste gösteriliyor. Manuel model ID yine kullanılabilir.")
+        st.sidebar.warning(
+            "Canlı OpenRouter listesi alınamadı; fallback liste gösteriliyor. Manuel model ID yine kullanılabilir."
+        )
     else:
         st.sidebar.caption(f"OpenRouter kataloğu: {len(model_ids)} text modeli")
     if st.sidebar.button("Model listesini yenile"):
