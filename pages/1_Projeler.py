@@ -23,6 +23,7 @@ PROJECT_FORM_KEYS = [
     "new_project_id",
     "new_description",
     "new_experiment",
+    "new_experiment_widget",
     "new_problem",
     "new_literature_query",
     "new_tags",
@@ -61,6 +62,7 @@ def apply_draft(draft) -> None:
     st.session_state["new_project_id"] = data["project_id"]
     st.session_state["new_description"] = data["description"]
     st.session_state["new_experiment"] = data["experiment"]
+    st.session_state["new_experiment_widget"] = data["experiment"]
     st.session_state["new_problem"] = data["problem"]
     st.session_state["new_literature_query"] = data["literature_query"]
     st.session_state["new_tags"] = ", ".join(data["tags"])
@@ -172,6 +174,7 @@ if st.session_state.get("show_create_project", False):
                     if current_exp not in EXPERIMENTS:
                         current_exp = "Teorem Araştırması"
                         st.session_state["new_experiment"] = current_exp
+                        st.session_state["new_experiment_widget"] = current_exp
                     experiment = st.selectbox(
                         "Varsayılan deney türü",
                         EXPERIMENTS,
@@ -295,6 +298,7 @@ for project in projects:
         with st.expander("Geçmiş / ayrıntılar", expanded=False):
             st.json({
                 "project_id": project.project_id,
+                "project_uuid": project.project_uuid,
                 "status": project.status,
                 "experiment": project.experiment,
                 "tags": project.tags,
@@ -308,7 +312,10 @@ for project in projects:
                 st.caption("Bu projeye bağlı kayıtlı run bulunamadı.")
 
         with st.expander("Tehlikeli işlemler", expanded=False):
-            st.warning("Silme işlemi araştırma state klasörünü kalıcı olarak siler. Runs klasöründeki eski loglar silinmez.")
+            st.warning(
+                "Silme işlemi araştırma state klasörünü kalıcı olarak siler. Runs klasöründeki eski loglar silinmez; "
+                "ancak immutable project UUID nedeniyle aynı project_id ile yeni proje oluşturulsa bile eski geçmiş yeni projeye bağlanmaz."
+            )
             confirm = st.text_input(
                 f"Silmek için `{project.project_id}` yaz",
                 key=f"delete_confirm_{project.project_id}",

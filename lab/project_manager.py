@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,9 +37,22 @@ def _write_json(path: Path, value: Any) -> None:
     tmp.replace(path)
 
 
+def _parse_time(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
 @dataclass
 class ProjectInfo:
     project_id: str
+    project_uuid: str
     title: str
     description: str
     problem: str
@@ -61,10 +75,11 @@ class ProjectInfo:
 
 
 class ProjectManager:
-    """Project-centric facade over existing research_state/<project_id> folders.
+    """Project-centric facade over research_state/<project_id> folders.
 
-    Existing folders created before project.json existed remain discoverable. New
-    metadata is additive; ResearchState file formats are left untouched.
+    ``project_id`` is a human-readable locator. ``project_uuid`` is the immutable
+    identity used for new run association, so deleting and later recreating the
+    same project_id cannot silently inherit another project's history.
     """
 
     def __init__(self, root: str | Path = "research_state", runs_dir: str | Path = "runs"):
@@ -98,8 +113,10 @@ class ProjectManager:
             raise FileExistsError(f"`{pid}` project_id zaten var.")
         root.mkdir(parents=True, exist_ok=True)
         now = _now()
+        project_uuid = uuid.uuid4().hex
         metadata = {
             "project_id": pid,
+            "project_uuid": project_uuid,
             "title": title.strip(),
             "description": description.strip(),
             "experiment": experiment,
@@ -114,7 +131,12 @@ class ProjectManager:
         state = ResearchState(root)
         state.freeze_problem(
             problem,
-            metadata={"project_id": pid, "title": title.strip(), "created_from": "project_manager"},
+            metadata={
+                "project_id": pid,
+                "project_uuid": project_uuid,
+                "title": title.strip(),
+                "created_from": "project_manager",
+            },
         )
         if activate:
             self.set_active(pid)
@@ -125,6 +147,7 @@ class ProjectManager:
         created = str(frozen.get("frozen_at") or "")
         return {
             "project_id": root.name,
+            "project_uuid": uuid.uuid4().hex,
             "title": root.name.replace("-", " ").replace("_", " ").title(),
             "description": "Eski research_state projesi (metadata otomatik türetildi).",
             "experiment": "Teorem Araştırması",
@@ -134,13 +157,22 @@ class ProjectManager:
             "updated_at": created,
             "archived": False,
             "status": "READY",
+            "uuid_migrated_at": _now(),
         }
 
     def _base_metadata(self, root: Path) -> dict[str, Any]:
-        raw = _read_json(root / "project.json", None)
-        if isinstance(raw, dict):
+        path = root / "project.json"
+        raw = _read_json(path, None)
+        if not isinstance(raw, dict):
+            raw = self._legacy_metadata(root)
+            _write_json(path, raw)
             return raw
-        return self._legacy_metadata(root)
+        if not str(raw.get("project_uuid") or "").strip():
+            raw = dict(raw)
+            raw["project_uuid"] = uuid.uuid4().hex
+            raw["uuid_migrated_at"] = _now()
+            _write_json(path, raw)
+        return raw
 
     def _runtime(self, root: Path) -> dict[str, Any]:
         value = _read_json(root / "runtime.json", {})
@@ -158,30 +190,55 @@ class ProjectManager:
         return counts
 
     @staticmethod
-    def _trace_project_id(trace_path: Path) -> str | None:
+    def _trace_identity(trace_path: Path) -> tuple[str | None, str | None, str | None]:
+        pid = None
+        project_uuid = None
+        first_ts = None
         try:
             with trace_path.open("r", encoding="utf-8") as handle:
                 for i, line in enumerate(handle):
-                    if i > 80:
+                    if i > 120:
                         break
                     try:
                         ev = json.loads(line)
                     except json.JSONDecodeError:
                         continue
+                    if first_ts is None and ev.get("ts"):
+                        first_ts = str(ev["ts"])
                     if ev.get("project_id"):
-                        return str(ev["project_id"])
+                        pid = str(ev["project_id"])
+                    if ev.get("project_uuid"):
+                        project_uuid = str(ev["project_uuid"])
+                    if pid and project_uuid:
+                        break
         except OSError:
-            return None
-        return None
+            return None, None, None
+        return pid, project_uuid, first_ts
 
     def run_summaries(self, project_id: str) -> list[dict[str, Any]]:
         pid = _slug(project_id)
+        root = self.project_root(pid)
+        if not root.exists():
+            return []
+        metadata = self._base_metadata(root)
+        current_uuid = str(metadata.get("project_uuid") or "")
+        created_at = _parse_time(str(metadata.get("created_at") or ""))
         rows: list[dict[str, Any]] = []
         if not self.runs_dir.exists():
             return rows
         for trace_path in self.runs_dir.glob("*/trace.jsonl"):
-            if self._trace_project_id(trace_path) != pid:
+            trace_pid, trace_uuid, first_ts = self._trace_identity(trace_path)
+            if trace_pid != pid:
                 continue
+            if trace_uuid:
+                if trace_uuid != current_uuid:
+                    continue
+            elif created_at is not None:
+                trace_time = _parse_time(first_ts or "")
+                # Legacy traces have no project_uuid. They are accepted only when
+                # they are not older than the current project's creation time.
+                if trace_time is not None and trace_time < created_at:
+                    continue
             summary = _read_json(trace_path.parent / "summary.json", {})
             if not isinstance(summary, dict):
                 summary = {}
@@ -189,7 +246,7 @@ class ProjectManager:
                 {
                     "run_id": trace_path.parent.name,
                     "path": str(trace_path.parent),
-                    "started_at": summary.get("started_at", ""),
+                    "started_at": summary.get("started_at", first_ts or ""),
                     "finished_at": summary.get("finished_at", ""),
                     "wall_time_s": float(summary.get("wall_time_s", 0) or 0),
                     "total_calls": int(summary.get("total_calls", 0) or 0),
@@ -213,6 +270,7 @@ class ProjectManager:
         updated = str(runtime.get("updated_at") or metadata.get("updated_at") or "")
         return ProjectInfo(
             project_id=pid,
+            project_uuid=str(metadata.get("project_uuid") or ""),
             title=str(metadata.get("title") or pid),
             description=str(metadata.get("description") or ""),
             problem=str(frozen.get("problem") or ""),
@@ -252,16 +310,26 @@ class ProjectManager:
 
     def set_active(self, project_id: str) -> ProjectInfo:
         info = self.get(project_id)
-        _write_json(self.active_path, {"project_id": info.project_id, "selected_at": _now()})
+        _write_json(
+            self.active_path,
+            {"project_id": info.project_id, "project_uuid": info.project_uuid, "selected_at": _now()},
+        )
         self.touch(info.project_id)
         return info
 
     def active_project_id(self) -> str | None:
         raw = _read_json(self.active_path, {})
         pid = str(raw.get("project_id") or "") if isinstance(raw, dict) else ""
-        if pid and self.project_root(pid).exists():
-            return pid
-        return None
+        if not pid or not self.project_root(pid).exists():
+            return None
+        try:
+            info = self.get(pid)
+        except KeyError:
+            return None
+        saved_uuid = str(raw.get("project_uuid") or "") if isinstance(raw, dict) else ""
+        if saved_uuid and saved_uuid != info.project_uuid:
+            return None
+        return pid
 
     def active_project(self) -> ProjectInfo | None:
         pid = self.active_project_id()
@@ -281,8 +349,10 @@ class ProjectManager:
         if not root.exists():
             return
         metadata = self._base_metadata(root)
+        project_uuid = str(metadata.get("project_uuid") or uuid.uuid4().hex)
         metadata.update(updates)
         metadata["project_id"] = pid
+        metadata["project_uuid"] = project_uuid
         metadata["updated_at"] = _now()
         _write_json(root / "project.json", metadata)
 
