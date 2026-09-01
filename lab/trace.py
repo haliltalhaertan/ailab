@@ -46,6 +46,7 @@ class Trace:
             agent=agent,
             model=model,
             temperature=temperature,
+            reasoning_effort=getattr(response, "requested_reasoning_effort", None),
             messages=exact_messages,
             output=response.content,
             provider_reasoning=getattr(response, "provider_reasoning", ""),
@@ -64,6 +65,7 @@ class Trace:
             return {
                 "calls": 0,
                 "models": [],
+                "reasoning_efforts": [],
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
                 "reasoning_tokens": 0,
@@ -87,6 +89,9 @@ class Trace:
                     t["calls"] += 1
                     if ev.get("model") and ev["model"] not in t["models"]:
                         t["models"].append(ev["model"])
+                    effort = ev.get("reasoning_effort")
+                    if effort is not None and effort not in t["reasoning_efforts"]:
+                        t["reasoning_efforts"].append(effort)
                     t["prompt_tokens"] += int(ev.get("prompt_tokens", 0) or 0)
                     t["completion_tokens"] += int(ev.get("completion_tokens", 0) or 0)
                     t["reasoning_tokens"] += int(ev.get("reasoning_tokens", 0) or 0)

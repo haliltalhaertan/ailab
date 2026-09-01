@@ -6,6 +6,8 @@ from typing import Any, Callable
 
 from openai import OpenAI
 
+from lab.reasoning_settings import normalize_effort
+
 DEFAULT_MODEL = "openai/gpt-4o-mini"
 StreamCallback = Callable[[str, Any], None]
 
@@ -23,6 +25,7 @@ class LLMResponse:
     provider_reasoning: str = ""
     reasoning_details: Any = None
     request_messages: list[dict] | None = None
+    requested_reasoning_effort: str | None = None
 
     @property
     def total_tokens(self) -> int:
@@ -100,9 +103,11 @@ class LLMClient:
         model: str | None = None,
         temperature: float = 0.7,
         max_tokens: int | None = None,
+        reasoning_effort: str | None = None,
         stream_callback: StreamCallback | None = None,
     ) -> LLMResponse:
         model = model or os.environ.get("LAB_MODEL", DEFAULT_MODEL)
+        reasoning_effort = normalize_effort(reasoning_effort)
         kwargs: dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -111,18 +116,29 @@ class LLMClient:
         if max_tokens:
             kwargs["max_tokens"] = max_tokens
         if self.is_openrouter:
-            # Ask OpenRouter to return exact billed usage/cost and expose reasoning
-            # when the selected provider/model supports returning it.
+            # OpenRouter's unified reasoning parameter accepts effort levels
+            # none/minimal/low/medium/high/xhigh. xhigh is shown as "Max" in the UI.
+            reasoning: dict[str, Any] = {"exclude": False}
+            if reasoning_effort is not None:
+                reasoning["effort"] = reasoning_effort
             kwargs["extra_body"] = {
                 "usage": {"include": True},
-                "reasoning": {"exclude": False},
+                "reasoning": reasoning,
             }
 
         if stream_callback is None:
-            return self._complete_once(kwargs, messages, model)
-        return self._complete_stream(kwargs, messages, model, stream_callback)
+            return self._complete_once(kwargs, messages, model, reasoning_effort)
+        return self._complete_stream(
+            kwargs, messages, model, reasoning_effort, stream_callback
+        )
 
-    def _complete_once(self, kwargs: dict[str, Any], messages: list[dict], model: str) -> LLMResponse:
+    def _complete_once(
+        self,
+        kwargs: dict[str, Any],
+        messages: list[dict],
+        model: str,
+        reasoning_effort: str | None,
+    ) -> LLMResponse:
         start = time.perf_counter()
         resp = self._client.chat.completions.create(**kwargs)
         latency = time.perf_counter() - start
@@ -143,6 +159,7 @@ class LLMClient:
             provider_reasoning=str(provider_reasoning),
             reasoning_details=reasoning_details,
             request_messages=[dict(m) for m in messages],
+            requested_reasoning_effort=reasoning_effort,
         )
 
     def _complete_stream(
@@ -150,6 +167,7 @@ class LLMClient:
         kwargs: dict[str, Any],
         messages: list[dict],
         model: str,
+        reasoning_effort: str | None,
         stream_callback: StreamCallback,
     ) -> LLMResponse:
         stream_kwargs = dict(kwargs)
@@ -210,4 +228,5 @@ class LLMClient:
             provider_reasoning="".join(reasoning_parts),
             reasoning_details=reasoning_details or None,
             request_messages=[dict(m) for m in messages],
+            requested_reasoning_effort=reasoning_effort,
         )
