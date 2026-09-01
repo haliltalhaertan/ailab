@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import ast
-import importlib.util
 import json
 import os
-import signal
+import shutil
 import subprocess
-import sys
 import time
 import uuid
 from dataclasses import dataclass
@@ -14,11 +12,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-import psutil
-
 from lab.agent import Agent
 from lab.integrity import sha256_file
-from lab.theorem_lab import extract_json_object
+from lab.json_io import parse_json_object
 from lab.tools import ToolResult
 from lab.trace import Trace
 
@@ -44,8 +40,7 @@ SAFE_IMPORT_ROOTS = {
     "statistics",
     "typing",
 }
-OPTIONAL_SCIENTIFIC_IMPORTS = {"numpy", "sympy", "networkx"}
-BLOCKED_CALLS = {
+BLOCKED_NAMES = {
     "breakpoint",
     "compile",
     "eval",
@@ -85,13 +80,13 @@ class WorkspaceActionResult:
 
 
 class GuardedExperimentWorkspace:
-    """Project-local execution boundary for LLM-authored experiments.
+    """Project-local authoring workspace with container-only execution.
 
-    The generated program gets no shell action and is AST-filtered before launch.
-    Runtime execution additionally uses an isolated Python process, a scrubbed
-    environment, wall-time cancellation, process-tree monitoring, memory/PID
-    limits, and bounded on-disk stdout/stderr. This materially reduces local risk,
-    but it is still not a VM/container security boundary or a network namespace.
+    The AST policy is defense in depth, not the security boundary. Generated
+    Python is *never* executed directly on the host. ``run_python`` requires
+    Docker or Podman and launches a disposable container with no network,
+    read-only rootfs, no Linux capabilities, no-new-privileges, memory/PID/CPU
+    limits and only this project workspace mounted writable.
     """
 
     def __init__(
@@ -104,7 +99,10 @@ class GuardedExperimentWorkspace:
         max_output_bytes: int = 4 * 1024 * 1024,
         memory_limit_mb: int = 768,
         pid_limit: int = 8,
+        cpu_limit: float = 1.0,
         cancel_check: Callable[[], bool] | None = None,
+        container_engine: str | None = None,
+        container_image: str | None = None,
     ):
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
@@ -114,19 +112,38 @@ class GuardedExperimentWorkspace:
         self.max_file_bytes = int(max_file_bytes)
         self.max_read_chars = int(max_read_chars)
         self.max_output_bytes = max(64 * 1024, int(max_output_bytes))
-        self.memory_limit_bytes = max(128, int(memory_limit_mb)) * 1024 * 1024
+        self.memory_limit_mb = max(128, int(memory_limit_mb))
         self.pid_limit = max(1, int(pid_limit))
+        self.cpu_limit = max(0.1, float(cpu_limit))
         self.cancel_check = cancel_check
-        self.available_optional_imports = {
-            name for name in OPTIONAL_SCIENTIFIC_IMPORTS if importlib.util.find_spec(name) is not None
-        }
+        requested = str(container_engine or os.environ.get("LAB_CODE_CONTAINER_ENGINE") or "").strip()
+        self.container_engine = requested or self._discover_engine()
+        self.container_image = str(
+            container_image or os.environ.get("LAB_CODE_CONTAINER_IMAGE") or "python:3.12-slim"
+        ).strip()
+        extras = str(os.environ.get("LAB_CODE_EXTRA_IMPORTS") or "").strip()
+        self.extra_imports = {x.strip() for x in extras.split(",") if x.strip()}
+
+    @staticmethod
+    def _discover_engine() -> str:
+        for name in ("docker", "podman"):
+            if shutil.which(name):
+                return name
+        return ""
+
+    @property
+    def execution_available(self) -> bool:
+        return bool(self.container_engine and shutil.which(self.container_engine))
 
     def capability_summary(self) -> str:
-        optional = ", ".join(sorted(self.available_optional_imports)) or "(none installed)"
+        engine = self.container_engine or "NONE"
+        extras = ", ".join(sorted(self.extra_imports)) or "none"
         return (
-            f"stdlib imports: {', '.join(sorted(SAFE_IMPORT_ROOTS))}; "
-            f"optional scientific imports currently installed: {optional}. "
-            "Do not import an optional package unless it appears in this list."
+            f"execution=disposable-container; engine={engine}; image={self.container_image}; network=none; "
+            f"rootfs=read-only; workspace-only writable mount; memory={self.memory_limit_mb}MB; "
+            f"pids={self.pid_limit}; cpus={self.cpu_limit}; timeout={self.timeout_s}s; "
+            f"stdlib imports={', '.join(sorted(SAFE_IMPORT_ROOTS))}; configured extra imports={extras}. "
+            + ("Container execution is available." if self.execution_available else "Container engine is NOT available; run_python will fail closed.")
         )
 
     def _resolve(self, relative: str, *, must_exist: bool = False) -> Path:
@@ -149,26 +166,22 @@ class GuardedExperimentWorkspace:
             tree = ast.parse(code)
         except SyntaxError as exc:
             raise UnsafeExperimentCode(f"Python syntax error: {exc}") from exc
-
-        allowed_imports = SAFE_IMPORT_ROOTS | self.available_optional_imports
+        allowed_imports = SAFE_IMPORT_ROOTS | self.extra_imports
         for node in ast.walk(tree):
             if isinstance(node, (ast.Import, ast.ImportFrom)):
                 names = [a.name for a in node.names] if isinstance(node, ast.Import) else [node.module or ""]
                 for name in names:
                     root = name.split(".", 1)[0]
                     if root not in allowed_imports:
-                        if root in OPTIONAL_SCIENTIFIC_IMPORTS:
-                            raise UnsafeExperimentCode(
-                                f"Opsiyonel paket kurulu değil: {root}. Capability listesine göre script üret."
-                            )
                         raise UnsafeExperimentCode(f"İzin verilmeyen import: {root}")
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-                if node.func.id in BLOCKED_CALLS:
-                    raise UnsafeExperimentCode(f"İzin verilmeyen çağrı: {node.func.id}")
+            # Reject blocked builtins at every load site, not only direct Call.func.
+            # This closes aliases such as ``o = open; o(...)`` and ``e = eval``.
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in BLOCKED_NAMES:
+                raise UnsafeExperimentCode(f"İzin verilmeyen isim erişimi: {node.id}")
             if isinstance(node, ast.Attribute) and str(node.attr).startswith("__"):
-                raise UnsafeExperimentCode("Dunder attribute erişimi deney workspace'inde kapalıdır.")
+                raise UnsafeExperimentCode("Dunder attribute erişimi kapalıdır.")
             if isinstance(node, ast.Name) and str(node.id).startswith("__"):
-                raise UnsafeExperimentCode("Dunder isimler deney workspace'inde kapalıdır.")
+                raise UnsafeExperimentCode("Dunder isimler kapalıdır.")
 
     def write_file(self, path: str, content: str) -> WorkspaceActionResult:
         try:
@@ -184,11 +197,7 @@ class GuardedExperimentWorkspace:
                 True,
                 "write_file",
                 output=f"Yazıldı: {target.relative_to(self.root)} ({len(payload)} karakter)",
-                metadata={
-                    "path": str(target.relative_to(self.root)),
-                    "chars": len(payload),
-                    "sha256": sha256_file(target),
-                },
+                metadata={"path": str(target.relative_to(self.root)), "chars": len(payload), "sha256": sha256_file(target)},
             )
         except Exception as exc:
             return WorkspaceActionResult(False, "write_file", error=str(exc))
@@ -209,12 +218,7 @@ class GuardedExperimentWorkspace:
             if target.suffix.lower() == ".py":
                 self._validate_python(updated)
             target.write_text(updated, encoding="utf-8")
-            return WorkspaceActionResult(
-                True,
-                "patch_file",
-                output=f"Patch uygulandı: {target.relative_to(self.root)}",
-                metadata={"path": str(target.relative_to(self.root)), "sha256": sha256_file(target)},
-            )
+            return WorkspaceActionResult(True, "patch_file", output=f"Patch uygulandı: {target.relative_to(self.root)}", metadata={"path": str(target.relative_to(self.root)), "sha256": sha256_file(target)})
         except Exception as exc:
             return WorkspaceActionResult(False, "patch_file", error=str(exc))
 
@@ -226,17 +230,7 @@ class GuardedExperimentWorkspace:
             shown = text[: self.max_read_chars]
             if truncated:
                 shown += "\n...[read truncated; full file remains on disk]"
-            return WorkspaceActionResult(
-                True,
-                "read_file",
-                output=shown,
-                metadata={
-                    "path": str(target.relative_to(self.root)),
-                    "chars": len(text),
-                    "truncated": truncated,
-                    "sha256": sha256_file(target),
-                },
-            )
+            return WorkspaceActionResult(True, "read_file", output=shown, metadata={"path": str(target.relative_to(self.root)), "chars": len(text), "truncated": truncated, "sha256": sha256_file(target)})
         except Exception as exc:
             return WorkspaceActionResult(False, "read_file", error=str(exc))
 
@@ -251,68 +245,12 @@ class GuardedExperimentWorkspace:
                 files.append({"path": rel, "bytes": path.stat().st_size})
                 if len(files) >= 250:
                     break
-        return WorkspaceActionResult(
-            True,
-            "list_files",
-            output=json.dumps(files, ensure_ascii=False, indent=2),
-            metadata={"count": len(files)},
-        )
-
-    def _safe_env(self) -> dict[str, str]:
-        keep = ("PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP")
-        env = {key: os.environ[key] for key in keep if os.environ.get(key)}
-        env["PYTHONIOENCODING"] = "utf-8"
-        env["PYTHONHASHSEED"] = "0"
-        return env
+        return WorkspaceActionResult(True, "list_files", output=json.dumps(files, ensure_ascii=False, indent=2), metadata={"count": len(files)})
 
     def _evidence_paths(self, target: Path) -> tuple[str, Path, Path]:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
         evidence_id = f"{stamp}_{uuid.uuid4().hex[:10]}_{target.stem}"
-        return (
-            evidence_id,
-            self.outputs / f"{evidence_id}.stdout.txt",
-            self.outputs / f"{evidence_id}.stderr.txt",
-        )
-
-    @staticmethod
-    def _kill_tree(proc: subprocess.Popen) -> None:
-        try:
-            parent = psutil.Process(proc.pid)
-            children = parent.children(recursive=True)
-            for child in children:
-                try:
-                    child.kill()
-                except psutil.Error:
-                    pass
-            try:
-                parent.kill()
-            except psutil.Error:
-                pass
-        except psutil.Error:
-            try:
-                if os.name != "nt":
-                    os.killpg(proc.pid, signal.SIGKILL)
-                else:
-                    proc.kill()
-            except Exception:
-                pass
-
-    @staticmethod
-    def _tree_stats(pid: int) -> tuple[int, int]:
-        try:
-            parent = psutil.Process(pid)
-            processes = [parent] + parent.children(recursive=True)
-        except psutil.Error:
-            return 0, 0
-        rss = 0
-        alive = 0
-        for process in processes:
-            try:
-                rss += int(process.memory_info().rss)
-                alive += 1
-            except psutil.Error:
-                continue
-        return rss, alive
+        return evidence_id, self.outputs / f"{evidence_id}.stdout.txt", self.outputs / f"{evidence_id}.stderr.txt"
 
     @staticmethod
     def _preview(path: Path, limit: int = 20_000) -> str:
@@ -320,71 +258,112 @@ class GuardedExperimentWorkspace:
             raw = path.read_bytes()
         except OSError:
             return ""
+        prefix = ""
         if len(raw) > limit:
             raw = raw[-limit:]
             prefix = "...[output preview truncated to tail]...\n"
-        else:
-            prefix = ""
         return prefix + raw.decode("utf-8", errors="replace")
+
+    def _container_name(self) -> str:
+        return "ailab-exp-" + uuid.uuid4().hex[:16]
+
+    def _kill_container(self, name: str) -> None:
+        if not self.execution_available:
+            return
+        try:
+            subprocess.run(
+                [self.container_engine, "rm", "-f", name],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
+            )
+        except Exception:
+            pass
 
     def run_python(self, path: str, args: list[str] | None = None) -> WorkspaceActionResult:
         target: Path | None = None
         stdout_path: Path | None = None
         stderr_path: Path | None = None
         proc: subprocess.Popen | None = None
+        container_name = self._container_name()
+        termination_reason = ""
         try:
             target = self._resolve(path, must_exist=True)
             if target.suffix.lower() != ".py":
                 raise ValueError("run_python yalnızca .py dosyası çalıştırır.")
             code = target.read_text(encoding="utf-8")
             self._validate_python(code)
+            if not self.execution_available:
+                raise RuntimeError(
+                    "Güvenli container engine bulunamadı. Docker veya Podman kurmadan LLM-generated Python host üzerinde çalıştırılmaz."
+                )
             clean_args = [str(x)[:500] for x in (args or [])][:20]
             evidence_id, stdout_path, stderr_path = self._evidence_paths(target)
+            rel_script = target.relative_to(self.root).as_posix()
+            mount = f"type=bind,source={self.root},target=/workspace"
+            command = [
+                self.container_engine,
+                "run",
+                "--rm",
+                "--name",
+                container_name,
+                "--network=none",
+                "--read-only",
+                "--cap-drop=ALL",
+                "--security-opt=no-new-privileges",
+                f"--memory={self.memory_limit_mb}m",
+                f"--pids-limit={self.pid_limit}",
+                f"--cpus={self.cpu_limit}",
+                "--tmpfs",
+                "/tmp:rw,noexec,nosuid,size=64m",
+                "--mount",
+                mount,
+                "--workdir",
+                "/workspace",
+                self.container_image,
+                "python",
+                "-I",
+                f"/workspace/{rel_script}",
+                *clean_args,
+            ]
             started = time.monotonic()
-            creationflags = 0
-            start_new_session = os.name != "nt"
-            if os.name == "nt" and hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
-                creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
             with stdout_path.open("wb") as stdout_handle, stderr_path.open("wb") as stderr_handle:
                 proc = subprocess.Popen(
-                    [sys.executable, "-I", str(target), *clean_args],
-                    cwd=str(self.root),
-                    env=self._safe_env(),
+                    command,
                     stdin=subprocess.DEVNULL,
                     stdout=stdout_handle,
                     stderr=stderr_handle,
-                    creationflags=creationflags,
-                    start_new_session=start_new_session,
+                    env={"PATH": os.environ.get("PATH", "")},
                 )
-                termination_reason = ""
-                peak_rss = 0
-                peak_pids = 1
                 while proc.poll() is None:
                     elapsed = time.monotonic() - started
-                    rss, pids = self._tree_stats(proc.pid)
-                    peak_rss = max(peak_rss, rss)
-                    peak_pids = max(peak_pids, pids)
                     output_bytes = stdout_path.stat().st_size + stderr_path.stat().st_size
                     if self.cancel_check and self.cancel_check():
                         termination_reason = "cancelled"
                     elif elapsed > self.timeout_s:
                         termination_reason = "timeout"
-                    elif rss > self.memory_limit_bytes:
-                        termination_reason = "memory_limit"
-                    elif pids > self.pid_limit:
-                        termination_reason = "pid_limit"
                     elif output_bytes > self.max_output_bytes:
                         termination_reason = "output_limit"
                     if termination_reason:
-                        self._kill_tree(proc)
+                        self._kill_container(container_name)
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
                         break
                     time.sleep(0.05)
                 try:
-                    returncode = proc.wait(timeout=2)
+                    returncode = proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    self._kill_tree(proc)
+                    self._kill_container(container_name)
+                    proc.kill()
                     returncode = proc.wait(timeout=2)
             elapsed = time.monotonic() - started
+            # Catch very fast processes that exceed the output cap between polls.
+            output_bytes = stdout_path.stat().st_size + stderr_path.stat().st_size
+            if output_bytes > self.max_output_bytes and not termination_reason:
+                termination_reason = "output_limit"
             stdout_preview = self._preview(stdout_path)
             stderr_preview = self._preview(stderr_path)
             ok = returncode == 0 and not termination_reason
@@ -394,11 +373,11 @@ class GuardedExperimentWorkspace:
                 "returncode": returncode,
                 "wall_time_s": elapsed,
                 "termination_reason": termination_reason,
-                "peak_rss_bytes": peak_rss,
-                "peak_processes": peak_pids,
-                "memory_limit_bytes": self.memory_limit_bytes,
-                "pid_limit": self.pid_limit,
                 "max_output_bytes": self.max_output_bytes,
+                "container_engine": self.container_engine,
+                "container_image": self.container_image,
+                "network": "none",
+                "rootfs": "read-only",
                 "stdout_file": str(stdout_path.relative_to(self.root)),
                 "stderr_file": str(stderr_path.relative_to(self.root)),
                 "script_sha256": sha256_file(target),
@@ -409,25 +388,21 @@ class GuardedExperimentWorkspace:
             }
             error = stderr_preview.strip()
             if termination_reason:
-                suffix = {
+                reason = {
                     "cancelled": "kullanıcı durdurma isteği",
                     "timeout": f"timeout ({self.timeout_s}s)",
-                    "memory_limit": "memory limiti aşıldı",
-                    "pid_limit": "process limiti aşıldı",
                     "output_limit": "stdout/stderr limiti aşıldı",
                 }.get(termination_reason, termination_reason)
-                error = (error + "\n" if error else "") + suffix
-            return WorkspaceActionResult(
-                ok,
-                "run_python",
-                output=stdout_preview.strip(),
-                error=error,
-                metadata=metadata,
-            )
+                error = (error + "\n" if error else "") + reason
+            return WorkspaceActionResult(ok, "run_python", output=stdout_preview.strip(), error=error, metadata=metadata)
         except Exception as exc:
             if proc is not None and proc.poll() is None:
-                self._kill_tree(proc)
-            metadata: dict[str, Any] = {"evidence_level": "COMPUTATION_ONLY"}
+                self._kill_container(container_name)
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            metadata: dict[str, Any] = {"evidence_level": "COMPUTATION_ONLY", "container_required": True}
             if target is not None and target.exists():
                 metadata["path"] = str(target.relative_to(self.root))
                 metadata["script_sha256"] = sha256_file(target)
@@ -438,36 +413,31 @@ class GuardedExperimentWorkspace:
                 metadata["stderr_file"] = str(stderr_path.relative_to(self.root))
                 metadata["stderr_sha256"] = sha256_file(stderr_path)
             return WorkspaceActionResult(False, "run_python", error=str(exc), metadata=metadata)
+        finally:
+            self._kill_container(container_name)
 
     def execute(self, action: dict[str, Any]) -> WorkspaceActionResult:
         name = str(action.get("action") or "").strip().lower()
         if name == "write_file":
             return self.write_file(str(action.get("path") or ""), str(action.get("content") or ""))
         if name == "patch_file":
-            return self.patch_file(
-                str(action.get("path") or ""),
-                str(action.get("old") or ""),
-                str(action.get("new") or ""),
-            )
+            return self.patch_file(str(action.get("path") or ""), str(action.get("old") or ""), str(action.get("new") or ""))
         if name == "read_file":
             return self.read_file(str(action.get("path") or ""))
         if name == "list_files":
             return self.list_files()
         if name == "run_python":
             args = action.get("args")
-            return self.run_python(
-                str(action.get("path") or ""),
-                [str(x) for x in args] if isinstance(args, list) else None,
-            )
+            return self.run_python(str(action.get("path") or ""), [str(x) for x in args] if isinstance(args, list) else None)
         return WorkspaceActionResult(False, name or "unknown", error=f"Bilinmeyen action: {name}")
 
 
 CODE_EXPERIMENT_SYSTEM_PROMPT = """Sen CodeExperimentAgent'sın.
 Görevin matematik/teorik CS araştırmasındaki aday iddiaları hesaplamalı deneylerle sınamak.
-Kendi proje workspace'in içinde dosya yazabilir, patch edebilir, okuyabilir, listeleyebilir ve Python çalıştırabilirsin.
-Serbest shell yoktur. API anahtarlarına veya workspace dışına erişmeye çalışma.
+Dosya işlemleri proje workspace'iyle sınırlıdır. Python yalnız no-network disposable container içinde çalışır.
+Host shell, host filesystem ve API anahtarları erişilebilir değildir.
 
-Her tur SADECE tek bir JSON object döndür:
+Her tur SADECE tek JSON object döndür:
 {
   "action": "write_file|patch_file|read_file|list_files|run_python|finish",
   "path": "exp_001.py",
@@ -478,9 +448,9 @@ Her tur SADECE tek bir JSON object döndür:
   "summary": "finish için kısa deney özeti"
 }
 
-İlk denemede küçük, deterministik ve denetlenebilir script yaz. Hata/karşıörnek görürsen çıktıya göre düzelt veya yeni deney tasarla.
+Önce küçük, deterministik ve denetlenebilir script yaz. Her tur geçmiş aksiyon/sonuç özetini kullan; aynı hatayı körlemesine tekrarlama.
 finish ancak en az bir gerçek run_python başarıyla bittikten ve en son run_python denemesi başarılı olduktan sonra kabul edilir.
-Finite computation'ı ispat olarak sunma.
+Finite computation ispat değildir.
 """
 
 
@@ -515,46 +485,39 @@ class CodeExperimentRunner:
         call_agent: Callable[[Agent, str, str], str],
         execute_cached: Callable[[str, dict[str, Any]], WorkspaceActionResult],
     ) -> ToolResult:
+        if not self.workspace.execution_available:
+            return ToolResult(
+                False,
+                "code_experiment",
+                error="Docker/Podman bulunamadı; güvenlik nedeniyle LLM-generated Python host üzerinde çalıştırılmadı.",
+                metadata={"status": "CONTAINER_UNAVAILABLE", "evidence_level": "COMPUTATION_ONLY"},
+            )
         observation = self.workspace.list_files().output
+        history: list[dict[str, Any]] = []
         successful_runs: list[dict[str, Any]] = []
         failed_runs: list[dict[str, Any]] = []
         last_run_ok: bool | None = None
         last_result: WorkspaceActionResult | None = None
         for turn in range(1, self.max_steps + 1):
+            history_text = json.dumps(history[-6:], ensure_ascii=False, indent=2)
             prompt = (
                 f"EXPERIMENT TASK:\n{task}\n\n"
                 f"RUNTIME CAPABILITIES:\n{self.workspace.capability_summary()}\n\n"
-                f"WORKSPACE / PREVIOUS OBSERVATION:\n{observation[-self.observation_limit:]}\n\n"
-                f"Successful Python runs so far: {len(successful_runs)}; failed runs: {len(failed_runs)}.\n"
+                f"RECENT ACTION HISTORY:\n{history_text[-self.observation_limit:]}\n\n"
+                f"LATEST OBSERVATION:\n{observation[-self.observation_limit:]}\n\n"
+                f"Successful Python runs: {len(successful_runs)}; failed runs: {len(failed_runs)}.\n"
                 "Choose exactly one next action. Return only the JSON action object."
             )
             raw = call_agent(agent, prompt, f"{step_key}:plan:{turn}")
-            action = extract_json_object(raw)
+            action = parse_json_object(raw)
             action_name = str(action.get("action") or "").lower()
-            self.trace.log(
-                "code_experiment_action",
-                step_key=step_key,
-                turn=turn,
-                agent=agent.name,
-                model=agent.model,
-                action=self._action_for_trace(action),
-            )
+            self.trace.log("code_experiment_action", step_key=step_key, turn=turn, agent=agent.name, model=agent.model, action=self._action_for_trace(action))
             if action_name == "finish":
                 if not successful_runs or last_run_ok is not True:
-                    reason = (
-                        "finish reddedildi: en az bir başarılı run_python gerekli ve en son run_python "
-                        "denemesi başarılı olmalı. Gerçek deney çalıştır veya son hatayı düzelt."
-                    )
-                    self.trace.log(
-                        "code_experiment_finish_rejected",
-                        step_key=step_key,
-                        turn=turn,
-                        successful_runs=len(successful_runs),
-                        failed_runs=len(failed_runs),
-                        last_run_ok=last_run_ok,
-                        reason=reason,
-                    )
+                    reason = "finish reddedildi: en az bir başarılı run_python gerekli ve en son run_python başarılı olmalı."
+                    self.trace.log("code_experiment_finish_rejected", step_key=step_key, turn=turn, successful_runs=len(successful_runs), failed_runs=len(failed_runs), last_run_ok=last_run_ok, reason=reason)
                     observation = reason
+                    history.append({"turn": turn, "action": action, "result": {"ok": False, "error": reason}})
                     continue
                 summary = str(action.get("summary") or "Deney tamamlandı.")
                 files = self.workspace.list_files()
@@ -579,23 +542,12 @@ class CodeExperimentRunner:
 
             last_result = execute_cached(f"{step_key}:action:{turn}", action)
             result_payload = last_result.as_dict()
-            self.trace.log(
-                "code_experiment_result",
-                step_key=step_key,
-                turn=turn,
-                executed_action=action_name,
-                result=result_payload,
-            )
+            self.trace.log("code_experiment_result", step_key=step_key, turn=turn, executed_action=action_name, result=result_payload)
+            history.append({"turn": turn, "action": self._action_for_trace(action), "result": result_payload})
             if action_name == "run_python":
-                evidence_record = {
-                    "ok": bool(last_result.ok),
-                    **dict(last_result.metadata or {}),
-                }
+                evidence_record = {"ok": bool(last_result.ok), **dict(last_result.metadata or {})}
                 last_run_ok = bool(last_result.ok)
-                if last_result.ok:
-                    successful_runs.append(evidence_record)
-                else:
-                    failed_runs.append(evidence_record)
+                (successful_runs if last_result.ok else failed_runs).append(evidence_record)
             observation = json.dumps(result_payload, ensure_ascii=False, indent=2)
 
         return ToolResult(
