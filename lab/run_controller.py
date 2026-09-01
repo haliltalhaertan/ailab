@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import json
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from lab.integrity import ProjectRunLock
+from lab.integrity import ProjectRunLock, atomic_write_json, read_json_tolerant
 from lab.trace import Trace
 
 
@@ -23,19 +23,11 @@ def now_iso() -> str:
 
 
 def atomic_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    atomic_write_json(path, value)
 
 
 def read_json(path: Path, default: Any) -> Any:
-    if not path.exists():
-        return default
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return default
+    return read_json_tolerant(path, default)
 
 
 def retryable(exc: Exception) -> bool:
@@ -48,7 +40,15 @@ def retryable(exc: Exception) -> bool:
     return any(
         token in text
         for token in (
-            "timeout", "timed out", "connection", "temporarily unavailable", "rate limit", "429", "502", "503", "504"
+            "timeout",
+            "timed out",
+            "connection",
+            "temporarily unavailable",
+            "rate limit",
+            "429",
+            "502",
+            "503",
+            "504",
         )
     )
 
@@ -62,6 +62,7 @@ class RunController:
         self.stop_path = self.root / "stop.flag"
         self.max_retries = max(1, int(max_retries))
         self.lock = ProjectRunLock(self.root)
+        self._last_heartbeat_monotonic = 0.0
 
     def runtime(self) -> dict[str, Any]:
         return read_json(
@@ -79,12 +80,30 @@ class RunController:
     def set_runtime(self, **updates: Any) -> dict[str, Any]:
         value = self.runtime()
         value.update(updates)
+        value["pid"] = os.getpid()
         value["updated_at"] = now_iso()
+        if str(value.get("status") or "").upper() == "RUNNING":
+            value["heartbeat_at"] = value["updated_at"]
         atomic_json(self.runtime_path, value)
         self.trace.log("runtime_state", **value)
+        self._last_heartbeat_monotonic = time.monotonic()
         return value
 
+    def heartbeat(self, *, min_interval_s: float = 2.0) -> None:
+        now = time.monotonic()
+        if now - self._last_heartbeat_monotonic < float(min_interval_s):
+            return
+        value = self.runtime()
+        if str(value.get("status") or "").upper() != "RUNNING":
+            return
+        value["pid"] = os.getpid()
+        value["heartbeat_at"] = now_iso()
+        value["updated_at"] = value["heartbeat_at"]
+        atomic_json(self.runtime_path, value)
+        self._last_heartbeat_monotonic = now
+
     def check_stop(self) -> None:
+        self.heartbeat()
         if self.stop_path.exists():
             raise ResearchStopped("Kullanıcı durdurma isteği gönderdi.")
 
