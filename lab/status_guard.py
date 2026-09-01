@@ -52,6 +52,7 @@ def choose_status(
     critic: dict[str, Any],
     expected_item_id: str | None = None,
     expected_iteration: int | None = None,
+    expected_claim_hash: str | None = None,
 ) -> GuardDecision:
     """Return the strongest status justified by machine-observable evidence."""
 
@@ -60,6 +61,10 @@ def choose_status(
     critic_verdict = str(critic.get("verdict") or "REVISE").upper()
     tmeta = dict((tool_result.metadata if tool_result else None) or {})
 
+    claim_hash_matches = bool(
+        expected_claim_hash
+        and str(tmeta.get("claim_hash") or "") == str(expected_claim_hash)
+    )
     formal_verified = bool(
         tool_result
         and tool_result.ok
@@ -68,6 +73,7 @@ def choose_status(
         and tmeta.get("source_clean") is True
         and tmeta.get("axioms_verified") is True
         and tmeta.get("formal_binding_verified") is True
+        and claim_hash_matches
         and (
             expected_item_id is None
             or str(tmeta.get("item_id") or "") == str(expected_item_id)
@@ -93,6 +99,9 @@ def choose_status(
         "formal_binding_verified": bool(tmeta.get("formal_binding_verified")),
         "axioms_verified": bool(tmeta.get("axioms_verified")),
         "source_clean": bool(tmeta.get("source_clean")),
+        "claim_hash_matches": claim_hash_matches,
+        "expected_claim_hash": expected_claim_hash,
+        "actual_claim_hash": str(tmeta.get("claim_hash") or ""),
         "computation_ok": computation_ok,
         "verifier_verdict": verifier_verdict,
         "critic_verdict": critic_verdict,
@@ -119,14 +128,14 @@ def choose_status(
             return GuardDecision(
                 requested,
                 "PROVEN",
-                "Bound Lean source passed the checker, source/axiom guards, verifier PASS, and critic did not KILL it.",
+                "Bound Lean source passed the checker, claim-hash/source/axiom guards, verifier PASS, and critic did not KILL it.",
                 False,
                 metadata,
             )
         return GuardDecision(
             requested,
             "OPEN",
-            "PROVEN rejected: requires same-item/same-iteration bound Lean evidence, clean source, verified axioms, verifier PASS, and critic not KILL.",
+            "PROVEN rejected: requires same-item/same-iteration/same-claim bound Lean evidence, clean source, verified axioms, verifier PASS, and critic not KILL.",
             True,
             metadata,
         )
