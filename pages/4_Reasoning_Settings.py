@@ -13,6 +13,7 @@ st.caption(
 )
 
 ROLES = [
+    "ProjectPlanner",
     "ResearchManager",
     "Theorist",
     "AdversarialCritic",
