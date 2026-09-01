@@ -27,12 +27,13 @@ class Trace:
         messages: list[dict],
         response,
     ) -> None:
+        exact_messages = getattr(response, "request_messages", None) or messages
         self.log(
             "llm_call",
             agent=agent,
             model=model,
             temperature=temperature,
-            messages=messages,
+            messages=exact_messages,
             output=response.content,
             provider_reasoning=getattr(response, "provider_reasoning", ""),
             reasoning_details=getattr(response, "reasoning_details", None),
