@@ -9,7 +9,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from lab.integrity import atomic_write_json, read_json_tolerant
 from lab.research_state import ResearchState
+from lab.runtime_health import normalize_runtime
 
 
 def _now() -> str:
@@ -22,19 +24,11 @@ def _slug(value: str) -> str:
 
 
 def _read_json(path: Path, default: Any) -> Any:
-    if not path.exists():
-        return default
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return default
+    return read_json_tolerant(path, default)
 
 
 def _write_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    atomic_write_json(path, value)
 
 
 def _parse_time(value: str) -> datetime | None:
@@ -124,7 +118,15 @@ class ProjectManager:
         }
         _write_json(root / "project.json", metadata)
         state = ResearchState(root)
-        state.freeze_problem(problem, metadata={"project_id": pid, "project_uuid": project_uuid, "title": title.strip(), "created_from": "project_manager"})
+        state.freeze_problem(
+            problem,
+            metadata={
+                "project_id": pid,
+                "project_uuid": project_uuid,
+                "title": title.strip(),
+                "created_from": "project_manager",
+            },
+        )
         if activate:
             self.set_active(pid)
         return self.get(pid)
@@ -163,7 +165,8 @@ class ProjectManager:
 
     def _runtime(self, root: Path) -> dict[str, Any]:
         value = _read_json(root / "runtime.json", {})
-        return value if isinstance(value, dict) else {}
+        runtime = value if isinstance(value, dict) else {}
+        return normalize_runtime(root, runtime, persist=True)
 
     def _counts(self, root: Path) -> dict[str, int]:
         try:
@@ -182,7 +185,11 @@ class ProjectManager:
         rows = []
         if not path.exists():
             return rows
-        with path.open("r", encoding="utf-8") as handle:
+        try:
+            handle = path.open("r", encoding="utf-8")
+        except OSError:
+            return rows
+        with handle:
             for line in handle:
                 try:
                     value = json.loads(line)
@@ -263,7 +270,11 @@ class ProjectManager:
             rows.append(self._summary_row(run_dir))
             matched_ids.add(run_id)
         if rows:
-            return sorted(rows, key=lambda x: str(x.get("started_at") or x.get("run")), reverse=True)
+            return sorted(
+                rows,
+                key=lambda x: str(x.get("started_at") or x.get("run")),
+                reverse=True,
+            )
 
         # One-time compatibility fallback for pre-index runs. New UI paths do not
         # repeatedly scan traces once index.jsonl exists.
@@ -281,7 +292,11 @@ class ProjectManager:
                     if ts and ts < created_at:
                         continue
                 rows.append(self._summary_row(trace_path.parent))
-        return sorted(rows, key=lambda x: str(x.get("started_at") or x.get("run")), reverse=True)
+        return sorted(
+            rows,
+            key=lambda x: str(x.get("started_at") or x.get("run")),
+            reverse=True,
+        )
 
     def get(self, project_id: str) -> ProjectInfo:
         pid = _slug(project_id)
@@ -319,7 +334,10 @@ class ProjectManager:
         for root in self.root.iterdir():
             if not root.is_dir():
                 continue
-            if not any((root / name).exists() for name in ("project.json", "problem_frozen.json", "state.json", "runtime.json")):
+            if not any(
+                (root / name).exists()
+                for name in ("project.json", "problem_frozen.json", "state.json", "runtime.json")
+            ):
                 continue
             try:
                 info = self.get(root.name)
@@ -332,7 +350,14 @@ class ProjectManager:
 
     def set_active(self, project_id: str) -> ProjectInfo:
         info = self.get(project_id)
-        _write_json(self.active_path, {"project_id": info.project_id, "project_uuid": info.project_uuid, "updated_at": _now()})
+        _write_json(
+            self.active_path,
+            {
+                "project_id": info.project_id,
+                "project_uuid": info.project_uuid,
+                "updated_at": _now(),
+            },
+        )
         return info
 
     def active_project_id(self) -> str | None:
@@ -363,7 +388,15 @@ class ProjectManager:
         pid = _slug(project_id)
         root = self.project_root(pid)
         meta = self._base_metadata(root)
-        allowed = {"title", "description", "experiment", "literature_query", "tags", "archived", "status"}
+        allowed = {
+            "title",
+            "description",
+            "experiment",
+            "literature_query",
+            "tags",
+            "archived",
+            "status",
+        }
         for key, value in updates.items():
             if key in allowed:
                 meta[key] = value
@@ -377,7 +410,13 @@ class ProjectManager:
             self.clear_active()
         return info
 
-    def clone(self, project_id: str, *, title: str, new_project_id: str | None = None) -> ProjectInfo:
+    def clone(
+        self,
+        project_id: str,
+        *,
+        title: str,
+        new_project_id: str | None = None,
+    ) -> ProjectInfo:
         source = self.get(project_id)
         return self.create_project(
             title=title,
