@@ -7,6 +7,7 @@ from typing import Any, Callable
 
 from lab.agent import Agent
 from lab.client import LLMResponse
+from lab.trace import get_active_trace
 
 
 EXPERIMENTS = (
@@ -246,6 +247,28 @@ def _repair_messages(user_prompt: str, invalid_output: str, parse_error: Excepti
 PlannerCallCallback = Callable[[str, list[dict[str, str]], LLMResponse], None]
 
 
+def _trace_failed_initial_call(
+    agent: Agent,
+    messages: list[dict[str, str]],
+    response: LLMResponse,
+    error: Exception,
+) -> None:
+    """Preserve the failed paid call when the caller uses the legacy return API."""
+
+    trace = get_active_trace()
+    if trace is None:
+        return
+    trace.agent_call(agent.name, response.model, agent.temperature, messages, response)
+    trace.log(
+        "project_planner_parse_error",
+        stage="initial",
+        agent=agent.name,
+        model=response.model,
+        error=str(error),
+    )
+    trace.log("project_planner_repair_start", agent=agent.name, model=agent.model)
+
+
 def generate_project_draft(
     user_prompt: str,
     agent: Agent,
@@ -255,9 +278,10 @@ def generate_project_draft(
     """Generate a project draft, automatically repairing malformed JSON once.
 
     ``on_call`` is invoked for every paid LLM call (stage ``initial`` or ``repair``),
-    allowing the UI trace to retain both attempts instead of hiding the failed one.
-    The public return shape stays backward compatible: the final response/messages
-    used to create the draft are returned.
+    allowing custom callers to retain both attempts. With the legacy UI path, a
+    failed initial call is written to the active Trace automatically; the caller
+    then records the returned successful repair call as before. The public return
+    shape remains backward compatible.
     """
 
     prompt = user_prompt.strip()
@@ -272,6 +296,8 @@ def generate_project_draft(
         draft = parse_project_draft(content, prompt)
         return draft, response, messages
     except ValueError as first_error:
+        if on_call is None:
+            _trace_failed_initial_call(agent, messages, response, first_error)
         repair_messages = _repair_messages(prompt, content, first_error)
         repaired_content, repaired_response = agent.respond(repair_messages)
         if on_call:
