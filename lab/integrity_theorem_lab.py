@@ -31,6 +31,7 @@ class TheoremResearchLab(CoreTheoremResearchLab):
         super().__init__(trace, state, literature=literature, toolbox=toolbox, **kwargs)
         self._active_iteration: int | None = None
         self._active_item_id = ""
+        self._active_claim_hash = ""
         self._active_claim_sha256 = ""
 
     def _ensure_item_matches_proposal(
@@ -42,6 +43,7 @@ class TheoremResearchLab(CoreTheoremResearchLab):
         item = super()._ensure_item_matches_proposal(iteration, proposal, snapshot)
         self._active_iteration = int(iteration)
         self._active_item_id = item.id
+        self._active_claim_hash = content_fingerprint("claim:v1", item.claim)
         self._active_claim_sha256 = hashlib.sha256(item.claim.encode("utf-8")).hexdigest()
         return item
 
@@ -103,9 +105,10 @@ class TheoremResearchLab(CoreTheoremResearchLab):
             "theorem_type": theorem_type,
             "item_id": self._active_item_id,
             "iteration": self._active_iteration,
+            "claim_hash": self._active_claim_hash,
             "claim_sha256": self._active_claim_sha256,
         }
-        fingerprint = content_fingerprint("bound_formal_tool:v1", enriched)
+        fingerprint = content_fingerprint("bound_formal_tool:v2", enriched)
         cached = self._cache_get(step_key)
         if (
             isinstance(cached, dict)
@@ -131,6 +134,7 @@ class TheoremResearchLab(CoreTheoremResearchLab):
             theorem_type=theorem_type,
             item_id=self._active_item_id,
             iteration=self._active_iteration,
+            claim_hash=self._active_claim_hash,
             claim_sha256=self._active_claim_sha256,
         )
         if not draft.ok:
@@ -142,6 +146,7 @@ class TheoremResearchLab(CoreTheoremResearchLab):
                 expected_sha256=str(dmeta.get("lean_sha256") or ""),
                 expected_item_id=self._active_item_id,
                 expected_iteration=self._active_iteration,
+                expected_claim_hash=self._active_claim_hash,
                 expected_claim_sha256=self._active_claim_sha256,
                 expected_theorem_name=theorem_name,
                 expected_theorem_type=theorem_type,
