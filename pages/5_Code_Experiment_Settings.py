@@ -80,14 +80,35 @@ timeout_s = c2.number_input(
     value=int(settings.get("timeout_s", 60)),
 )
 
+c3, c4 = st.columns(2)
+memory_limit_mb = c3.number_input(
+    "Python process ağacı bellek limiti (MB)",
+    min_value=128,
+    max_value=8192,
+    value=int(settings.get("memory_limit_mb", 768)),
+)
+max_output_mb = c4.number_input(
+    "stdout + stderr toplam limiti (MB)",
+    min_value=1,
+    max_value=64,
+    value=int(settings.get("max_output_mb", 4)),
+)
+
 st.info(
     "İzin verilen actions: write_file, patch_file, read_file, list_files, run_python, finish. "
-    "Serbest shell yoktur. Python deneyleri computation evidence üretir; otomatik ispat sayılmaz."
+    "finish için en az bir gerçek başarılı run_python zorunludur ve son Python denemesi başarılı olmalıdır. "
+    "Computation evidence otomatik ispat sayılmaz."
 )
 
 if st.button("Code deney ayarlarını kaydet", type="primary", use_container_width=True):
     path = save_code_experiment_settings(
-        {"model": model, "max_steps": int(max_steps), "timeout_s": int(timeout_s)}
+        {
+            "model": model,
+            "max_steps": int(max_steps),
+            "timeout_s": int(timeout_s),
+            "memory_limit_mb": int(memory_limit_mb),
+            "max_output_mb": int(max_output_mb),
+        }
     )
     st.success(f"Kaydedildi: {path}")
 
@@ -98,5 +119,8 @@ with st.expander("Güvenlik modeli", expanded=False):
         "- API key ve çoğu environment variable child process'e aktarılmaz.\n"
         "- Python `-I` modunda, AST güvenlik kontrolünden sonra çalışır.\n"
         "- `os`, `subprocess`, `socket`, dosya `open`, `eval/exec` ve dunder introspection engellenir.\n"
-        "- Bu bir VM/container seviyesinde cryptographic sandbox değildir; kontrollü yerel execution boundary'dir."
+        "- stdout/stderr RAM'de sınırsız biriktirilmez; immutable evidence dosyalarına akar ve byte limiti izlenir.\n"
+        "- Process ağacı psutil ile bellek/PID sınırına karşı izlenir; timeout veya DURDUR isteğinde terminate edilir.\n"
+        "- Opsiyonel `numpy/sympy/networkx` yalnız gerçekten kuruluysa capability listesine girer.\n"
+        "- Bu hâlâ VM/container seviyesinde network/filesystem namespace izolasyonu değildir; yüksek tehdit modeli için dış container runner tercih edilmelidir."
     )
