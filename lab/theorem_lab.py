@@ -41,9 +41,7 @@ def _paper_context(papers: list[Paper]) -> str:
     rows = []
     for i, paper in enumerate(papers, 1):
         authors = ", ".join(paper.authors[:3])
-        rows.append(
-            f"{i}. {paper.title} ({paper.year or '?'}) — {authors} — {paper.url}"
-        )
+        rows.append(f"{i}. {paper.title} ({paper.year or '?'}) — {authors} — {paper.url}")
     return "\n".join(rows)
 
 
@@ -72,17 +70,20 @@ class TheoremResearchLab:
 
     def _call(self, agent: Agent, prompt: str) -> str:
         messages = [{"role": "user", "content": prompt}]
-        content, response = agent.respond(messages)
-        self.trace.agent_call(
-            agent.name,
-            response.model,
-            agent.temperature,
-            messages,
-            response,
+        self.trace.log(
+            "agent_start",
+            agent=agent.name,
+            model=agent.model,
+            temperature=agent.temperature,
+            system_prompt=agent.system_prompt,
+            prompt=prompt,
         )
+        content, response = agent.respond(messages)
+        self.trace.agent_call(agent.name, response.model, agent.temperature, messages, response)
         return content
 
     def _search_literature(self, query: str, limit: int = 8) -> list[Paper]:
+        self.trace.log("literature_search_start", query=query, limit=limit)
         try:
             papers = self.literature.search(query, limit=limit)
             self.trace.log(
@@ -96,6 +97,8 @@ class TheoremResearchLab:
             return []
 
     def _verify_tool_request(self, request: dict[str, Any] | None) -> ToolResult | None:
+        if request and str(request.get("tool", "none")).lower() not in {"", "none"}:
+            self.trace.log("tool_start", request=request)
         result = self.toolbox.execute(request)
         if result:
             self.trace.log("tool_result", **result.as_dict())
@@ -116,6 +119,7 @@ class TheoremResearchLab:
         checkpoint_every: int = 2,
     ) -> str:
         self.state.freeze_problem(problem)
+        self.trace.log("problem_frozen", problem=problem)
 
         papers = self._search_literature(literature_query or problem)
         literature_context = _paper_context(papers)
@@ -128,16 +132,22 @@ class TheoremResearchLab:
                 "kısa bir screening raporu hazırla. Bir yayını okumadıysan theorem içeriğini uydurma."
             )
             literature_report = self._call(literature_agent, literature_prompt)
-            self.state.add_item(
+            known = self.state.add_item(
                 "known_result",
                 "Literature screening report",
                 literature_report,
                 status="KNOWN",
                 metadata={"screening_only": True},
             )
-            literature_context += (
-                "\n\nLLM LITERATURE SCREEN (not a novelty proof):\n" + literature_report
+            self.trace.log(
+                "state_change",
+                action="create",
+                item_id=known.id,
+                kind="known_result",
+                status="KNOWN",
+                title="Literature screening report",
             )
+            literature_context += "\n\nLLM LITERATURE SCREEN (not a novelty proof):\n" + literature_report
 
         next_task = (
             "Problemi daralt; bilinen sınırları ihlal etmeyen, çürütülebilir tek bir lemma, "
@@ -162,6 +172,7 @@ class TheoremResearchLab:
         }
 
         for iteration in range(1, iterations + 1):
+            self.trace.log("iteration_start", iteration=iteration, next_task=next_task)
             state_context = self.state.summary_for_prompt()
             proposal_prompt = (
                 f"PROBLEM (frozen):\n{problem}\n\n"
@@ -182,6 +193,16 @@ class TheoremResearchLab:
                 claim=claim,
                 metadata={"iteration": iteration, "proposal": proposal},
             )
+            self.trace.log(
+                "state_change",
+                action="create",
+                item_id=item.id,
+                kind="conjecture",
+                old_status=None,
+                new_status="OPEN",
+                title=title,
+                claim=claim,
+            )
 
             request = proposal.get("tool_request")
             tool_request = request if isinstance(request, dict) else None
@@ -191,11 +212,7 @@ class TheoremResearchLab:
                 f"Frozen problem:\n{problem}\n\n"
                 f"Candidate {item.id}:\n{json.dumps(proposal, ensure_ascii=False, indent=2)}\n\n"
                 "Deterministic tool result:\n"
-                + json.dumps(
-                    tool_result.as_dict() if tool_result else None,
-                    ensure_ascii=False,
-                    indent=2,
-                )
+                + json.dumps(tool_result.as_dict() if tool_result else None, ensure_ascii=False, indent=2)
                 + "\n\nBu iddiayı doğrulama mühendisi gibi incele. LLM görüşünü ispat sayma. "
                 "Eksik deney, küçük-n testi, SMT kontrolü veya formal proof ihtiyacını belirt. "
                 "SADECE JSON ver: "
@@ -208,11 +225,7 @@ class TheoremResearchLab:
                 f"Frozen problem:\n{problem}\n\nCandidate {item.id}:\n{claim}\n\n"
                 f"Proposal:\n{json.dumps(proposal, ensure_ascii=False, indent=2)}\n\n"
                 "Tool result:\n"
-                + json.dumps(
-                    tool_result.as_dict() if tool_result else None,
-                    ensure_ascii=False,
-                    indent=2,
-                )
+                + json.dumps(tool_result.as_dict() if tool_result else None, ensure_ascii=False, indent=2)
                 + f"\n\nVerifier:\n{json.dumps(verification, ensure_ascii=False, indent=2)}\n\n"
                 f"Previous ledger:\n{state_context}\n\n"
                 "Görevin adayı çürütmek. Gizli varsayım, küçük karşıörnek, asymptotic hata, "
@@ -224,11 +237,7 @@ class TheoremResearchLab:
             manager_prompt = (
                 f"Frozen problem:\n{problem}\n\nCandidate {item.id}: {claim}\n\n"
                 "Tool:\n"
-                + json.dumps(
-                    tool_result.as_dict() if tool_result else None,
-                    ensure_ascii=False,
-                    indent=2,
-                )
+                + json.dumps(tool_result.as_dict() if tool_result else None, ensure_ascii=False, indent=2)
                 + f"\nVerifier:\n{json.dumps(verification, ensure_ascii=False, indent=2)}\n"
                 f"Critic:\n{critique_raw}\n\n"
                 "Araştırmayı yönet. PROVEN kararı verme: formal checker sonucu yoksa en fazla "
@@ -242,13 +251,7 @@ class TheoremResearchLab:
             requested_status = str(manager_decision.get("status", "OPEN")).upper()
             if requested_status == "PROVEN":
                 requested_status = "PROOF_CANDIDATE"
-            allowed = {
-                "OPEN",
-                "COMPUTATION_PASS",
-                "PROOF_CANDIDATE",
-                "FAIL",
-                "DROPPED",
-            }
+            allowed = {"OPEN", "COMPUTATION_PASS", "PROOF_CANDIDATE", "FAIL", "DROPPED"}
             status = requested_status if requested_status in allowed else "OPEN"
 
             counterexample = str(verification.get("counterexample") or "").strip()
@@ -258,14 +261,32 @@ class TheoremResearchLab:
                 and tool_result.metadata.get("status") == "COUNTEREXAMPLE"
             )
             if tool_counterexample:
-                self.state.add_counterexample(
+                counter = self.state.add_counterexample(
                     item.id,
                     "Deterministic tropical grid counterexample",
                     payload=tool_result.metadata,
                 )
+                self.trace.log(
+                    "state_change",
+                    action="counterexample",
+                    item_id=counter.id,
+                    target_id=item.id,
+                    kind="counterexample",
+                    status="KNOWN",
+                    detail=tool_result.metadata,
+                )
                 status = "FAIL"
             elif verification.get("verdict") == "FAIL" and counterexample:
-                self.state.add_counterexample(item.id, counterexample)
+                counter = self.state.add_counterexample(item.id, counterexample)
+                self.trace.log(
+                    "state_change",
+                    action="counterexample",
+                    item_id=counter.id,
+                    target_id=item.id,
+                    kind="counterexample",
+                    status="KNOWN",
+                    detail=counterexample,
+                )
                 status = "FAIL"
             else:
                 evidence = [
@@ -274,13 +295,29 @@ class TheoremResearchLab:
                     "Manager: " + str(manager_decision.get("reason", "")),
                 ]
                 if tool_result:
-                    evidence.append(
-                        "Tool: " + json.dumps(tool_result.as_dict(), ensure_ascii=False)
-                    )
+                    evidence.append("Tool: " + json.dumps(tool_result.as_dict(), ensure_ascii=False))
                 self.state.update_item(item.id, status=status, evidence=evidence)
 
+            self.trace.log(
+                "state_change",
+                action="status",
+                item_id=item.id,
+                kind="conjecture",
+                old_status="OPEN",
+                new_status=status,
+                decision=decision,
+                reason=str(manager_decision.get("reason", "")),
+            )
             next_task = str(manager_decision.get("next_task") or next_task)
             outcomes.append(IterationOutcome(item.id, decision, status, next_task))
+            self.trace.log(
+                "iteration_end",
+                iteration=iteration,
+                item_id=item.id,
+                decision=decision,
+                status=status,
+                next_task=next_task,
+            )
 
             if checkpoint_every and iteration % checkpoint_every == 0:
                 audit_prompt = (
@@ -292,14 +329,21 @@ class TheoremResearchLab:
                     "Sonucu PASS / PASS-WITH-GAPS / FAIL olarak ver."
                 )
                 audit = self._call(auditor, audit_prompt)
-                self.state.add_item(
+                audit_item = self.state.add_item(
                     "audit",
                     f"Checkpoint audit {iteration}",
                     audit,
                     status="KNOWN",
                     metadata={"iteration": iteration, "independent": True},
                 )
-                self.state.checkpoint(f"iteration-{iteration}", note=audit[:1000])
+                checkpoint_path = self.state.checkpoint(f"iteration-{iteration}", note=audit[:1000])
+                self.trace.log(
+                    "checkpoint",
+                    iteration=iteration,
+                    audit_item_id=audit_item.id,
+                    path=str(checkpoint_path),
+                    audit=audit,
+                )
 
         final_audit_prompt = (
             f"FINAL INDEPENDENT AUDIT\n\nProblem:\n{problem}\n\n"
@@ -308,7 +352,7 @@ class TheoremResearchLab:
             "en iyi counterexample ve bir sonraki kesin theorem target'ı belirt."
         )
         final_audit = self._call(auditor, final_audit_prompt)
-        self.state.add_item(
+        final_item = self.state.add_item(
             "audit",
             "Final independent audit",
             final_audit,
@@ -316,6 +360,13 @@ class TheoremResearchLab:
             metadata={"independent": True, "final": True},
         )
         checkpoint = self.state.checkpoint("final", note=final_audit[:1500])
+        self.trace.log(
+            "checkpoint",
+            final=True,
+            audit_item_id=final_item.id,
+            path=str(checkpoint),
+            audit=final_audit,
+        )
 
         lines = [
             "# Theorem Research Run",
@@ -327,8 +378,7 @@ class TheoremResearchLab:
         ]
         for outcome in outcomes:
             lines.append(
-                f"- {outcome.item_id}: [{outcome.status}] decision={outcome.decision}; "
-                f"next={outcome.next_task}"
+                f"- {outcome.item_id}: [{outcome.status}] decision={outcome.decision}; next={outcome.next_task}"
             )
         lines.extend(["", "## Final independent audit", final_audit])
         return "\n".join(lines)

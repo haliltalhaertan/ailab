@@ -19,6 +19,8 @@ class FakeResponse:
 class FakeAgent:
     def __init__(self, name: str, outputs: list[str]):
         self.name = name
+        self.model = "fake/model"
+        self.system_prompt = f"system:{name}"
         self.temperature = 0.0
         self.outputs = list(outputs)
 
@@ -54,6 +56,11 @@ def test_theorem_lab_persists_candidate_and_audit(tmp_path: Path):
     assert candidates[0].status == "OPEN"
     assert state.list_items(kind="audit")
     assert "Theorem Research Run" in report
+
+    trace_text = trace.path.read_text(encoding="utf-8")
+    assert '"type": "agent_start"' in trace_text
+    assert '"type": "state_change"' in trace_text
+    assert '"type": "checkpoint"' in trace_text
 
 
 def test_tropical_counterexample_automatically_kills_candidate(tmp_path: Path):
