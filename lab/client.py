@@ -1,9 +1,13 @@
+from __future__ import annotations
+
 import json
 import os
 import time
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Callable
 
+import httpx
 from openai import OpenAI
 
 from lab.reasoning_settings import normalize_effort
@@ -87,7 +91,20 @@ def _usage_values(usage: Any) -> tuple[int, int, int, int, float | None]:
 
 
 class LLMClient:
-    def __init__(self, api_key: str | None = None, base_url: str | None = None):
+    """OpenAI-compatible client with *no hidden SDK retry layer*.
+
+    Retry/backoff belongs to RunController/TheoremResearchLab where every retry is
+    traceable. Setting OpenAI(max_retries=0) prevents the SDK from silently making
+    extra requests that the research ledger cannot account for.
+    """
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        *,
+        timeout_s: float | None = None,
+    ):
         api_key = api_key or os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY")
         if not api_key:
             raise RuntimeError(
@@ -95,7 +112,13 @@ class LLMClient:
             )
         self.base_url = base_url or os.environ.get("LLM_BASE_URL", "https://openrouter.ai/api/v1")
         self.is_openrouter = "openrouter.ai" in self.base_url.lower()
-        self._client = OpenAI(api_key=api_key, base_url=self.base_url)
+        timeout = float(timeout_s or os.environ.get("LAB_LLM_TIMEOUT_S", "180"))
+        self._client = OpenAI(
+            api_key=api_key,
+            base_url=self.base_url,
+            max_retries=0,
+            timeout=httpx.Timeout(timeout, connect=min(timeout, 30.0)),
+        )
 
     def complete(
         self,
@@ -116,8 +139,6 @@ class LLMClient:
         if max_tokens:
             kwargs["max_tokens"] = max_tokens
         if self.is_openrouter:
-            # OpenRouter's unified reasoning parameter accepts effort levels
-            # none/minimal/low/medium/high/xhigh. xhigh is shown as "Max" in the UI.
             reasoning: dict[str, Any] = {"exclude": False}
             if reasoning_effort is not None:
                 reasoning["effort"] = reasoning_effort
@@ -128,9 +149,7 @@ class LLMClient:
 
         if stream_callback is None:
             return self._complete_once(kwargs, messages, model, reasoning_effort)
-        return self._complete_stream(
-            kwargs, messages, model, reasoning_effort, stream_callback
-        )
+        return self._complete_stream(kwargs, messages, model, reasoning_effort, stream_callback)
 
     def _complete_once(
         self,
@@ -172,7 +191,6 @@ class LLMClient:
     ) -> LLMResponse:
         stream_kwargs = dict(kwargs)
         stream_kwargs["stream"] = True
-        # OpenAI-compatible providers normally put usage in the final stream chunk.
         stream_kwargs["stream_options"] = {"include_usage": True}
 
         start = time.perf_counter()
@@ -230,3 +248,14 @@ class LLMClient:
             request_messages=[dict(m) for m in messages],
             requested_reasoning_effort=reasoning_effort,
         )
+
+
+@lru_cache(maxsize=4)
+def get_default_client(base_url: str | None = None) -> LLMClient:
+    """Lazily create and share a connection pool per base URL.
+
+    Importing/constructing Agent objects is now safe in offline tests; the API key
+    is required only when an agent actually makes its first network call.
+    """
+
+    return LLMClient(base_url=base_url)
