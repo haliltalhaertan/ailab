@@ -1,5 +1,5 @@
-"""Compatibility shim. Hardening is now composed into lab.theorem_engine."""
+"""Compatibility shim. Hardening wraps the unified theorem engine."""
 
-from lab.theorem_engine import TheoremResearchLab
+from lab.integrity_theorem_lab import TheoremResearchLab
 
 __all__ = ["TheoremResearchLab"]
