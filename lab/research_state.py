@@ -14,6 +14,7 @@ from lab.integrity import EvidenceSigner, atomic_write_json, read_json_tolerant,
 
 VALID_STATUSES = {
     "OPEN",
+    "REFUTATION_CANDIDATE",
     "COMPUTATION_PASS",
     "PROOF_CANDIDATE",
     "PROVEN",
@@ -149,8 +150,6 @@ class ResearchState:
             return {"items": [], "events": []}
         raw.setdefault("items", [])
         raw.setdefault("events", [])
-        # Never trust a literal PROVEN token from disk by itself. Invalid/tampered
-        # proof evidence is downgraded in memory and surfaced to the UI/agents.
         for item in raw.get("items", []):
             if not isinstance(item, dict) or str(item.get("status") or "") != "PROVEN":
                 continue
