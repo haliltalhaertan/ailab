@@ -12,14 +12,11 @@ DEFAULTS: dict[str, Any] = {
     "timeout_s": 60,
     "memory_limit_mb": 768,
     "max_output_mb": 4,
+    "pid_limit": 8,
+    "cpu_limit": 1.0,
+    "container_engine": "",
+    "container_image": "python:3.12-slim",
 }
-
-
-def _bounded_int(value: Any, default: int, low: int, high: int) -> int:
-    try:
-        return min(high, max(low, int(value)))
-    except Exception:
-        return default
 
 
 def load_code_experiment_settings(path: str | Path = SETTINGS_PATH) -> dict[str, Any]:
@@ -34,24 +31,63 @@ def load_code_experiment_settings(path: str | Path = SETTINGS_PATH) -> dict[str,
             data = {}
     merged = dict(DEFAULTS)
     merged.update(data)
-    merged["max_steps"] = _bounded_int(merged.get("max_steps"), 8, 1, 20)
-    merged["timeout_s"] = _bounded_int(merged.get("timeout_s"), 60, 5, 300)
-    merged["memory_limit_mb"] = _bounded_int(merged.get("memory_limit_mb"), 768, 128, 8192)
-    merged["max_output_mb"] = _bounded_int(merged.get("max_output_mb"), 4, 1, 64)
+    for key, default, low, high in (
+        ("max_steps", 8, 1, 20),
+        ("timeout_s", 60, 5, 600),
+        ("memory_limit_mb", 768, 128, 8192),
+        ("max_output_mb", 4, 1, 64),
+        ("pid_limit", 8, 1, 128),
+    ):
+        try:
+            merged[key] = min(high, max(low, int(merged.get(key, default))))
+        except Exception:
+            merged[key] = default
+    try:
+        merged["cpu_limit"] = min(16.0, max(0.1, float(merged.get("cpu_limit", 1.0))))
+    except Exception:
+        merged["cpu_limit"] = 1.0
     merged["model"] = str(merged.get("model") or "").strip()
+    merged["container_engine"] = str(merged.get("container_engine") or "").strip()
+    merged["container_image"] = str(merged.get("container_image") or DEFAULTS["container_image"]).strip()
     return merged
 
 
-def save_code_experiment_settings(
-    settings: dict[str, Any], path: str | Path = SETTINGS_PATH
-) -> Path:
+def save_code_experiment_settings(settings: dict[str, Any], path: str | Path = SETTINGS_PATH) -> Path:
     target = Path(path)
-    value = load_code_experiment_settings(path)
+    value = dict(DEFAULTS)
+    if target.exists():
+        try:
+            existing = json.loads(target.read_text(encoding="utf-8"))
+            if isinstance(existing, dict):
+                value.update(existing)
+        except Exception:
+            pass
     value.update(settings)
-    value["model"] = str(value.get("model") or "").strip()
-    value["max_steps"] = _bounded_int(value.get("max_steps"), 8, 1, 20)
-    value["timeout_s"] = _bounded_int(value.get("timeout_s"), 60, 5, 300)
-    value["memory_limit_mb"] = _bounded_int(value.get("memory_limit_mb"), 768, 128, 8192)
-    value["max_output_mb"] = _bounded_int(value.get("max_output_mb"), 4, 1, 64)
-    target.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+    normalized = load_code_experiment_settings_from_dict(value)
+    target.write_text(json.dumps(normalized, ensure_ascii=False, indent=2), encoding="utf-8")
     return target
+
+
+def load_code_experiment_settings_from_dict(value: dict[str, Any]) -> dict[str, Any]:
+    # Reuse normalizer without touching the user's real settings path.
+    merged = dict(DEFAULTS)
+    merged.update(value)
+    for key, default, low, high in (
+        ("max_steps", 8, 1, 20),
+        ("timeout_s", 60, 5, 600),
+        ("memory_limit_mb", 768, 128, 8192),
+        ("max_output_mb", 4, 1, 64),
+        ("pid_limit", 8, 1, 128),
+    ):
+        try:
+            merged[key] = min(high, max(low, int(merged.get(key, default))))
+        except Exception:
+            merged[key] = default
+    try:
+        merged["cpu_limit"] = min(16.0, max(0.1, float(merged.get("cpu_limit", 1.0))))
+    except Exception:
+        merged["cpu_limit"] = 1.0
+    merged["model"] = str(merged.get("model") or "").strip()
+    merged["container_engine"] = str(merged.get("container_engine") or "").strip()
+    merged["container_image"] = str(merged.get("container_image") or DEFAULTS["container_image"]).strip()
+    return merged
