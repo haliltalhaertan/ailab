@@ -1,3 +1,4 @@
+import json
 import os
 import time
 from dataclasses import dataclass
@@ -18,6 +19,8 @@ class LLMResponse:
     cost_usd: float | None = None
     reasoning_tokens: int = 0
     cached_tokens: int = 0
+    provider_reasoning: str = ""
+    reasoning_details: Any = None
 
     @property
     def total_tokens(self) -> int:
@@ -42,6 +45,25 @@ def _detail_token_count(details: Any, field: str) -> int:
         return int(value or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _jsonable(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    if hasattr(value, "model_dump"):
+        try:
+            return _jsonable(value.model_dump())
+        except Exception:
+            pass
+    try:
+        json.dumps(value)
+        return value
+    except Exception:
+        return str(value)
 
 
 class LLMClient:
@@ -70,7 +92,8 @@ class LLMClient:
         }
         if max_tokens:
             kwargs["max_tokens"] = max_tokens
-        # OpenRouter can return the exact billed request cost in usage.cost.
+        # OpenRouter can return exact billed cost in usage.cost. Reasoning fields,
+        # when a provider exposes them, are read back from the assistant message.
         if self.is_openrouter:
             kwargs["extra_body"] = {"usage": {"include": True}}
 
@@ -78,6 +101,7 @@ class LLMClient:
         resp = self._client.chat.completions.create(**kwargs)
         latency = time.perf_counter() - start
         usage = resp.usage
+        message = resp.choices[0].message
 
         prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0) if usage else 0
         completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0) if usage else 0
@@ -89,9 +113,11 @@ class LLMClient:
 
         prompt_details = getattr(usage, "prompt_tokens_details", None) if usage else None
         completion_details = getattr(usage, "completion_tokens_details", None) if usage else None
+        provider_reasoning = _extra(message, "reasoning", "") or ""
+        reasoning_details = _jsonable(_extra(message, "reasoning_details"))
 
         return LLMResponse(
-            content=resp.choices[0].message.content or "",
+            content=message.content or "",
             model=resp.model or model,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
@@ -99,4 +125,6 @@ class LLMClient:
             cost_usd=cost_usd,
             reasoning_tokens=_detail_token_count(completion_details, "reasoning_tokens"),
             cached_tokens=_detail_token_count(prompt_details, "cached_tokens"),
+            provider_reasoning=str(provider_reasoning),
+            reasoning_details=reasoning_details,
         )
