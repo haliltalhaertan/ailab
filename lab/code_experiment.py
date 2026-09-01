@@ -119,6 +119,15 @@ class GuardedExperimentWorkspace:
         self.root.mkdir(parents=True, exist_ok=True)
         self.outputs = self.root / "outputs"
         self.outputs.mkdir(exist_ok=True)
+        # Rootless/user-namespaced Docker may map container root to an unrelated
+        # host uid. Outputs are intentionally the container-writable evidence
+        # area, so make that one directory world-writable on POSIX. The rest of
+        # the workspace keeps normal host permissions.
+        if os.name != "nt":
+            try:
+                self.outputs.chmod(0o777)
+            except OSError:
+                pass
         self.timeout_s = int(timeout_s)
         self.max_file_bytes = int(max_file_bytes)
         self.max_read_chars = int(max_read_chars)
