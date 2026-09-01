@@ -37,12 +37,7 @@ def atomic_write_text(
     attempts: int = 10,
     initial_backoff_s: float = 0.01,
 ) -> None:
-    """Durably replace a text file, retrying Windows sharing violations.
-
-    Windows can reject ``os.replace`` while a reader briefly has the destination
-    open. Streamlit polls runtime/state files frequently, so a short bounded retry
-    is required even though the write itself is atomic.
-    """
+    """Durably replace a text file, retrying Windows sharing violations."""
 
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -64,8 +59,6 @@ def atomic_write_text(
             except PermissionError as exc:
                 last_error = exc
             except OSError as exc:
-                # WinError 5/32 are common sharing violations. Other platforms
-                # may report EACCES similarly; retry briefly before failing.
                 if getattr(exc, "winerror", None) not in {5, 32, None}:
                     raise
                 last_error = exc
@@ -129,8 +122,6 @@ def project_lock_is_live(project_root: str | Path) -> bool:
     except Exception:
         pid = 0
     if host and host != socket.gethostname():
-        # We cannot safely inspect a process on another host. Treat the lock as
-        # live instead of stealing it.
         return True
     return process_alive(pid)
 
@@ -140,12 +131,7 @@ class ProjectBusyError(RuntimeError):
 
 
 class ProjectRunLock:
-    """Cross-process project lock backed by atomic O_EXCL file creation.
-
-    The same lock instance is re-entrant inside one process. This lets the worker
-    acquire the project lock *before* touching worker/config/runtime files and then
-    hand the already-held lock to the theorem engine without a race window.
-    """
+    """Cross-process project lock backed by atomic O_EXCL file creation."""
 
     def __init__(self, project_root: str | Path):
         self.project_root = Path(project_root)
@@ -229,11 +215,11 @@ class ProjectRunLock:
 class EvidenceSigner:
     """HMAC seal for local evidence/cache tamper detection.
 
-    ``LAB_EVIDENCE_HMAC_KEY`` provides the strongest local mode because the key
-    need not live beside the project data. Without it, a random per-project key is
-    stored in ``.evidence_hmac.key`` (0600 where supported). That protects against
-    accidental/manual DB edits but not against an administrator who can also read
-    or replace the local key. This limitation is deliberate and documented.
+    ``LAB_EVIDENCE_HMAC_KEY`` is the stronger mode because the key need not live
+    beside project data. Without it, a random per-project key is created with
+    O_EXCL and stored in ``.evidence_hmac.key``. Local-key mode detects accidental
+    or naive manual edits; it is not protection from an administrator who can
+    read/replace both the project and its key.
     """
 
     ENV_NAME = "LAB_EVIDENCE_HMAC_KEY"
@@ -248,14 +234,30 @@ class EvidenceSigner:
             self.key_path: Path | None = None
         else:
             self.key_path = self.root / ".evidence_hmac.key"
-            if not self.key_path.exists():
-                atomic_write_text(self.key_path, secrets.token_hex(32))
-                try:
-                    os.chmod(self.key_path, 0o600)
-                except OSError:
-                    pass
+            self._ensure_local_key()
             self.key = self.key_path.read_text(encoding="utf-8").strip().encode("utf-8")
             self.mode = "LOCAL_PROJECT_KEY"
+
+    def _ensure_local_key(self) -> None:
+        assert self.key_path is not None
+        if self.key_path.exists():
+            return
+        secret = secrets.token_hex(32)
+        try:
+            fd = os.open(str(self.key_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            return
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(secret)
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except OSError:
+                pass
+        try:
+            os.chmod(self.key_path, 0o600)
+        except OSError:
+            pass
 
     def sign(self, kind: str, value: Any) -> str:
         payload = f"{kind}\n{canonical_json(value)}".encode("utf-8")
