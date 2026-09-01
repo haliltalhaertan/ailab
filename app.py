@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import os
 import re
@@ -9,9 +11,13 @@ import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
-from lab import Agent, Orchestrator, ResearchState, ResearchToolbox, TheoremResearchLab, Trace
+from lab import Agent, Orchestrator, Trace
 from lab.openrouter_catalog import fetch_openrouter_models
-from lab.project_manager import ProjectManager, ProjectInfo
+from lab.project_manager import ProjectInfo, ProjectManager
+from lab.prompts import ROLE_LIBRARY as THEOREM_ROLE_LIBRARY
+from lab.reasoning_settings import get_reasoning_effort
+from lab.ui_model import cost_text, event_summary, filter_models, load_run_events, runs_for_project, tool_status, usage_rows
+from lab.worker_launcher import build_request_from_ui, launch_theorem_worker, write_worker_request
 
 load_dotenv()
 RUNS_DIR = Path("runs")
@@ -38,12 +44,7 @@ ROLE_LIBRARY = {
     "Eleştirmen": "Analizdeki zayıf varsayım, eksik veri ve mantık hatalarını bul.",
     "Panelist": "Soruyu bağımsız ve özgün bir bakış açısından yanıtla.",
     "Sentezleyici": "Bağımsız yanıtları tutarlı tek bir cevapta birleştir.",
-    "ResearchManager": "Araştırmayı yönet; doğru dalı seç, FAIL fikirleri kapalı tut ve tek sonraki görev ver.",
-    "Theorist": "Küçük, test edilebilir lemma/construction/lower-bound fikri üret; varsayımı açıkça etiketle.",
-    "AdversarialCritic": "Adayı çürütmeye çalış: karşıörnek, gizli varsayım, yanlış model ve asymptotic hata ara.",
-    "VerificationEngineer": "LLM görüşünü ispat sayma; gerekli deterministic test, Z3, küçük-n veya formal proof'u belirle.",
-    "LiteratureScout": "Literatür/novelty riskini tara; theorem içeriği uydurma.",
-    "IndependentAuditor": "Sıfır-güven bağımsız denetçi ol; OPEN ile PROVEN'i kesin ayır.",
+    **THEOREM_ROLE_LIBRARY,
 }
 
 ROLE_TEMPS = {
@@ -94,7 +95,7 @@ EXPERIMENTS = {
     "Teorem Araştırması": {
         "method": "theorem_lab",
         "slug": "theorem",
-        "description": "Gerçek açık matematik/teorik CS problemi için: literatür + kalıcı ledger + deterministic doğrulama + critic + bağımsız audit. Bu proje için önerilen mod.",
+        "description": "Uzun theorem run'ı ayrı worker process'te çalışır. Tarayıcı kapanabilir; durdur/devam Research Control sayfasından yapılır.",
         "roles": ["ResearchManager", "Theorist", "AdversarialCritic", "VerificationEngineer", "LiteratureScout", "IndependentAuditor"],
         "optional_roles": [],
         "param_label": "Tur sayısı",
@@ -105,7 +106,7 @@ EXPERIMENTS = {
     "Araştırma Döngüsü": {
         "method": "research_loop",
         "slug": "research",
-        "description": "Hızlı fikir↔eleştiri döngüsü. Kalıcı theorem state, literatür/tool zinciri ve bağımsız audit yok.",
+        "description": "Hızlı fikir-eleştiri döngüsü; kalıcı theorem workflow'u değildir.",
         "roles": ["Teorisyen", "Sceptik", "Raporcu"],
         "optional_roles": ["Raporcu"],
         "param_label": "Tur sayısı",
@@ -116,7 +117,7 @@ EXPERIMENTS = {
     "Tartışma": {
         "method": "debate",
         "slug": "debate",
-        "description": "İki zıt görüş tartışır, opsiyonel hakem değerlendirir. Argüman testi içindir; theorem workflow'u değildir.",
+        "description": "İki zıt görüş tartışır, opsiyonel hakem değerlendirir.",
         "roles": ["Taraftar A", "Taraftar B", "Hakem"],
         "optional_roles": ["Hakem"],
         "param_label": "Tur sayısı",
@@ -127,7 +128,7 @@ EXPERIMENTS = {
     "Zincir": {
         "method": "pipeline",
         "slug": "pipeline",
-        "description": "Tek yönlü A→B→C akışı: araştır → analiz et → eleştir/düzenle. Geri beslemeli araştırma değildir.",
+        "description": "Tek yönlü A→B→C akışı.",
         "roles": ["Araştırmacı", "Analist", "Eleştirmen"],
         "optional_roles": [],
         "param_label": None,
@@ -138,7 +139,7 @@ EXPERIMENTS = {
     "Panel": {
         "method": "panel",
         "slug": "panel",
-        "description": "Aynı soruya birkaç ajan bağımsız cevap verir, sentezleyici birleştirir. Model/fikir çeşitliliği için.",
+        "description": "Bağımsız yanıtlar + sentez.",
         "roles": ["Panelist", "Panelist", "Panelist", "Sentezleyici"],
         "optional_roles": ["Sentezleyici"],
         "param_label": None,
@@ -168,34 +169,11 @@ def model_catalog() -> tuple[list[str], dict[str, str], str | None]:
     return FALLBACK_MODELS.copy(), {m: m for m in FALLBACK_MODELS}, error
 
 
-def filter_models(model_ids: list[str], model_labels: dict[str, str], query: str) -> list[str]:
-    needle = query.strip().casefold()
-    if not needle:
-        return list(model_ids)
-    return [m for m in model_ids if needle in m.casefold() or needle in model_labels.get(m, "").casefold()]
-
-
-def slugify(value: str) -> str:
-    value = re.sub(r"[^a-zA-Z0-9_-]+", "-", value.strip()).strip("-")
-    return value[:60] or "research"
-
-
 def default_model(role: str) -> str:
     env_name = ROLE_MODEL_ENV.get(role)
     if env_name and os.environ.get(env_name):
         return os.environ[env_name]
     return ROLE_MODELS.get(role, os.environ.get("LAB_MODEL", "openai/gpt-4o-mini"))
-
-
-class ObservedTrace(Trace):
-    def __init__(self, experiment: str, on_event=None):
-        super().__init__(experiment)
-        self.on_event = on_event
-
-    def log(self, event_type: str, **data) -> None:
-        super().log(event_type, **data)
-        if self.on_event:
-            self.on_event({"type": event_type, "_live_time": datetime.now().strftime("%H:%M:%S"), **data})
 
 
 def build_sidebar(exp_name: str, model_ids: list[str], model_labels: dict[str, str], active: ProjectInfo):
@@ -205,22 +183,14 @@ def build_sidebar(exp_name: str, model_ids: list[str], model_labels: dict[str, s
     prompt = st.sidebar.text_area(exp["prompt_label"], value=prompt_default, height=145)
     param = None
     if exp["param_label"]:
-        param = st.sidebar.number_input(
-            exp["param_label"],
-            min_value=1,
-            max_value=100 if exp["method"] == "theorem_lab" else 10,
-            value=exp["param_default"],
-        )
-
+        param = st.sidebar.number_input(exp["param_label"], min_value=1, max_value=100 if exp["method"] == "theorem_lab" else 10, value=exp["param_default"])
     extras = {"project_id": active.project_id, "project_title": active.title}
     if exp["method"] == "theorem_lab":
-        literature_default = active.literature_query or os.environ.get(
-            "LAB_LITERATURE_QUERY", "tropical circuit reachability provenance lower bound"
+        extras["literature_query"] = st.sidebar.text_input(
+            "Literatür arama sorgusu",
+            value=active.literature_query or os.environ.get("LAB_LITERATURE_QUERY", "tropical circuit reachability provenance lower bound"),
         )
-        extras["literature_query"] = st.sidebar.text_input("Literatür arama sorgusu", value=literature_default)
-        extras["checkpoint_every"] = st.sidebar.number_input(
-            "Checkpoint sıklığı (tur)", min_value=1, max_value=20, value=2
-        )
+        extras["checkpoint_every"] = st.sidebar.number_input("Checkpoint sıklığı (tur)", min_value=1, max_value=20, value=2)
 
     agents, optional = [], {}
     role_counts: dict[str, int] = {}
@@ -229,21 +199,12 @@ def build_sidebar(exp_name: str, model_ids: list[str], model_labels: dict[str, s
         display_role = role if role_counts[role] == 1 else f"{role} {role_counts[role]}"
         key = f"{exp_name}_{i}_{role_counts[role]}"
         is_optional = role in exp["optional_roles"]
-        if is_optional and not st.sidebar.checkbox(
-            f"{display_role} dahil et", value=True, key=f"inc_{key}"
-        ):
+        if is_optional and not st.sidebar.checkbox(f"{display_role} dahil et", value=True, key=f"inc_{key}"):
             continue
         with st.sidebar.expander(display_role, expanded=exp["method"] == "theorem_lab"):
-            sys_prompt = st.text_area(
-                "Sistem promptu",
-                ROLE_LIBRARY.get(role, ROLE_LIBRARY["Panelist"]),
-                key=f"p_{key}",
-                height=110,
-            )
+            sys_prompt = st.text_area("Sistem promptu", ROLE_LIBRARY.get(role, ROLE_LIBRARY["Panelist"]), key=f"p_{key}", height=110)
             wanted_default = default_model(role)
-            query = st.text_input(
-                "Model ara", placeholder="örn. 5.3, glm, kimi, flash", key=f"search_{key}"
-            )
+            query = st.text_input("Model ara", placeholder="örn. 5.3, glm, kimi, flash", key=f"search_{key}")
             choices = filter_models(model_ids, model_labels, query)
             if not query and wanted_default not in choices:
                 choices.insert(0, wanted_default)
@@ -252,34 +213,17 @@ def build_sidebar(exp_name: str, model_ids: list[str], model_labels: dict[str, s
                 st.caption(f"{len(choices)} model eşleşti")
             if choices:
                 preferred = wanted_default if wanted_default in choices else choices[0]
-                model = st.selectbox(
-                    "OpenRouter modeli",
-                    choices,
-                    index=choices.index(preferred),
-                    format_func=lambda mid: model_labels.get(mid, mid),
-                    key=f"m_{key}_{query.casefold()}",
-                )
+                model = st.selectbox("OpenRouter modeli", choices, index=choices.index(preferred), format_func=lambda mid: model_labels.get(mid, mid), key=f"m_{key}_{query.casefold()}")
             else:
-                st.warning("Eşleşen model yok. Aramayı değiştir veya manuel model ID gir.")
+                st.warning("Eşleşen model yok. Manuel model ID girebilirsin.")
                 model = wanted_default
-            manual = st.text_input(
-                "Manuel model ID (opsiyonel)",
-                placeholder="örn. z-ai/glm-5.3",
-                key=f"manual_{key}",
-            ).strip()
+            manual = st.text_input("Manuel model ID (opsiyonel)", key=f"manual_{key}").strip()
             if manual:
                 model = manual
-            temp = st.slider(
-                "Sıcaklık", 0.0, 1.5, ROLE_TEMPS.get(role, 0.7), 0.05, key=f"t_{key}"
-            )
+            temp = st.slider("Sıcaklık", 0.0, 1.5, ROLE_TEMPS.get(role, 0.7), 0.05, key=f"t_{key}")
             st.caption(f"Kullanılacak model: `{model}`")
-        cfg = {
-            "role": role,
-            "display_role": display_role,
-            "prompt": sys_prompt,
-            "model": model,
-            "temp": temp,
-        }
+        cfg = {"role": role, "display_role": display_role, "prompt": sys_prompt, "model": model, "temp": temp}
+        (optional if is_optional else agents if False else agents)
         if is_optional:
             optional[display_role] = cfg
         else:
@@ -288,56 +232,12 @@ def build_sidebar(exp_name: str, model_ids: list[str], model_labels: dict[str, s
 
 
 def _agent(cfg: dict) -> Agent:
-    return Agent(
-        name=cfg["display_role"],
-        system_prompt=cfg["prompt"],
-        model=cfg["model"],
-        temperature=cfg["temp"],
-    )
+    return Agent(name=cfg["display_role"], system_prompt=cfg["prompt"], model=cfg["model"], temperature=cfg["temp"])
 
 
 def _event_time(event: dict) -> str:
-    if event.get("_live_time"):
-        return str(event["_live_time"])
-    raw = str(event.get("ts", ""))
-    if "T" in raw:
-        return raw.split("T", 1)[1][:8]
-    return ""
-
-
-def _event_summary(event: dict) -> str:
-    kind = event.get("type", "event")
-    if kind == "agent_start":
-        return f"{event.get('agent')} başladı ({event.get('model')})"
-    if kind == "llm_call":
-        return f"{event.get('agent')} tamamlandı: {event.get('total_tokens', 0)} token"
-    if kind == "tool_start":
-        return f"Tool başladı: {event.get('request', {}).get('tool', '?')}"
-    if kind == "tool_result":
-        return f"Tool sonucu: {event.get('tool')} ok={event.get('ok')}"
-    if kind == "state_change":
-        return (
-            f"State: {event.get('item_id')} {event.get('old_status', '')}→"
-            f"{event.get('new_status', event.get('status', ''))}"
-        )
-    if kind == "checkpoint":
-        return "Checkpoint kaydedildi"
-    if kind == "literature_search":
-        return f"Literatür: {len(event.get('results', []))} kayıt"
-    return str(kind)
-
-
-def _tool_status(event: dict) -> tuple[str, str]:
-    error = str(event.get("error") or "").strip()
-    metadata = event.get("metadata") or {}
-    metadata_status = str(metadata.get("status") or "").upper()
-    if error:
-        return "HATA", "error"
-    if metadata_status == "COUNTEREXAMPLE":
-        return "COUNTEREXAMPLE", "error"
-    if bool(event.get("ok")):
-        return "PASS", "success"
-    return "FAIL", "error"
+    raw = str(event.get("ts") or "")
+    return raw.split("T", 1)[1][:8] if "T" in raw else ""
 
 
 def render_timeline_event(target, event: dict) -> None:
@@ -345,96 +245,37 @@ def render_timeline_event(target, event: dict) -> None:
     if kind in {"agent_stream", "runtime_state", "agent_start", "llm_call", "agent_error", "agent_retry"}:
         return
     stamp = f"`{_event_time(event)}` " if _event_time(event) else ""
-    if kind == "project_context":
-        target.markdown(f"{stamp}**Proje** — `{event.get('project_id')}` · {event.get('title', '')}")
-    elif kind == "run_config":
-        target.markdown(f"{stamp}**Sistem** — çalışma yapılandırması yüklendi")
-        with target.expander("Run config", expanded=False):
-            st.json({k: v for k, v in event.items() if k not in {"type", "ts", "_live_time"}})
-    elif kind == "problem_frozen":
-        target.markdown(f"{stamp}**Problem** — araştırma problemi donduruldu")
-    elif kind == "iteration_start":
-        target.markdown(
-            f"{stamp}**Tur {event.get('iteration')}** — başladı · {event.get('next_task', '')}"
-        )
+    if kind == "iteration_start":
+        target.markdown(f"{stamp}**Tur {event.get('iteration')}** — başladı · {event.get('next_task', '')}")
     elif kind == "iteration_end":
-        target.markdown(
-            f"{stamp}**Tur {event.get('iteration')}** — tamamlandı · `{event.get('item_id', '')}` · "
-            f"**{event.get('status', '')}** · karar `{event.get('decision', '')}`"
-        )
-    elif kind == "literature_search_start":
-        target.markdown(f"{stamp}**Literatür** — arama başladı: `{event.get('query', '')}`")
+        target.markdown(f"{stamp}**Tur {event.get('iteration')}** — `{event.get('item_id', '')}` · **{event.get('status', '')}**")
+    elif kind == "status_downgraded_by_guard":
+        target.warning(f"Evidence guard: `{event.get('requested')}` → `{event.get('granted')}` · {event.get('reason', '')}")
+    elif kind == "literature_search_inconclusive":
+        target.warning("Literatür taraması sonuçsuz kaldı; novelty hakkında sonuç çıkarılmadı.")
     elif kind == "literature_search":
-        results = event.get("results", []) or []
-        target.markdown(f"{stamp}**Literatür** — {len(results)} aday kayıt bulundu")
-        if results:
-            with target.expander("Bulunan yayınlar", expanded=False):
-                for i, paper in enumerate(results, 1):
-                    st.write(f"{i}. {paper.get('title', '?')} ({paper.get('year', '?')})")
-                    if paper.get("url"):
-                        st.caption(str(paper["url"]))
-    elif kind == "literature_search_error":
-        target.error(f"Literatür araması hata verdi: {event.get('error', '')}")
-    elif kind == "tool_start":
-        request = event.get("request", {}) or {}
-        tool = str(request.get("tool", "tool"))
-        target.markdown(f"{stamp}**Araç** · `{tool}` — çalışmaya başladı")
-        with target.expander(f"{tool} · input", expanded=False):
-            st.json(request)
+        target.markdown(f"{stamp}**Literatür** — {len(event.get('results', []))} aday kayıt")
     elif kind == "tool_result":
-        tool = str(event.get("tool", "tool"))
-        label, _ = _tool_status(event)
-        target.markdown(f"{stamp}**Araç** · `{tool}` — **{label}**")
-        with target.expander(f"{tool} · çıktı", expanded=False):
-            if event.get("output"):
-                st.code(str(event["output"]), language=None)
-            if event.get("error"):
-                st.error(str(event["error"]))
-            if event.get("metadata"):
-                st.json(event["metadata"])
-    elif kind == "state_change":
-        item_id = str(event.get("item_id", "state"))
-        action = str(event.get("action", "update"))
-        if action == "create":
-            target.markdown(
-                f"{stamp}**Research State** — `{item_id}` oluşturuldu · "
-                f"**{event.get('new_status', event.get('status', 'OPEN'))}**"
-            )
-            if event.get("claim"):
-                target.caption(str(event["claim"]))
-        elif action == "counterexample":
-            target.markdown(
-                f"{stamp}**Counterexample** — `{event.get('target_id', '')}` için kaydedildi"
-            )
-        else:
-            target.markdown(
-                f"{stamp}**Research State** — `{item_id}` · `{event.get('old_status', '?')}` → "
-                f"**{event.get('new_status', event.get('status', '?'))}**"
-            )
+        label, _ = tool_status(event)
+        target.markdown(f"{stamp}**Araç** · `{event.get('tool', '')}` — **{label}**")
     elif kind == "checkpoint":
-        label = "Final checkpoint" if event.get("final") else f"Checkpoint {event.get('iteration', '')}"
-        target.markdown(f"{stamp}**{label}** — kaydedildi")
+        target.markdown(f"{stamp}**Checkpoint** — kaydedildi")
     elif kind == "step_reused":
-        target.caption(f"♻️ `{event.get('step_key', '')}` tamamlanmış kayıttan yeniden kullanıldı")
-    elif kind == "run_paused":
-        target.warning(f"Araştırma hata nedeniyle beklemeye alındı: {event.get('error', '')}")
+        target.caption(f"♻️ `{event.get('step_key', '')}` cache'den kullanıldı")
     elif kind == "run_stopped":
-        target.warning("Araştırma kullanıcı isteğiyle durduruldu; tamamlanan adımlar korundu.")
+        target.warning("Araştırma kullanıcı isteğiyle durduruldu.")
+    elif kind == "run_paused":
+        target.warning(f"Araştırma beklemeye alındı: {event.get('error', '')}")
     else:
-        target.caption(f"{stamp}{kind}")
+        target.caption(f"{stamp}{event_summary(event)}")
 
 
 class LiveTimelineRenderer:
-    """Readable OpenCode-style timeline. Raw events remain untouched in trace.jsonl."""
-
     REASONING_HEIGHT = 360
     ANSWER_HEIGHT = 360
-    TASK_HEIGHT = 260
 
-    def __init__(self, target, *, live: bool):
+    def __init__(self, target):
         self.target = target
-        self.live = live
-        self.runtime_slot = target.empty()
         self.cards: dict[str, dict] = {}
         self.latest_by_agent: dict[str, str] = {}
 
@@ -445,327 +286,56 @@ class LiveTimelineRenderer:
         agent = str(event.get("agent") or "Agent")
         return self.latest_by_agent.get(agent, f"{agent}:{len(self.cards) + 1}")
 
-    def _ensure_card(self, event: dict) -> dict:
+    def _card(self, event: dict) -> dict:
         key = self._key(event)
         if key in self.cards:
             return self.cards[key]
         agent = str(event.get("agent") or "Agent")
-        model = str(event.get("model") or "")
         card = self.target.container(border=True)
         header = card.empty()
-        header.markdown(f"⏳ **{agent}** · `{model}` — çalışıyor")
-        reasoning_tab, answer_tab, task_tab = card.tabs(["🧠 Reasoning", "✍️ Cevap", "📋 Görev"])
-        with reasoning_tab:
-            reasoning_box = st.container(height=self.REASONING_HEIGHT, border=False)
-            with reasoning_box:
-                reasoning_slot = st.empty()
-                reasoning_slot.caption("Provider reasoning gönderirse burada canlı görünecek.")
-        with answer_tab:
-            answer_box = st.container(height=self.ANSWER_HEIGHT, border=False)
-            with answer_box:
-                answer_slot = st.empty()
-                answer_slot.caption("Yanıt bekleniyor…")
-        with task_tab:
-            task_box = st.container(height=self.TASK_HEIGHT, border=False)
-            with task_box:
-                if event.get("system_prompt"):
-                    st.markdown("**System prompt**")
-                    st.code(str(event.get("system_prompt") or ""), language=None)
-                if event.get("prompt"):
-                    st.markdown("**User/task prompt**")
-                    st.code(str(event.get("prompt") or ""), language=None)
-                if not event.get("system_prompt") and not event.get("prompt"):
-                    st.caption("Görev ayrıntısı bu event içinde yok.")
-        footer = card.empty()
-        footer.caption(f"Adım: `{key}`")
-        state = {
-            "key": key,
-            "agent": agent,
-            "model": model,
-            "header": header,
-            "reasoning_slot": reasoning_slot,
-            "answer_slot": answer_slot,
-            "footer": footer,
-            "reasoning": "",
-            "content": "",
-            "last_reasoning_render": 0.0,
-            "last_content_render": 0.0,
-            "complete": False,
-        }
+        header.markdown(f"⏳ **{agent}** · `{event.get('model', '')}`")
+        rtab, atab = card.tabs(["🧠 Reasoning", "✍️ Cevap"])
+        with rtab:
+            with st.container(height=self.REASONING_HEIGHT, border=False):
+                rslot = st.empty()
+        with atab:
+            with st.container(height=self.ANSWER_HEIGHT, border=False):
+                aslot = st.empty()
+        state = {"key": key, "agent": agent, "header": header, "rslot": rslot, "aslot": aslot, "reasoning": "", "content": ""}
         self.cards[key] = state
         self.latest_by_agent[agent] = key
         return state
 
-    def _render_buffer(self, state: dict, channel: str, *, force: bool = False) -> None:
-        now = time.monotonic()
-        if channel == "reasoning":
-            text, last_key, slot = state["reasoning"], "last_reasoning_render", state["reasoning_slot"]
-        else:
-            text, last_key, slot = state["content"], "last_content_render", state["answer_slot"]
-        if not text:
-            return
-        if not force and self.live and now - float(state[last_key]) < 0.08:
-            return
-        state[last_key] = now
-        slot.markdown(text)
-
-    def _runtime(self, event: dict) -> None:
-        self.runtime_slot.caption(
-            f"**Durum:** `{event.get('status', '')}` · **Tur:** {int(event.get('current_iteration', 0) or 0)} · "
-            f"**Tamamlanan:** {int(event.get('completed_iterations', 0) or 0)} · "
-            f"**Aktif adım:** `{event.get('current_step', '-')}`"
-        )
-
-    def _start(self, event: dict) -> None:
-        state = self._ensure_card(event)
-        agent = str(event.get("agent") or state["agent"])
-        model = str(event.get("model") or state["model"])
-        effort = event.get("reasoning_effort")
-        effort_text = f" · reasoning `{effort}`" if effort else ""
-        state["agent"], state["model"] = agent, model
-        state["header"].markdown(f"⏳ **{agent}** · `{model}` — çalışıyor{effort_text}")
-        self.latest_by_agent[agent] = state["key"]
-
-    def _stream(self, event: dict) -> None:
-        state = self._ensure_card(event)
-        channel, delta = str(event.get("channel") or ""), event.get("delta")
-        if channel == "reasoning" and isinstance(delta, str):
-            state["reasoning"] += delta
-            if self.live:
-                self._render_buffer(state, "reasoning")
-        elif channel == "content" and isinstance(delta, str):
-            state["content"] += delta
-            if self.live:
-                self._render_buffer(state, "content")
-
-    def _complete(self, event: dict) -> None:
-        agent = str(event.get("agent") or "Agent")
-        key = self.latest_by_agent.get(agent)
-        state = self.cards.get(key) if key else None
-        if state is None:
-            state = self._ensure_card(event)
-        if event.get("provider_reasoning"):
-            state["reasoning"] = str(event["provider_reasoning"])
-        if event.get("output"):
-            state["content"] = str(event["output"])
-        self._render_buffer(state, "reasoning", force=True)
-        self._render_buffer(state, "content", force=True)
-        reasoning_tokens = int(event.get("reasoning_tokens", 0) or 0)
-        if not state["reasoning"] and reasoning_tokens:
-            state["reasoning_slot"].caption(
-                f"Model {reasoning_tokens:,} reasoning token kullandı ancak provider reasoning metnini expose etmedi."
-            )
-        elif not state["reasoning"]:
-            state["reasoning_slot"].caption("Bu model/provider görünür reasoning metni göndermedi.")
-        cost = event.get("cost_usd")
-        cost_text = f"${float(cost):.6f}" if cost is not None else "ücret N/A"
-        state["header"].markdown(
-            f"✅ **{agent}** · `{event.get('model', state['model'])}` — tamamlandı · "
-            f"{int(event.get('total_tokens', 0) or 0):,} token · {cost_text} · "
-            f"{float(event.get('latency_s', 0) or 0):.1f} sn"
-        )
-        state["footer"].caption(
-            f"input={int(event.get('prompt_tokens', 0) or 0):,} · "
-            f"output={int(event.get('completion_tokens', 0) or 0):,} · "
-            f"reasoning={reasoning_tokens:,} · cached={int(event.get('cached_tokens', 0) or 0):,} · "
-            f"effort={event.get('reasoning_effort') or 'provider-default'} · adım `{state['key']}`"
-        )
-        state["complete"] = True
-
-    def _error(self, event: dict) -> None:
-        state = self._ensure_card(event)
-        error = str(event.get("error") or "Bilinmeyen hata")
-        if event.get("retrying"):
-            state["header"].markdown(
-                f"⚠️ **{state['agent']}** · `{state['model']}` — hata, yeniden denenecek"
-            )
-            state["footer"].warning(error)
-        else:
-            state["header"].markdown(
-                f"❌ **{state['agent']}** · `{state['model']}` — adım tamamlanamadı"
-            )
-            state["footer"].error(error)
-
     def handle(self, event: dict) -> None:
-        kind = str(event.get("type") or "event")
-        if kind == "runtime_state":
-            self._runtime(event)
-            return
+        kind = str(event.get("type") or "")
         if kind == "agent_start":
-            self._start(event)
+            state = self._card(event)
+            state["header"].markdown(f"⏳ **{event.get('agent')}** · `{event.get('model', '')}` — çalışıyor")
             return
         if kind == "agent_stream":
-            self._stream(event)
+            state = self._card(event)
+            delta = event.get("delta")
+            if event.get("channel") == "reasoning" and isinstance(delta, str):
+                state["reasoning"] += delta
+                state["rslot"].markdown(state["reasoning"])
+            elif event.get("channel") == "content" and isinstance(delta, str):
+                state["content"] += delta
+                state["aslot"].markdown(state["content"])
             return
         if kind == "llm_call":
-            self._complete(event)
-            return
-        if kind == "agent_error":
-            self._error(event)
-            return
-        if kind == "agent_retry":
+            state = self._card(event)
+            if event.get("provider_reasoning"):
+                state["reasoning"] = str(event["provider_reasoning"])
+                state["rslot"].markdown(state["reasoning"])
+            if event.get("output"):
+                state["content"] = str(event["output"])
+                state["aslot"].markdown(state["content"])
+            state["header"].markdown(f"✅ **{event.get('agent')}** · `{event.get('model', '')}` · {int(event.get('total_tokens', 0) or 0):,} token")
             return
         render_timeline_event(self.target, event)
 
-    def finalize(self) -> None:
-        for state in self.cards.values():
-            self._render_buffer(state, "reasoning", force=True)
-            self._render_buffer(state, "content", force=True)
 
-
-def load_trace_events(path: Path) -> list[dict]:
-    if not path.exists():
-        return []
-    events = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        try:
-            events.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    return events
-
-
-def _event_project_id(events: list[dict]) -> str | None:
-    for ev in events[:100]:
-        if ev.get("project_id"):
-            return str(ev["project_id"])
-    return None
-
-
-def _read_runtime(state: ResearchState | None) -> dict:
-    if state is None:
-        return {}
-    path = state.root / "runtime.json"
-    if not path.exists():
-        return {}
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
-def execute(exp_name, prompt, param, agents, optional, extras):
-    exp = EXPERIMENTS[exp_name]
-    project_id = extras["project_id"]
-    PROJECTS.touch(project_id, experiment=exp_name, status="RUNNING")
-    with st.chat_message("user"):
-        st.write(prompt)
-    st.subheader("Canlı Araştırma Akışı")
-    timeline = st.container(border=True)
-    renderer = LiveTimelineRenderer(timeline, live=True)
-    run_status = st.status("Araştırma çalışıyor...", expanded=False)
-    steps: list[str] = []
-    theorem_state = None
-
-    def on_event(event: dict):
-        if event.get("type") not in {"agent_stream", "runtime_state"}:
-            steps.append(_event_summary(event))
-        renderer.handle(event)
-
-    trace = ObservedTrace(exp["slug"], on_event=on_event)
-    trace.log(
-        "project_context",
-        project_id=project_id,
-        title=extras.get("project_title", ""),
-        experiment=exp_name,
-    )
-    try:
-        a_objs = [_agent(c) for c in agents]
-        o_objs = {r: _agent(c) for r, c in optional.items()}
-        method = exp["method"]
-        if method == "theorem_lab":
-            by_role = {cfg["role"]: _agent(cfg) for cfg in agents}
-            theorem_state = ResearchState(f"research_state/{project_id}")
-            trace.log(
-                "run_config",
-                experiment=exp_name,
-                project_id=project_id,
-                iterations=int(param),
-                models={r: a.model for r, a in by_role.items()},
-                reasoning_efforts={r: a.reasoning_effort for r, a in by_role.items()},
-            )
-            result = TheoremResearchLab(trace, theorem_state, toolbox=ResearchToolbox()).run(
-                prompt,
-                manager=by_role["ResearchManager"],
-                proposer=by_role["Theorist"],
-                critic=by_role["AdversarialCritic"],
-                verifier=by_role["VerificationEngineer"],
-                literature_agent=by_role["LiteratureScout"],
-                auditor=by_role["IndependentAuditor"],
-                iterations=int(param),
-                literature_query=extras.get("literature_query") or None,
-                checkpoint_every=int(extras.get("checkpoint_every", 2)),
-            )
-        else:
-            orch = Orchestrator(trace)
-            if method == "research_loop":
-                result = orch.research_loop(
-                    prompt,
-                    a_objs[0],
-                    a_objs[1],
-                    iterations=int(param),
-                    synthesizer=o_objs.get("Raporcu"),
-                )
-            elif method == "debate":
-                result = orch.debate(prompt, a_objs[:2], rounds=int(param), judge=o_objs.get("Hakem"))
-            elif method == "pipeline":
-                result = orch.pipeline(prompt, a_objs)
-            else:
-                result = orch.panel(prompt, a_objs, synthesizer=o_objs.get("Sentezleyici"))
-    except Exception as exc:
-        PROJECTS.touch(project_id, status="PAUSED_ERROR")
-        run_status.update(label="Araştırma hata verdi", state="error", expanded=True)
-        st.error(f"Deney başarısız: {exc}")
-        return None
-    finally:
-        renderer.finalize()
-        summary_path = trace.close()
-
-    runtime = _read_runtime(theorem_state)
-    runtime_status = str(runtime.get("status") or "")
-    if runtime_status in {"PAUSED_ERROR", "STOPPED"}:
-        PROJECTS.touch(project_id, status=runtime_status)
-        run_status.update(
-            label="Araştırma beklemeye alındı — kaldığı yer kaydedildi",
-            state="error",
-            expanded=True,
-        )
-    else:
-        PROJECTS.touch(project_id, status="COMPLETED")
-        run_status.update(label="Araştırma tamamlandı", state="complete")
-    return {
-        "exp": exp_name,
-        "result": result,
-        "summary": json.loads(summary_path.read_text(encoding="utf-8")),
-        "run_dir": str(trace.run_dir),
-        "steps": steps,
-        "project_id": project_id,
-    }
-
-
-def cost_text(summary):
-    return f"{'' if summary.get('cost_complete', False) else '≥'}${float(summary.get('total_cost_usd', 0.0)):.6f}"
-
-
-def usage_rows(summary):
-    return [
-        {
-            "Ajan": name,
-            "Model": ", ".join(v.get("models", [])),
-            "Çağrı": v.get("calls", 0),
-            "Input": v.get("prompt_tokens", 0),
-            "Output": v.get("completion_tokens", 0),
-            "Reasoning": v.get("reasoning_tokens", 0),
-            "Cached": v.get("cached_tokens", 0),
-            "Toplam": v.get("total_tokens", 0),
-            "Ücret ($)": round(float(v.get("cost_usd", 0)), 8),
-            "Süre (sn)": round(float(v.get("latency_s", 0)), 2),
-        }
-        for name, v in summary.get("agents", {}).items()
-    ]
-
-
-def summary_metrics(summary):
+def summary_metrics(summary: dict) -> None:
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Toplam çağrı", summary.get("total_calls", 0))
     c2.metric("Toplam token", f"{summary.get('total_tokens', 0):,}")
@@ -773,29 +343,12 @@ def summary_metrics(summary):
     c4.metric("Geçen süre", f"{float(summary.get('wall_time_s', 0)):.1f} sn")
 
 
-def render_result(last):
-    st.divider()
-    summary_metrics(last["summary"])
-    rows = usage_rows(last["summary"])
-    if rows:
-        st.subheader("Ajan bazında kullanım")
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-    st.caption(f"Kayıt klasörü: {last['run_dir']}")
-    st.subheader("Sonuç")
-    st.markdown(last["result"])
-
-
-def render_history(project_id: str):
-    traces = (
-        sorted(RUNS_DIR.glob("*/trace.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
-        if RUNS_DIR.exists()
-        else []
-    )
-    traces = [p for p in traces if _event_project_id(load_trace_events(p)) == project_id]
-    if not traces:
+def render_history(active: ProjectInfo) -> None:
+    run_dirs = runs_for_project(RUNS_DIR, active.project_id, active.project_uuid)
+    if not run_dirs:
         st.info("Bu projeye bağlı henüz kayıt yok.")
         return
-    selected = st.selectbox("Deney kaydı", [p.parent for p in traces], format_func=lambda p: p.name)
+    selected = st.selectbox("Deney kaydı", run_dirs, format_func=lambda p: p.name)
     summary_file = selected / "summary.json"
     if summary_file.exists():
         summary = json.loads(summary_file.read_text(encoding="utf-8"))
@@ -803,31 +356,82 @@ def render_history(project_id: str):
         rows = usage_rows(summary)
         if rows:
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-    all_events = load_trace_events(selected / "trace.jsonl")
-    st.subheader("Tam Araştırma Timeline'ı")
-    timeline = st.container(border=True)
-    renderer = LiveTimelineRenderer(timeline, live=False)
-    for event in all_events:
+    events = load_run_events(selected, include_stream=True)
+    st.subheader("Araştırma Timeline'ı")
+    renderer = LiveTimelineRenderer(st.container(border=True))
+    for event in events:
         renderer.handle(event)
-    renderer.finalize()
+
+
+def execute_inline(exp_name: str, prompt: str, param, agents: list[dict], optional: dict[str, dict], extras: dict) -> dict | None:
+    exp = EXPERIMENTS[exp_name]
+    project_id = extras["project_id"]
+    PROJECTS.touch(project_id, experiment=exp_name, status="RUNNING")
+    trace = Trace(exp["slug"])
+    info = PROJECTS.get(project_id)
+    trace.log("project_context", project_id=project_id, project_uuid=info.project_uuid, title=info.title, experiment=exp_name)
+    try:
+        a_objs = [_agent(c) for c in agents]
+        o_objs = {r: _agent(c) for r, c in optional.items()}
+        orch = Orchestrator(trace)
+        method = exp["method"]
+        if method == "research_loop":
+            result = orch.research_loop(prompt, a_objs[0], a_objs[1], iterations=int(param), synthesizer=o_objs.get("Raporcu"))
+        elif method == "debate":
+            result = orch.debate(prompt, a_objs[:2], rounds=int(param), judge=o_objs.get("Hakem"))
+        elif method == "pipeline":
+            result = orch.pipeline(prompt, a_objs)
+        else:
+            result = orch.panel(prompt, a_objs, synthesizer=o_objs.get("Sentezleyici"))
+        PROJECTS.touch(project_id, status="COMPLETED")
+        return {"result": result, "run_dir": str(trace.run_dir), "project_id": project_id, "exp": exp_name}
+    except Exception:
+        PROJECTS.touch(project_id, status="PAUSED_ERROR")
+        raise
+    finally:
+        trace.close()
+
+
+def launch_theorem(prompt: str, param: int, agents: list[dict], extras: dict) -> int:
+    project_id = extras["project_id"]
+    role_configs: dict[str, dict] = {}
+    for cfg in agents:
+        role = str(cfg["role"])
+        role_configs[role] = {
+            "name": role,
+            "system_prompt": cfg["prompt"],
+            "model": cfg["model"],
+            "temperature": cfg["temp"],
+            "max_tokens": None,
+            "reasoning_effort": get_reasoning_effort(role),
+        }
+    request = build_request_from_ui(
+        project_id=project_id,
+        problem=prompt,
+        iterations=int(param),
+        literature_query=extras.get("literature_query") or None,
+        checkpoint_every=int(extras.get("checkpoint_every", 2)),
+        agents=role_configs,
+    )
+    root = PROJECTS.project_root(project_id)
+    write_worker_request(root, request)
+    PROJECTS.touch(project_id, experiment="Teorem Araştırması", status="RUNNING")
+    return launch_theorem_worker(project_id)
 
 
 def active_project_header(active: ProjectInfo) -> None:
     with st.container(border=True):
         c1, c2 = st.columns([4, 1])
         c1.markdown(f"### Aktif Proje · {active.title}")
-        c1.caption(
-            f"`{active.project_id}` · durum **{active.status}** · {active.run_count} run · "
-            f"${active.total_cost_usd:.4f}"
-        )
+        c1.caption(f"`{active.project_id}` · durum **{active.status}** · {active.run_count} run · ${active.total_cost_usd:.4f}")
         if c2.button("Projeyi Değiştir", use_container_width=True):
             st.switch_page("pages/1_Projeler.py")
-        if active.status in {"PAUSED_ERROR", "STOPPED", "PAUSED"}:
-            if st.button("Kaldığı Yerden Devam Et", type="primary"):
+        if active.status in {"RUNNING", "PAUSED_ERROR", "STOPPED", "PAUSED"}:
+            if st.button("Araştırma Kontrolü", type="primary"):
                 st.switch_page("pages/3_Research_Control.py")
 
 
-def main():
+def main() -> None:
     st.title("LLM Araştırma Laboratuvarı")
     active = PROJECTS.active_project()
     if active is None:
@@ -852,46 +456,41 @@ def main():
     model_ids, model_labels, catalog_error = model_catalog()
     if catalog_error:
         st.sidebar.warning("Canlı OpenRouter listesi alınamadı; fallback liste gösteriliyor.")
-    else:
-        st.sidebar.caption(f"OpenRouter kataloğu: {len(model_ids)} text modeli")
     if st.sidebar.button("Model listesini yenile"):
         load_openrouter_catalog.clear()
         st.rerun()
 
-    experiment_names = list(EXPERIMENTS)
+    names = list(EXPERIMENTS)
     default_exp = active.experiment if active.experiment in EXPERIMENTS else "Teorem Araştırması"
-    exp_name = st.sidebar.selectbox(
-        "Deney tipi",
-        experiment_names,
-        index=experiment_names.index(default_exp),
-    )
-    prompt, param, agents, optional, extras = build_sidebar(
-        exp_name, model_ids, model_labels, active
-    )
+    exp_name = st.sidebar.selectbox("Deney tipi", names, index=names.index(default_exp))
+    prompt, param, agents, optional, extras = build_sidebar(exp_name, model_ids, model_labels, active)
 
     tab_run, tab_hist = st.tabs(["Deney", "Proje Geçmişi"])
     with tab_run:
-        if st.button(
-            "Deneyi Çalıştır",
-            type="primary",
-            disabled=not api_ok,
-            use_container_width=True,
-        ):
+        if exp_name == "Teorem Araştırması":
+            st.info("Teorem araştırması ayrı worker process'te çalışır. Bu sayfayı veya tarayıcıyı kapatabilirsin.")
+        if st.button("Deneyi Çalıştır", type="primary", disabled=not api_ok, use_container_width=True):
             if not prompt.strip():
                 st.warning("Lütfen bir problem/konu gir.")
+            elif exp_name == "Teorem Araştırması":
+                try:
+                    pid = launch_theorem(prompt, int(param), agents, extras)
+                    st.session_state["worker_pid"] = pid
+                    st.switch_page("pages/3_Research_Control.py")
+                except Exception as exc:
+                    PROJECTS.touch(active.project_id, status="PAUSED_ERROR")
+                    st.exception(exc)
             else:
-                data = execute(exp_name, prompt, param, agents, optional, extras)
-                if data:
-                    st.session_state["last"] = data
-        last = st.session_state.get("last")
-        if (
-            last
-            and last.get("project_id") == active.project_id
-            and last["exp"] == exp_name
-        ):
-            render_result(last)
+                try:
+                    data = execute_inline(exp_name, prompt, param, agents, optional, extras)
+                except Exception as exc:
+                    st.exception(exc)
+                else:
+                    if data:
+                        st.success("Deney tamamlandı.")
+                        st.markdown(data["result"])
     with tab_hist:
-        render_history(active.project_id)
+        render_history(active)
 
 
 if __name__ == "__main__":
