@@ -16,6 +16,7 @@ ROLES = [
     "ProjectPlanner",
     "ResearchManager",
     "Theorist",
+    "CodeExperimentAgent",
     "AdversarialCritic",
     "VerificationEngineer",
     "LiteratureScout",
