@@ -84,15 +84,23 @@ def choose_status(
         )
     )
     computation_ok = _tool_is_successful_computation(tool_result)
-    tropical_status = str(tmeta.get("status") or "").upper()
-    deterministic_counterexample = bool(
+
+    tropical_counterexample = bool(
         tool_result
         and tool_result.tool == "tropical_grid"
-        and tropical_status in {"COUNTEREXAMPLE", "STRUCTURE_MISMATCH"}
+        and str(tmeta.get("status") or "").upper() == "COUNTEREXAMPLE"
     )
-    verifier_counterexample = verifier_verdict == "FAIL" and bool(
-        str(verifier.get("counterexample") or "").strip()
+    verified_tool_counterexample = bool(
+        tool_result
+        and tool_result.tool in {"script", "code_experiment"}
+        and tmeta.get("counterexample_verified") is True
     )
+    deterministic_counterexample = tropical_counterexample or verified_tool_counterexample
+
+    verifier_counterexample = str(verifier.get("counterexample") or "").strip()
+    critic_counterexample = str(critic.get("counterexample") or "").strip()
+    llm_counterexample = verifier_counterexample or critic_counterexample
+    llm_refutation_candidate = bool(llm_counterexample) and not deterministic_counterexample
 
     metadata = {
         "formal_verified": formal_verified,
@@ -106,20 +114,34 @@ def choose_status(
         "verifier_verdict": verifier_verdict,
         "critic_verdict": critic_verdict,
         "deterministic_counterexample": deterministic_counterexample,
-        "deterministic_counterexample_type": tropical_status
-        if deterministic_counterexample
-        else "",
-        "verifier_counterexample": verifier_counterexample,
+        "deterministic_counterexample_type": (
+            "TROPICAL_GRID"
+            if tropical_counterexample
+            else "VERIFIED_TOOL"
+            if verified_tool_counterexample
+            else ""
+        ),
+        "llm_counterexample": llm_counterexample,
+        "llm_refutation_candidate": llm_refutation_candidate,
         "expected_item_id": expected_item_id,
         "expected_iteration": expected_iteration,
     }
 
-    if deterministic_counterexample or verifier_counterexample:
+    if deterministic_counterexample:
         return GuardDecision(
             requested,
             "FAIL",
-            "Counterexample/structural refutation evidence forces FAIL.",
+            "Deterministically verified counterexample evidence forces FAIL.",
             requested != "FAIL",
+            metadata,
+        )
+
+    if llm_refutation_candidate:
+        return GuardDecision(
+            requested,
+            "REFUTATION_CANDIDATE",
+            "LLM-only counterexample is not deterministic evidence; keep it active until verified.",
+            requested != "REFUTATION_CANDIDATE",
             metadata,
         )
 
@@ -179,15 +201,24 @@ def choose_status(
             return GuardDecision(
                 requested,
                 "DROPPED",
-                "No concrete counterexample payload; recorded as DROPPED rather than mathematical FAIL.",
+                "No deterministic counterexample exists; negative LLM judgement alone cannot create mathematical FAIL.",
                 True,
                 metadata,
             )
         return GuardDecision(
             requested,
             "OPEN",
-            "FAIL rejected: insufficient failure evidence.",
+            "FAIL rejected: insufficient deterministic failure evidence.",
             True,
+            metadata,
+        )
+
+    if requested == "REFUTATION_CANDIDATE":
+        return GuardDecision(
+            requested,
+            "REFUTATION_CANDIDATE",
+            "Refutation candidate remains active pending deterministic verification.",
+            False,
             metadata,
         )
 
