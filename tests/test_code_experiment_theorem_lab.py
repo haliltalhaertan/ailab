@@ -41,7 +41,7 @@ class FakeCodeAgent:
         )
 
 
-def test_code_experiment_tool_writes_runs_and_finishes(tmp_path):
+def test_code_experiment_tool_writes_runs_and_finishes(tmp_path, fake_container_runtime):
     state = ResearchState(tmp_path / "state")
     trace = Trace("code-exp", out_dir=tmp_path / "runs")
     lab = TheoremResearchLab(trace, state, literature=EmptyLiterature(), code_experiment_steps=5)
@@ -58,13 +58,14 @@ def test_code_experiment_tool_writes_runs_and_finishes(tmp_path):
     assert result.tool == "code_experiment"
     assert result.metadata["evidence_level"] == "COMPUTATION_ONLY"
     assert agent.calls == 3
+    assert fake_container_runtime
     assert (state.root / "workspace" / "exp_001.py").exists()
     stdout_files = list((state.root / "workspace" / "outputs").glob("*.stdout.txt"))
     assert stdout_files
     assert stdout_files[0].read_text(encoding="utf-8").strip() == "10"
 
 
-def test_completed_code_experiment_is_reused(tmp_path):
+def test_completed_code_experiment_is_reused(tmp_path, fake_container_runtime):
     state = ResearchState(tmp_path / "state")
     first_trace = Trace("first", out_dir=tmp_path / "runs")
     first_lab = TheoremResearchLab(first_trace, state, literature=EmptyLiterature(), code_experiment_steps=5)
@@ -73,6 +74,7 @@ def test_completed_code_experiment_is_reused(tmp_path):
     first_lab._tool({"tool": "code_experiment", "task": "test"}, "iter:1:tool")
     first_trace.close()
 
+    first_command_count = len(fake_container_runtime)
     second_trace = Trace("second", out_dir=tmp_path / "runs")
     second_lab = TheoremResearchLab(second_trace, state, literature=EmptyLiterature(), code_experiment_steps=5)
     second_agent = FakeCodeAgent()
@@ -82,3 +84,4 @@ def test_completed_code_experiment_is_reused(tmp_path):
 
     assert result is not None and result.ok
     assert second_agent.calls == 0
+    assert len(fake_container_runtime) == first_command_count
