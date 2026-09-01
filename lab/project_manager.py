@@ -75,12 +75,7 @@ class ProjectInfo:
 
 
 class ProjectManager:
-    """Project-centric facade over research_state/<project_id> folders.
-
-    ``project_id`` is a human-readable locator. ``project_uuid`` is the immutable
-    identity used for new run association, so deleting and later recreating the
-    same project_id cannot silently inherit another project's history.
-    """
+    """Project-centric facade with immutable project UUIDs and indexed run history."""
 
     def __init__(self, root: str | Path = "research_state", runs_dir: str | Path = "runs"):
         self.root = Path(root)
@@ -129,15 +124,7 @@ class ProjectManager:
         }
         _write_json(root / "project.json", metadata)
         state = ResearchState(root)
-        state.freeze_problem(
-            problem,
-            metadata={
-                "project_id": pid,
-                "project_uuid": project_uuid,
-                "title": title.strip(),
-                "created_from": "project_manager",
-            },
-        )
+        state.freeze_problem(problem, metadata={"project_id": pid, "project_uuid": project_uuid, "title": title.strip(), "created_from": "project_manager"})
         if activate:
             self.set_active(pid)
         return self.get(pid)
@@ -179,15 +166,42 @@ class ProjectManager:
         return value if isinstance(value, dict) else {}
 
     def _counts(self, root: Path) -> dict[str, int]:
-        data = _read_json(root / "state.json", {})
-        items = data.get("items", []) if isinstance(data, dict) else []
+        try:
+            items = ResearchState(root).list_items()
+        except Exception:
+            items = []
         counts = {"OPEN": 0, "FAIL": 0, "PROVEN": 0, "KNOWN": 0, "TOTAL": 0}
-        for item in items if isinstance(items, list) else []:
-            status = str(item.get("status") or "")
+        for item in items:
             counts["TOTAL"] += 1
-            if status in counts:
-                counts[status] += 1
+            if item.status in counts:
+                counts[item.status] += 1
         return counts
+
+    @staticmethod
+    def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+        rows = []
+        if not path.exists():
+            return rows
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    value = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(value, dict):
+                    rows.append(value)
+        return rows
+
+    def _indexed_runs(self) -> dict[str, dict[str, Any]]:
+        latest: dict[str, dict[str, Any]] = {}
+        for row in self._read_jsonl(self.runs_dir / "index.jsonl"):
+            run_id = str(row.get("run_id") or "")
+            if not run_id:
+                continue
+            merged = dict(latest.get(run_id) or {})
+            merged.update(row)
+            latest[run_id] = merged
+        return latest
 
     @staticmethod
     def _trace_identity(trace_path: Path) -> tuple[str | None, str | None, str | None]:
@@ -203,8 +217,7 @@ class ProjectManager:
                         ev = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if first_ts is None and ev.get("ts"):
-                        first_ts = str(ev["ts"])
+                    first_ts = first_ts or (str(ev.get("ts")) if ev.get("ts") else None)
                     if ev.get("project_id"):
                         pid = str(ev["project_id"])
                     if ev.get("project_uuid"):
@@ -212,8 +225,21 @@ class ProjectManager:
                     if pid and project_uuid:
                         break
         except OSError:
-            return None, None, None
+            pass
         return pid, project_uuid, first_ts
+
+    def _summary_row(self, run_dir: Path) -> dict[str, Any]:
+        summary = _read_json(run_dir / "summary.json", {})
+        return {
+            "run": run_dir.name,
+            "run_dir": str(run_dir),
+            "started_at": summary.get("started_at", ""),
+            "finished_at": summary.get("finished_at", ""),
+            "wall_time_s": float(summary.get("wall_time_s", 0.0) or 0.0),
+            "calls": int(summary.get("total_calls", 0) or 0),
+            "tokens": int(summary.get("total_tokens", 0) or 0),
+            "cost_usd": float(summary.get("total_cost_usd", 0.0) or 0.0),
+        }
 
     def run_summaries(self, project_id: str) -> list[dict[str, Any]]:
         pid = _slug(project_id)
@@ -222,81 +248,78 @@ class ProjectManager:
             return []
         metadata = self._base_metadata(root)
         current_uuid = str(metadata.get("project_uuid") or "")
-        created_at = _parse_time(str(metadata.get("created_at") or ""))
         rows: list[dict[str, Any]] = []
-        if not self.runs_dir.exists():
-            return rows
-        for trace_path in self.runs_dir.glob("*/trace.jsonl"):
-            trace_pid, trace_uuid, first_ts = self._trace_identity(trace_path)
-            if trace_pid != pid:
+        indexed = self._indexed_runs()
+        matched_ids: set[str] = set()
+        for run_id, row in indexed.items():
+            if str(row.get("project_id") or "") != pid:
                 continue
-            if trace_uuid:
-                if trace_uuid != current_uuid:
+            row_uuid = str(row.get("project_uuid") or "")
+            if row_uuid and row_uuid != current_uuid:
+                continue
+            run_dir = Path(str(row.get("run_dir") or self.runs_dir / run_id))
+            if not run_dir.exists():
+                continue
+            rows.append(self._summary_row(run_dir))
+            matched_ids.add(run_id)
+        if rows:
+            return sorted(rows, key=lambda x: str(x.get("started_at") or x.get("run")), reverse=True)
+
+        # One-time compatibility fallback for pre-index runs. New UI paths do not
+        # repeatedly scan traces once index.jsonl exists.
+        created_at = _parse_time(str(metadata.get("created_at") or ""))
+        if self.runs_dir.exists():
+            for trace_path in self.runs_dir.glob("*/trace.jsonl"):
+                trace_pid, trace_uuid, first_ts = self._trace_identity(trace_path)
+                if trace_pid != pid:
                     continue
-            elif created_at is not None:
-                trace_time = _parse_time(first_ts or "")
-                # Legacy traces have no project_uuid. They are accepted only when
-                # they are not older than the current project's creation time.
-                if trace_time is not None and trace_time < created_at:
-                    continue
-            summary = _read_json(trace_path.parent / "summary.json", {})
-            if not isinstance(summary, dict):
-                summary = {}
-            rows.append(
-                {
-                    "run_id": trace_path.parent.name,
-                    "path": str(trace_path.parent),
-                    "started_at": summary.get("started_at", first_ts or ""),
-                    "finished_at": summary.get("finished_at", ""),
-                    "wall_time_s": float(summary.get("wall_time_s", 0) or 0),
-                    "total_calls": int(summary.get("total_calls", 0) or 0),
-                    "total_tokens": int(summary.get("total_tokens", 0) or 0),
-                    "total_cost_usd": float(summary.get("total_cost_usd", 0) or 0),
-                }
-            )
-        rows.sort(key=lambda x: str(x.get("started_at") or x["run_id"]), reverse=True)
-        return rows
+                if trace_uuid:
+                    if trace_uuid != current_uuid:
+                        continue
+                elif created_at:
+                    ts = _parse_time(first_ts or "")
+                    if ts and ts < created_at:
+                        continue
+                rows.append(self._summary_row(trace_path.parent))
+        return sorted(rows, key=lambda x: str(x.get("started_at") or x.get("run")), reverse=True)
 
     def get(self, project_id: str) -> ProjectInfo:
         pid = _slug(project_id)
         root = self.project_root(pid)
         if not root.exists():
             raise KeyError(pid)
-        metadata = self._base_metadata(root)
+        meta = self._base_metadata(root)
         frozen = _read_json(root / "problem_frozen.json", {})
         runtime = self._runtime(root)
         runs = self.run_summaries(pid)
-        status = str(runtime.get("status") or metadata.get("status") or "READY")
-        updated = str(runtime.get("updated_at") or metadata.get("updated_at") or "")
+        status = str(runtime.get("status") or meta.get("status") or "READY")
         return ProjectInfo(
             project_id=pid,
-            project_uuid=str(metadata.get("project_uuid") or ""),
-            title=str(metadata.get("title") or pid),
-            description=str(metadata.get("description") or ""),
+            project_uuid=str(meta.get("project_uuid") or ""),
+            title=str(meta.get("title") or pid),
+            description=str(meta.get("description") or ""),
             problem=str(frozen.get("problem") or ""),
-            experiment=str(metadata.get("experiment") or "Teorem Araştırması"),
-            literature_query=str(metadata.get("literature_query") or ""),
-            tags=list(metadata.get("tags") or []),
-            created_at=str(metadata.get("created_at") or frozen.get("frozen_at") or ""),
-            updated_at=updated,
-            archived=bool(metadata.get("archived", False)),
+            experiment=str(meta.get("experiment") or "Teorem Araştırması"),
+            literature_query=str(meta.get("literature_query") or ""),
+            tags=list(meta.get("tags") or []),
+            created_at=str(meta.get("created_at") or ""),
+            updated_at=str(meta.get("updated_at") or ""),
+            archived=bool(meta.get("archived", False)),
             status=status,
             runtime=runtime,
             counts=self._counts(root),
             run_count=len(runs),
-            total_tokens=sum(int(r.get("total_tokens", 0)) for r in runs),
-            total_cost_usd=round(sum(float(r.get("total_cost_usd", 0)) for r in runs), 8),
-            last_run=str(runs[0]["run_id"]) if runs else "",
+            total_tokens=sum(int(r.get("tokens", 0) or 0) for r in runs),
+            total_cost_usd=sum(float(r.get("cost_usd", 0.0) or 0.0) for r in runs),
+            last_run=str(runs[0].get("run") if runs else ""),
         )
 
     def list_projects(self, *, include_archived: bool = False) -> list[ProjectInfo]:
-        projects: list[ProjectInfo] = []
-        if not self.root.exists():
-            return projects
+        projects = []
         for root in self.root.iterdir():
-            if not root.is_dir() or root.name.startswith("."):
+            if not root.is_dir():
                 continue
-            if not any((root / marker).exists() for marker in ("project.json", "problem_frozen.json", "state.json", "runtime.json")):
+            if not any((root / name).exists() for name in ("project.json", "problem_frozen.json", "state.json", "runtime.json")):
                 continue
             try:
                 info = self.get(root.name)
@@ -305,61 +328,54 @@ class ProjectManager:
             if info.archived and not include_archived:
                 continue
             projects.append(info)
-        projects.sort(key=lambda x: x.updated_at or x.created_at or x.project_id, reverse=True)
-        return projects
+        return sorted(projects, key=lambda p: p.updated_at or p.created_at, reverse=True)
 
     def set_active(self, project_id: str) -> ProjectInfo:
         info = self.get(project_id)
-        _write_json(
-            self.active_path,
-            {"project_id": info.project_id, "project_uuid": info.project_uuid, "selected_at": _now()},
-        )
-        self.touch(info.project_id)
+        _write_json(self.active_path, {"project_id": info.project_id, "project_uuid": info.project_uuid, "updated_at": _now()})
         return info
 
     def active_project_id(self) -> str | None:
         raw = _read_json(self.active_path, {})
         pid = str(raw.get("project_id") or "") if isinstance(raw, dict) else ""
-        if not pid or not self.project_root(pid).exists():
-            return None
-        try:
-            info = self.get(pid)
-        except KeyError:
-            return None
-        saved_uuid = str(raw.get("project_uuid") or "") if isinstance(raw, dict) else ""
-        if saved_uuid and saved_uuid != info.project_uuid:
-            return None
-        return pid
+        return pid or None
 
     def active_project(self) -> ProjectInfo | None:
         pid = self.active_project_id()
         if not pid:
             return None
         try:
-            return self.get(pid)
+            info = self.get(pid)
         except KeyError:
+            self.clear_active()
             return None
+        active = _read_json(self.active_path, {})
+        stored_uuid = str(active.get("project_uuid") or "") if isinstance(active, dict) else ""
+        if stored_uuid and stored_uuid != info.project_uuid:
+            self.clear_active()
+            return None
+        return info
 
     def clear_active(self) -> None:
         self.active_path.unlink(missing_ok=True)
 
-    def touch(self, project_id: str, **updates: Any) -> None:
+    def touch(self, project_id: str, **updates: Any) -> ProjectInfo:
         pid = _slug(project_id)
         root = self.project_root(pid)
-        if not root.exists():
-            return
-        metadata = self._base_metadata(root)
-        project_uuid = str(metadata.get("project_uuid") or uuid.uuid4().hex)
-        metadata.update(updates)
-        metadata["project_id"] = pid
-        metadata["project_uuid"] = project_uuid
-        metadata["updated_at"] = _now()
-        _write_json(root / "project.json", metadata)
+        meta = self._base_metadata(root)
+        allowed = {"title", "description", "experiment", "literature_query", "tags", "archived", "status"}
+        for key, value in updates.items():
+            if key in allowed:
+                meta[key] = value
+        meta["updated_at"] = _now()
+        _write_json(root / "project.json", meta)
+        return self.get(pid)
 
-    def archive(self, project_id: str, archived: bool = True) -> None:
-        self.touch(project_id, archived=bool(archived))
-        if archived and self.active_project_id() == _slug(project_id):
+    def archive(self, project_id: str, archived: bool = True) -> ProjectInfo:
+        info = self.touch(project_id, archived=bool(archived))
+        if archived and self.active_project_id() == info.project_id:
             self.clear_active()
+        return info
 
     def clone(self, project_id: str, *, title: str, new_project_id: str | None = None) -> ProjectInfo:
         source = self.get(project_id)
@@ -367,7 +383,7 @@ class ProjectManager:
             title=title,
             project_id=new_project_id,
             problem=source.problem,
-            description=f"{source.description}\n\nKaynak proje: {source.project_id}".strip(),
+            description=source.description,
             experiment=source.experiment,
             literature_query=source.literature_query,
             tags=list(source.tags or []),
