@@ -8,9 +8,6 @@ import pytest
 from lab.code_experiment import GuardedExperimentWorkspace
 
 
-pytestmark = pytest.mark.container_integration
-
-
 def _docker_or_skip() -> str:
     docker = shutil.which("docker")
     if not docker:
