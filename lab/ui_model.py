@@ -68,25 +68,60 @@ def tool_status(event: dict[str, Any]) -> tuple[str, str]:
     return "FAIL", "error"
 
 
+def _parse_jsonl_lines(lines: list[str]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for line in lines:
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            result.append(value)
+    return result
+
+
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
-    result = []
     with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            try:
-                value = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(value, dict):
-                result.append(value)
-    return result
+        return _parse_jsonl_lines(handle.readlines())
+
+
+def read_jsonl_tail(path: Path, *, max_bytes: int = 2_000_000) -> list[dict[str, Any]]:
+    """Read only the tail of a potentially huge JSONL stream file.
+
+    trace.jsonl is intentionally low-volume, but stream.jsonl can become very
+    large during long reasoning calls. The live UI only needs recent deltas;
+    completed calls already have their full output in trace.jsonl.
+    """
+
+    if not path.exists() or max_bytes <= 0:
+        return []
+    with path.open("rb") as handle:
+        handle.seek(0, 2)
+        size = handle.tell()
+        start = max(0, size - int(max_bytes))
+        handle.seek(start)
+        if start:
+            handle.readline()  # discard a possibly partial JSONL record
+        raw = handle.read()
+    text = raw.decode("utf-8", errors="replace")
+    return _parse_jsonl_lines(text.splitlines())
 
 
 def load_run_events(run_dir: Path, *, include_stream: bool = True) -> list[dict[str, Any]]:
     events = read_jsonl(run_dir / "trace.jsonl")
     if include_stream:
         events.extend(read_jsonl(run_dir / "stream.jsonl"))
+    events.sort(key=lambda ev: str(ev.get("ts") or ""))
+    return events
+
+
+def load_live_run_events(run_dir: Path, *, stream_tail_bytes: int = 2_000_000) -> list[dict[str, Any]]:
+    """Load a live timeline without re-reading the entire streaming log."""
+
+    events = read_jsonl(run_dir / "trace.jsonl")
+    events.extend(read_jsonl_tail(run_dir / "stream.jsonl", max_bytes=stream_tail_bytes))
     events.sort(key=lambda ev: str(ev.get("ts") or ""))
     return events
 
