@@ -75,6 +75,7 @@ class TheoremResearchLab:
             agent=agent.name,
             model=agent.model,
             temperature=agent.temperature,
+            system_prompt=agent.system_prompt,
             prompt=prompt,
         )
         content, response = agent.respond(messages)
