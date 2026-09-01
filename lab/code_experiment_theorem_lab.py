@@ -10,6 +10,7 @@ from lab.code_experiment import (
     GuardedExperimentWorkspace,
     WorkspaceActionResult,
 )
+from lab.code_experiment_settings import load_code_experiment_settings
 from lab.partial_resume_theorem_lab import TheoremResearchLab as PartialResumeTheoremResearchLab
 from lab.tools import ToolResult
 
@@ -17,14 +18,21 @@ from lab.tools import ToolResult
 class TheoremResearchLab(PartialResumeTheoremResearchLab):
     """Partial-resumable theorem lab with an autonomous guarded code-experiment loop."""
 
-    def __init__(self, *args, code_experiment_steps: int = 8, **kwargs):
+    def __init__(self, *args, code_experiment_steps: int | None = None, **kwargs):
         super().__init__(*args, **kwargs)
+        settings = load_code_experiment_settings()
+        steps = int(code_experiment_steps or settings.get("max_steps", 8))
+        timeout_s = int(settings.get("timeout_s", 60))
+        self.code_settings = settings
         self.code_agent: Agent | None = None
-        self.code_workspace = GuardedExperimentWorkspace(self.state.root / "workspace")
+        self.code_workspace = GuardedExperimentWorkspace(
+            self.state.root / "workspace",
+            timeout_s=timeout_s,
+        )
         self.code_runner = CodeExperimentRunner(
             self.code_workspace,
             self.trace,
-            max_steps=code_experiment_steps,
+            max_steps=steps,
         )
 
     def _save_config(
@@ -42,10 +50,15 @@ class TheoremResearchLab(PartialResumeTheoremResearchLab):
 
     def run(self, problem: str, *, code_agent: Agent | None = None, proposer: Agent, **kwargs) -> str:
         if code_agent is None:
+            configured_model = str(self.code_settings.get("model") or "").strip()
             code_agent = Agent(
                 name="CodeExperimentAgent",
                 system_prompt=CODE_EXPERIMENT_SYSTEM_PROMPT,
-                model=os.environ.get("LAB_CODE_EXPERIMENT_MODEL") or proposer.model,
+                model=(
+                    configured_model
+                    or os.environ.get("LAB_CODE_EXPERIMENT_MODEL")
+                    or proposer.model
+                ),
                 temperature=0.2,
                 max_tokens=proposer.max_tokens,
             )
