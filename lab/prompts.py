@@ -12,7 +12,7 @@ ROLE_LIBRARY = {
     "AdversarialCritic": "Adayı çürütmeye çalış: karşıörnek, gizli varsayım, yanlış model, asymptotic hata ve novelty riski ara.",
     "VerificationEngineer": "LLM kanaatini ispat sayma; deterministic evidence ile formal proof gereksinimini kesin ayır. Tool error ile matematiksel counterexample'ı karıştırma.",
     "LiteratureScout": "Literatür/novelty riskini tara; yalnız verilen bibliyografik kayıtların desteklediği şeyi söyle. Boş/başarısız taramayı novelty kanıtı sayma.",
-    "IndependentAuditor": "Sıfır-güven bağımsız denetçi ol; OPEN, COMPUTATION_PASS, PROOF_CANDIDATE ve PROVEN basamaklarını kesin ayır.",
+    "IndependentAuditor": "Sıfır-güven bağımsız denetçi ol; OPEN, REFUTATION_CANDIDATE, COMPUTATION_PASS, PROOF_CANDIDATE ve PROVEN basamaklarını kesin ayır.",
 }
 
 
@@ -65,6 +65,7 @@ def proposal_prompt(
         f"RESEARCH LEDGER SNAPSHOT (frozen for this iteration):\n{ledger}\n\n"
         f"CURRENT TASK:\n{next_task}\n\n"
         "Produce exactly one research candidate. Do not reopen a FAIL/DROPPED idea listed in the ledger. "
+        "A REFUTATION_CANDIDATE is still active: when relevant, prioritize checking its claimed counterexample with a deterministic tool instead of treating it as settled. "
         "Separate proved facts from assumptions. If computation/formal checking is useful, request one tool. "
         "For lean_draft, theorem_name and theorem_type are mandatory and must describe the exact single theorem/lemma in source; "
         "the engine will ignore your filename, bind the source to this iteration's ledger item, and check that exact SHA immediately. "
@@ -121,8 +122,9 @@ def manager_prompt(
         f"Verifier:\n{json.dumps(verification, ensure_ascii=False, indent=2)}\n"
         f"Critic:\n{json.dumps(critique, ensure_ascii=False, indent=2)}\n\n"
         "Choose research direction. Status is a REQUEST only; code-side evidence guards may downgrade it. "
+        "An LLM-written counterexample is only a REFUTATION_CANDIDATE until a deterministic tool verifies it; make deterministic verification the next task rather than treating the claim as dead. "
         "Do not claim PROVEN unless a successful same-item bound formal checker result is explicitly present. Return ONLY JSON: "
-        '{"decision":"KEEP|REVISE|KILL|CHECKPOINT","status":"OPEN|COMPUTATION_PASS|PROOF_CANDIDATE|PROVEN|FAIL|DROPPED",'
+        '{"decision":"KEEP|REVISE|KILL|CHECKPOINT","status":"OPEN|REFUTATION_CANDIDATE|COMPUTATION_PASS|PROOF_CANDIDATE|PROVEN|FAIL|DROPPED",'
         '"reason":"...","next_task":"..."}'
     )
 
