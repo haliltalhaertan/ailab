@@ -47,9 +47,11 @@ runtime_path = project / "runtime.json"
 config_path = project / "run_config.json"
 stop_path = project / "stop.flag"
 cache_path = project / "step_cache.json"
+partial_path = project / "partial_steps.json"
 runtime = read_json(runtime_path, {})
 config = read_json(config_path, {})
 cache = read_json(cache_path, {})
+partials = read_json(partial_path, {})
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Durum", runtime.get("status", "READY"))
@@ -60,6 +62,8 @@ c4.metric(
     len([v for v in cache.values() if isinstance(v, dict) and v.get("status") == "COMPLETE"]),
 )
 st.write("**Şu anki adım:**", runtime.get("current_step", "-"))
+if partials:
+    st.info(f"Yarım kalmış/soft-resume için saklanan {len(partials)} LLM adımı var.")
 if runtime.get("next_task"):
     st.write("**Sonraki araştırma hedefi:**", runtime["next_task"])
 if runtime.get("last_error"):
@@ -69,7 +73,7 @@ left, right = st.columns(2)
 with left:
     if st.button("DURDUR", type="primary", use_container_width=True):
         stop_path.write_text("stop requested\n", encoding="utf-8")
-        st.warning("Durdurma isteği yazıldı. Tamamlanan işler korunacak.")
+        st.warning("Durdurma isteği yazıldı. Tamamlanan işler ve provider-visible partial çalışma korunacak.")
 with right:
     if st.button("Durdurma isteğini iptal et", use_container_width=True):
         stop_path.unlink(missing_ok=True)
@@ -85,7 +89,7 @@ if not config:
 else:
     st.caption(
         "404 veren model slug'ı gibi ayarları burada değiştirip devam edebilirsin. "
-        "Reasoning effort kalıcı agent ayarlarından yüklenir."
+        "CodeExperimentAgent kaydedilmişse onun modeli de burada değiştirilebilir."
     )
     edited = {}
     for role, raw in config.get("agents", {}).items():
@@ -137,6 +141,7 @@ else:
                     str(config.get("problem") or frozen.get("problem", "")),
                     manager=agents["ResearchManager"],
                     proposer=agents["Theorist"],
+                    code_agent=agents.get("CodeExperimentAgent"),
                     critic=agents["AdversarialCritic"],
                     verifier=agents["VerificationEngineer"],
                     literature_agent=agents.get("LiteratureScout"),
@@ -165,6 +170,8 @@ with st.expander("Kaydedilmiş run config", expanded=False):
     st.json(config)
 with st.expander("Runtime cursor", expanded=False):
     st.json(runtime)
+with st.expander("Partial/soft-resume adımları", expanded=False):
+    st.json(partials)
 with st.expander("Step cache anahtarları", expanded=False):
     st.json(
         {
