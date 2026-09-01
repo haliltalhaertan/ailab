@@ -19,9 +19,17 @@ from lab.tools import ToolResult
 class TheoremResearchLab(PartialResumeTheoremResearchLab):
     """Partial-resumable theorem lab with autonomous computational experiments."""
 
-    def __init__(self, *args, code_experiment_steps: int | None = None, **kwargs):
+    def __init__(
+        self,
+        *args,
+        code_experiment_steps: int | None = None,
+        code_experiment_settings_override: dict[str, Any] | None = None,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         settings = load_code_experiment_settings()
+        if code_experiment_settings_override:
+            settings = {**settings, **dict(code_experiment_settings_override)}
         steps = int(code_experiment_steps or settings.get("max_steps", 8))
         timeout_s = int(settings.get("timeout_s", 60))
         memory_limit_mb = int(settings.get("memory_limit_mb", 768))
