@@ -1,5 +1,6 @@
-"""Compatibility shim. Resume/stop/retry now live in RunController + theorem_engine."""
+"""Compatibility shim. Resume/stop/retry now live in RunController + theorem engine."""
 
+from lab.integrity_theorem_lab import TheoremResearchLab
 from lab.run_controller import (
     ResearchPaused,
     ResearchStopped,
@@ -8,7 +9,6 @@ from lab.run_controller import (
     read_json as _read_json,
     retryable as _retryable,
 )
-from lab.theorem_engine import TheoremResearchLab
 
 __all__ = [
     "TheoremResearchLab",
