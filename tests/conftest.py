@@ -13,12 +13,13 @@ import lab.code_experiment as code_experiment
 
 @pytest.fixture
 def fake_container_runtime(monkeypatch):
-    """Run hard-coded test scripts through a fake container CLI.
+    """Run policy-approved unit-test scripts through a fake container CLI.
 
     Production code still requires Docker/Podman and fails closed without it.
-    This fixture only replaces the external container process so unit tests do
-    not depend on Docker Hub/network availability. It also records the exact
-    command, allowing tests to assert the production isolation flags.
+    The fake exists only for fast unit tests. Because it ultimately uses host
+    ``exec``, it performs the production AST policy a second time immediately
+    before execution so a bypass payload can never reach host Python through
+    this fixture.
     """
 
     commands: list[list[str]] = []
@@ -50,10 +51,16 @@ def fake_container_runtime(monkeypatch):
             err_buffer = io.StringIO()
             old_argv = sys.argv
             try:
+                source_text = script.read_text(encoding="utf-8")
+                policy = code_experiment.GuardedExperimentWorkspace(
+                    Path(source),
+                    container_engine="docker",
+                )
+                policy._validate_python(source_text)
                 sys.argv = [str(script), *script_args]
                 namespace = {"__name__": "__main__", "__file__": str(script)}
                 with contextlib.redirect_stdout(out_buffer), contextlib.redirect_stderr(err_buffer):
-                    exec(compile(script.read_text(encoding="utf-8"), str(script), "exec"), namespace, namespace)
+                    exec(compile(source_text, str(script), "exec"), namespace, namespace)
             except BaseException:
                 self.returncode = 1
                 traceback.print_exc(file=err_buffer)
