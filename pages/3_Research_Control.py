@@ -3,7 +3,14 @@ from pathlib import Path
 
 import streamlit as st
 
-from lab import Agent, ResearchState, ResearchToolbox, TheoremResearchLab, Trace
+from lab import (
+    Agent,
+    ProjectBusyError,
+    ResearchState,
+    ResearchToolbox,
+    TheoremResearchLab,
+    Trace,
+)
 from lab.project_manager import ProjectManager
 
 
@@ -73,7 +80,10 @@ left, right = st.columns(2)
 with left:
     if st.button("DURDUR", type="primary", use_container_width=True):
         stop_path.write_text("stop requested\n", encoding="utf-8")
-        st.warning("Durdurma isteği yazıldı. Tamamlanan işler ve provider-visible partial çalışma korunacak.")
+        st.warning(
+            "Durdurma isteği yazıldı. LLM çağrısı ve çalışan Python deneyi mümkün olan ilk noktada durdurulacak; "
+            "tamamlanan işler ve provider-visible partial çalışma korunacak."
+        )
 with right:
     if st.button("Durdurma isteğini iptal et", use_container_width=True):
         stop_path.unlink(missing_ok=True)
@@ -88,13 +98,16 @@ if not config:
         st.switch_page("app.py")
 else:
     st.caption(
-        "404 veren model slug'ı gibi ayarları burada değiştirip devam edebilirsin. "
-        "CodeExperimentAgent kaydedilmişse onun modeli de burada değiştirilebilir."
+        "Model slug'ını bilinçli olarak değiştirebilirsin. Reasoning effort, temperature, system prompt "
+        "ve code-experiment limitleri kaydedilmiş run config'ten aynen geri yüklenir."
     )
     edited = {}
     for role, raw in config.get("agents", {}).items():
         col1, col2 = st.columns([1, 2])
+        effort = raw.get("reasoning_effort")
+        effort_label = effort if effort is not None else "provider-default"
         col1.write(f"**{role}**")
+        col1.caption(f"reasoning: `{effort_label}`")
         edited[role] = dict(raw)
         edited[role]["model"] = col2.text_input(
             f"{role} model",
@@ -107,13 +120,14 @@ else:
         stop_path.unlink(missing_ok=True)
         state = ResearchState(project)
         trace = Trace("theorem-resume")
+        project_info = pm.get(selected_id)
         trace.log(
             "project_context",
             project_id=selected_id,
-            title=pm.get(selected_id).title,
+            project_uuid=project_info.project_uuid,
+            title=project_info.title,
             experiment="Teorem Araştırması",
         )
-        pm.touch(selected_id, status="RUNNING")
         agents = {}
         for role, raw in edited.items():
             agents[role] = Agent(
@@ -122,6 +136,7 @@ else:
                 model=str(raw.get("model") or ""),
                 temperature=float(raw.get("temperature", 0.2)),
                 max_tokens=raw.get("max_tokens"),
+                reasoning_effort=raw.get("reasoning_effort"),
             )
         required = {
             "ResearchManager",
@@ -132,12 +147,20 @@ else:
         }
         missing = required - set(agents)
         if missing:
+            trace.close()
             st.error(f"Eksik rol config'i: {sorted(missing)}")
         else:
             status = st.status("Araştırma kaldığı yerden devam ediyor...", expanded=True)
             try:
+                pm.touch(selected_id, status="RUNNING")
                 frozen = state.frozen_problem() or {}
-                result = TheoremResearchLab(trace, state, toolbox=ResearchToolbox()).run(
+                lab = TheoremResearchLab(
+                    trace,
+                    state,
+                    toolbox=ResearchToolbox(),
+                    code_experiment_settings_override=config.get("code_experiment") or None,
+                )
+                result = lab.run(
                     str(config.get("problem") or frozen.get("problem", "")),
                     manager=agents["ResearchManager"],
                     proposer=agents["Theorist"],
@@ -158,13 +181,17 @@ else:
                     state="complete",
                 )
                 st.markdown(result)
+            except ProjectBusyError as exc:
+                status.update(label="Proje zaten başka bir process tarafından çalıştırılıyor", state="error")
+                st.error(str(exc))
             except Exception as exc:
                 pm.touch(selected_id, status="PAUSED_ERROR")
                 status.update(label="Resume çağrısı beklenmeyen hata verdi", state="error")
                 st.exception(exc)
             finally:
-                summary_path = trace.close()
-                st.caption(f"Resume logları: {summary_path.parent}")
+                if not trace.closed:
+                    summary_path = trace.close()
+                    st.caption(f"Resume logları: {summary_path.parent}")
 
 with st.expander("Kaydedilmiş run config", expanded=False):
     st.json(config)
@@ -175,7 +202,11 @@ with st.expander("Partial/soft-resume adımları", expanded=False):
 with st.expander("Step cache anahtarları", expanded=False):
     st.json(
         {
-            k: {"status": v.get("status"), "model": v.get("model")}
+            k: {
+                "status": v.get("status"),
+                "model": v.get("model"),
+                "fingerprint": str(v.get("fingerprint") or "")[:16],
+            }
             if isinstance(v, dict)
             else v
             for k, v in cache.items()
