@@ -174,7 +174,7 @@ def test_code_experiment_finish_after_failed_run_is_rejected(tmp_path, fake_cont
         execute_cached=lambda key, action: ws.execute(action),
     )
     trace.close()
-    assert fake_container_runtime
+    assert [cmd for cmd in fake_container_runtime if len(cmd) > 1 and cmd[1] == "run"]
     assert not result.ok
     assert result.metadata["successful_run_count"] == 0
     assert result.metadata["failed_run_count"] == 1
@@ -186,7 +186,8 @@ def test_experiment_outputs_are_never_overwritten(tmp_path, fake_container_runti
     first = ws.run_python("exp.py")
     second = ws.run_python("exp.py")
     assert first.ok and second.ok
-    assert len(fake_container_runtime) == 2
+    run_commands = [cmd for cmd in fake_container_runtime if len(cmd) > 1 and cmd[1] == "run"]
+    assert len(run_commands) == 2
     assert first.metadata["stdout_file"] != second.metadata["stdout_file"]
     assert (ws.root / first.metadata["stdout_file"]).read_text(encoding="utf-8").strip() == "same"
     assert (ws.root / second.metadata["stdout_file"]).read_text(encoding="utf-8").strip() == "same"
