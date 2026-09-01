@@ -274,4 +274,6 @@ mypy
 
 Container execution testleri Docker Hub/network'e bağımlı değildir; external runtime deterministik test double ile doğrulanırken production command'in network/rootfs/capability/resource izolasyon flagleri ayrıca assert edilir.
 
+Son audit-hardening değişiklikleri bu matrisin tamamı yeşil olmadan `main`e alınmaz.
+
 Amaç, çok sayıda ikna edici metin üretmek değil; yanlış hipotezleri mümkün olduğunca erken öldürmek ve her güçlü iddiayı gerçekten sahip olduğu evidence seviyesinde tutmaktır.
