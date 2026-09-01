@@ -56,13 +56,16 @@ def test_theorem_lab_persists_candidate_and_audit(tmp_path: Path):
     candidates = state.list_items(kind="conjecture")
     assert len(candidates) == 1
     assert candidates[0].status == "OPEN"
-    assert state.list_items(kind="audit")
+    final_checkpoints = list((state.root / "checkpoints").glob("*final*"))
+    assert final_checkpoints
     assert "Teorem Araştırması Sonucu" in report
 
     trace_text = trace.path.read_text(encoding="utf-8")
     assert '"type": "agent_start"' in trace_text
     assert '"type": "state_change"' in trace_text
     assert '"type": "checkpoint"' in trace_text
+    assert '"final": true' in trace_text
+    assert "PASS-WITH-GAPS" in trace_text
 
 
 def test_tropical_counterexample_automatically_kills_candidate(tmp_path: Path):
