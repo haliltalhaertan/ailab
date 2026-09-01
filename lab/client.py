@@ -2,11 +2,12 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from openai import OpenAI
 
 DEFAULT_MODEL = "openai/gpt-4o-mini"
+StreamCallback = Callable[[str, Any], None]
 
 
 @dataclass
@@ -67,6 +68,21 @@ def _jsonable(value: Any) -> Any:
         return str(value)
 
 
+def _usage_values(usage: Any) -> tuple[int, int, int, int, float | None]:
+    prompt_tokens = int(_extra(usage, "prompt_tokens", 0) or 0) if usage else 0
+    completion_tokens = int(_extra(usage, "completion_tokens", 0) or 0) if usage else 0
+    prompt_details = _extra(usage, "prompt_tokens_details") if usage else None
+    completion_details = _extra(usage, "completion_tokens_details") if usage else None
+    reasoning_tokens = _detail_token_count(completion_details, "reasoning_tokens")
+    cached_tokens = _detail_token_count(prompt_details, "cached_tokens")
+    cost_raw = _extra(usage, "cost") if usage else None
+    try:
+        cost_usd = float(cost_raw) if cost_raw is not None else None
+    except (TypeError, ValueError):
+        cost_usd = None
+    return prompt_tokens, completion_tokens, reasoning_tokens, cached_tokens, cost_usd
+
+
 class LLMClient:
     def __init__(self, api_key: str | None = None, base_url: str | None = None):
         api_key = api_key or os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY")
@@ -84,9 +100,10 @@ class LLMClient:
         model: str | None = None,
         temperature: float = 0.7,
         max_tokens: int | None = None,
+        stream_callback: StreamCallback | None = None,
     ) -> LLMResponse:
         model = model or os.environ.get("LAB_MODEL", DEFAULT_MODEL)
-        kwargs: dict = {
+        kwargs: dict[str, Any] = {
             "model": model,
             "messages": messages,
             "temperature": temperature,
@@ -94,27 +111,26 @@ class LLMClient:
         if max_tokens:
             kwargs["max_tokens"] = max_tokens
         if self.is_openrouter:
-            kwargs["extra_body"] = {"usage": {"include": True}}
+            # Ask OpenRouter to return exact billed usage/cost and expose reasoning
+            # when the selected provider/model supports returning it.
+            kwargs["extra_body"] = {
+                "usage": {"include": True},
+                "reasoning": {"exclude": False},
+            }
 
+        if stream_callback is None:
+            return self._complete_once(kwargs, messages, model)
+        return self._complete_stream(kwargs, messages, model, stream_callback)
+
+    def _complete_once(self, kwargs: dict[str, Any], messages: list[dict], model: str) -> LLMResponse:
         start = time.perf_counter()
         resp = self._client.chat.completions.create(**kwargs)
         latency = time.perf_counter() - start
         usage = resp.usage
         message = resp.choices[0].message
-
-        prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0) if usage else 0
-        completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0) if usage else 0
-        cost_raw = _extra(usage, "cost") if usage else None
-        try:
-            cost_usd = float(cost_raw) if cost_raw is not None else None
-        except (TypeError, ValueError):
-            cost_usd = None
-
-        prompt_details = getattr(usage, "prompt_tokens_details", None) if usage else None
-        completion_details = getattr(usage, "completion_tokens_details", None) if usage else None
+        prompt_tokens, completion_tokens, reasoning_tokens, cached_tokens, cost_usd = _usage_values(usage)
         provider_reasoning = _extra(message, "reasoning", "") or ""
         reasoning_details = _jsonable(_extra(message, "reasoning_details"))
-
         return LLMResponse(
             content=message.content or "",
             model=resp.model or model,
@@ -122,9 +138,76 @@ class LLMClient:
             completion_tokens=completion_tokens,
             latency_s=round(latency, 3),
             cost_usd=cost_usd,
-            reasoning_tokens=_detail_token_count(completion_details, "reasoning_tokens"),
-            cached_tokens=_detail_token_count(prompt_details, "cached_tokens"),
+            reasoning_tokens=reasoning_tokens,
+            cached_tokens=cached_tokens,
             provider_reasoning=str(provider_reasoning),
             reasoning_details=reasoning_details,
+            request_messages=[dict(m) for m in messages],
+        )
+
+    def _complete_stream(
+        self,
+        kwargs: dict[str, Any],
+        messages: list[dict],
+        model: str,
+        stream_callback: StreamCallback,
+    ) -> LLMResponse:
+        stream_kwargs = dict(kwargs)
+        stream_kwargs["stream"] = True
+        # OpenAI-compatible providers normally put usage in the final stream chunk.
+        stream_kwargs["stream_options"] = {"include_usage": True}
+
+        start = time.perf_counter()
+        stream = self._client.chat.completions.create(**stream_kwargs)
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        reasoning_details: list[Any] = []
+        final_usage = None
+        resolved_model = model
+
+        for chunk in stream:
+            if getattr(chunk, "model", None):
+                resolved_model = chunk.model
+            usage = getattr(chunk, "usage", None)
+            if usage is not None:
+                final_usage = usage
+            choices = getattr(chunk, "choices", None) or []
+            if not choices:
+                continue
+            delta = choices[0].delta
+
+            content_delta = _extra(delta, "content", "") or ""
+            if content_delta:
+                text = str(content_delta)
+                content_parts.append(text)
+                stream_callback("content", text)
+
+            reasoning_delta = _extra(delta, "reasoning", "") or ""
+            if reasoning_delta:
+                text = str(reasoning_delta)
+                reasoning_parts.append(text)
+                stream_callback("reasoning", text)
+
+            detail_delta = _jsonable(_extra(delta, "reasoning_details"))
+            if detail_delta:
+                if isinstance(detail_delta, list):
+                    reasoning_details.extend(detail_delta)
+                else:
+                    reasoning_details.append(detail_delta)
+                stream_callback("reasoning_details", detail_delta)
+
+        latency = time.perf_counter() - start
+        prompt_tokens, completion_tokens, reasoning_tokens, cached_tokens, cost_usd = _usage_values(final_usage)
+        return LLMResponse(
+            content="".join(content_parts),
+            model=resolved_model or model,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            latency_s=round(latency, 3),
+            cost_usd=cost_usd,
+            reasoning_tokens=reasoning_tokens,
+            cached_tokens=cached_tokens,
+            provider_reasoning="".join(reasoning_parts),
+            reasoning_details=reasoning_details or None,
             request_messages=[dict(m) for m in messages],
         )

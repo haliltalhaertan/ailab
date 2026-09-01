@@ -1,8 +1,19 @@
 import json
 import time
 from collections import defaultdict
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
+
+
+_ACTIVE_TRACE: ContextVar["Trace | None"] = ContextVar("ailab_active_trace", default=None)
+
+
+def get_active_trace() -> "Trace | None":
+    trace = _ACTIVE_TRACE.get()
+    if trace is None or trace.closed:
+        return None
+    return trace
 
 
 class Trace:
@@ -13,6 +24,8 @@ class Trace:
         self.path = self.run_dir / "trace.jsonl"
         self.started_at = datetime.now(timezone.utc).isoformat()
         self._started_perf = time.perf_counter()
+        self.closed = False
+        _ACTIVE_TRACE.set(self)
 
     def log(self, event_type: str, **data) -> None:
         event = {"ts": datetime.now(timezone.utc).isoformat(), "type": event_type, **data}
@@ -128,4 +141,5 @@ class Trace:
         }
         out = self.run_dir / "summary.json"
         out.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.closed = True
         return out

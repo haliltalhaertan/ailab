@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field
+from typing import Any, Callable
 
 from lab.client import LLMClient, LLMResponse
+from lab.trace import get_active_trace
 
 
 @dataclass
@@ -12,12 +14,30 @@ class Agent:
     max_tokens: int | None = None
     client: LLMClient = field(default_factory=LLMClient)
 
-    def respond(self, messages: list[dict]) -> tuple[str, LLMResponse]:
+    def respond(
+        self,
+        messages: list[dict],
+        stream_callback: Callable[[str, Any], None] | None = None,
+    ) -> tuple[str, LLMResponse]:
         full = [{"role": "system", "content": self.system_prompt}] + messages
+        callback = stream_callback
+        if callback is None:
+            trace = get_active_trace()
+            if trace is not None:
+                def callback(channel: str, payload: Any) -> None:
+                    trace.log(
+                        "agent_stream",
+                        agent=self.name,
+                        model=self.model,
+                        channel=channel,
+                        delta=payload,
+                    )
+
         resp = self.client.complete(
             full,
             model=self.model,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
+            stream_callback=callback,
         )
         return resp.content, resp
