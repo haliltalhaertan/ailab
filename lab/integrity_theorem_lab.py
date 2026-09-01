@@ -13,13 +13,7 @@ from lab.tools import LeanTool, ResearchToolbox, ToolResult
 
 
 class TheoremResearchLab(CoreTheoremResearchLab):
-    """Integrity wrapper around the single production theorem engine.
-
-    It keeps the core workflow in ``theorem_engine.py`` while enforcing the
-    invariants that need project/iteration context: project-local formal files,
-    early project locking, same-iteration Lean draft/check binding, and generic
-    exception runtime recovery.
-    """
+    """Integrity wrapper around the single production theorem engine."""
 
     def __init__(
         self,
@@ -61,9 +55,6 @@ class TheoremResearchLab(CoreTheoremResearchLab):
         ):
             return
         metadata["lean_file"] = str(metadata.get("file") or "")
-        # Persist the complete machine-produced binding while status is still OPEN.
-        # The core engine later supplies only a small formal summary; ResearchState
-        # merges it with these fields and creates the HMAC proof seal at PROVEN.
         self.state.update_item(self._active_item_id, metadata=metadata)
 
     def _cached_formal_result(self, raw: dict[str, Any]) -> ToolResult:
@@ -172,6 +163,19 @@ class TheoremResearchLab(CoreTheoremResearchLab):
         )
         return result
 
+    @staticmethod
+    def _normalize_structural_counterexample(result: ToolResult | None) -> ToolResult | None:
+        if result is None or result.tool != "tropical_grid":
+            return result
+        metadata = dict(result.metadata or {})
+        if str(metadata.get("status") or "").upper() != "STRUCTURE_MISMATCH":
+            return result
+        metadata["counterexample_type"] = "PROVENANCE_STRUCTURE_MISMATCH"
+        metadata["raw_status"] = "STRUCTURE_MISMATCH"
+        metadata["status"] = "COUNTEREXAMPLE"
+        result.metadata = metadata
+        return result
+
     def _tool(self, request: dict[str, Any] | None, step_key: str) -> ToolResult | None:
         name = str((request or {}).get("tool") or "none").strip().lower()
         if name == "lean":
@@ -187,12 +191,10 @@ class TheoremResearchLab(CoreTheoremResearchLab):
             return result
         if name == "lean_draft":
             return self._formal_tool(dict(request or {}), step_key)
-        return super()._tool(request, step_key)
+        result = super()._tool(request, step_key)
+        return self._normalize_structural_counterexample(result)
 
     def run(self, *args: Any, **kwargs: Any) -> str:
-        # Acquire before _save_config(), clear_stale_stop(), or any theorem-state
-        # mutation in the core run method. ProjectRunLock is re-entrant for this
-        # exact lock instance, so the core ``with self.controller.lock`` remains.
         try:
             with self.controller.lock:
                 self.trace.log(
