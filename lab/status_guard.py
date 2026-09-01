@@ -40,11 +40,7 @@ def choose_status(
     verifier: dict[str, Any],
     critic: dict[str, Any],
 ) -> GuardDecision:
-    """Return the strongest status justified by machine-observable evidence.
-
-    LLMs can request a status but cannot manufacture the evidence needed for the
-    upper rungs of the proof ladder.
-    """
+    """Return the strongest status justified by machine-observable evidence."""
 
     requested = str(requested or "OPEN").upper()
     verifier_verdict = str(verifier.get("verdict") or "INCONCLUSIVE").upper()
@@ -76,9 +72,21 @@ def choose_status(
         return GuardDecision(requested, "FAIL", "Counterexample evidence forces FAIL.", requested != "FAIL", metadata)
 
     if requested == "PROVEN":
-        if formal_verified:
-            return GuardDecision(requested, "PROVEN", "Successful formal checker result.", False, metadata)
-        return GuardDecision(requested, "OPEN", "PROVEN rejected: no successful formal checker evidence.", True, metadata)
+        if formal_verified and verifier_verdict == "PASS" and critic_verdict != "KILL":
+            return GuardDecision(
+                requested,
+                "PROVEN",
+                "Formal checker succeeded, verifier passed the candidate, and critic did not KILL it.",
+                False,
+                metadata,
+            )
+        return GuardDecision(
+            requested,
+            "OPEN",
+            "PROVEN rejected: requires successful formal checker + verifier PASS + critic not KILL.",
+            True,
+            metadata,
+        )
 
     if requested == "PROOF_CANDIDATE":
         if verifier_verdict == "PASS" and critic_verdict != "KILL":
@@ -91,10 +99,14 @@ def choose_status(
         return GuardDecision(requested, "OPEN", "COMPUTATION_PASS rejected: no successful deterministic tool evidence.", True, metadata)
 
     if requested == "FAIL":
-        # An LLM may recommend abandoning a direction, but without a concrete
-        # counterexample we keep that semantic distinction as DROPPED.
         if critic_verdict == "KILL" or verifier_verdict == "FAIL":
-            return GuardDecision(requested, "DROPPED", "No machine/verifier counterexample payload; recorded as DROPPED, not mathematical FAIL.", True, metadata)
+            return GuardDecision(
+                requested,
+                "DROPPED",
+                "No concrete counterexample payload; recorded as DROPPED rather than mathematical FAIL.",
+                True,
+                metadata,
+            )
         return GuardDecision(requested, "OPEN", "FAIL rejected: insufficient failure evidence.", True, metadata)
 
     if requested == "DROPPED":
