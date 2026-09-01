@@ -43,12 +43,23 @@ class Agent:
                         delta=payload,
                     )
 
-        resp = self.client.complete(
-            full,
-            model=self.model,
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
-            reasoning_effort=self.reasoning_effort,
-            stream_callback=callback,
-        )
+        base_kwargs = {
+            "model": self.model,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "stream_callback": callback,
+        }
+        try:
+            resp = self.client.complete(
+                full,
+                reasoning_effort=self.reasoning_effort,
+                **base_kwargs,
+            )
+        except TypeError as exc:
+            # Preserve compatibility with custom/test clients that implement the
+            # older complete(...) signature and do not accept reasoning_effort.
+            text = str(exc)
+            if "reasoning_effort" not in text or "unexpected keyword" not in text:
+                raise
+            resp = self.client.complete(full, **base_kwargs)
         return resp.content, resp
