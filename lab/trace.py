@@ -1,5 +1,6 @@
 import json
 import time
+import uuid
 from collections import defaultdict
 from contextvars import ContextVar
 from datetime import datetime, timezone
@@ -18,16 +19,31 @@ def get_active_trace() -> "Trace | None":
 
 class Trace:
     def __init__(self, experiment: str, out_dir: str | Path = "runs"):
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.run_dir = Path(out_dir) / f"{stamp}_{experiment}"
-        self.run_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        run_nonce = uuid.uuid4().hex[:10]
+        self.run_id = f"{stamp}_{run_nonce}_{experiment}"
+        self.run_dir = Path(out_dir) / self.run_id
+        self.run_dir.mkdir(parents=True, exist_ok=False)
         self.path = self.run_dir / "trace.jsonl"
         self.started_at = datetime.now(timezone.utc).isoformat()
         self._started_perf = time.perf_counter()
         self.closed = False
         _ACTIVE_TRACE.set(self)
 
+    @staticmethod
+    def _project_uuid(project_id: str) -> str | None:
+        try:
+            raw = json.loads((Path("research_state") / project_id / "project.json").read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        value = str(raw.get("project_uuid") or "").strip() if isinstance(raw, dict) else ""
+        return value or None
+
     def log(self, event_type: str, **data) -> None:
+        if event_type == "project_context" and data.get("project_id") and not data.get("project_uuid"):
+            project_uuid = self._project_uuid(str(data["project_id"]))
+            if project_uuid:
+                data["project_uuid"] = project_uuid
         event = {"ts": datetime.now(timezone.utc).isoformat(), "type": event_type, **data}
         with self.path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(event, ensure_ascii=False) + "\n")
@@ -128,6 +144,7 @@ class Trace:
             t["cost_complete"] = t["cost_available_calls"] == t["calls"]
 
         summary = {
+            "run_id": self.run_id,
             "started_at": self.started_at,
             "finished_at": finished_at,
             "wall_time_s": wall_time_s,
