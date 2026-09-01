@@ -18,16 +18,24 @@ class GuardDecision:
 def _tool_is_successful_computation(tool_result: ToolResult | None) -> bool:
     if tool_result is None or not tool_result.ok:
         return False
+    metadata = dict(tool_result.metadata or {})
     if tool_result.tool == "code_experiment":
-        evidence = dict(tool_result.metadata or {}).get("evidence") or {}
+        evidence = metadata.get("evidence") or {}
         try:
             return int(evidence.get("successful_run_count", 0)) > 0
         except Exception:
             return False
     if tool_result.tool == "tropical_grid":
-        return str((tool_result.metadata or {}).get("status") or "").upper() == "GRID_PASS"
+        return (
+            str(metadata.get("status") or "").upper() == "GRID_PASS"
+            and metadata.get("provenance_structure_ok") is True
+        )
     if tool_result.tool == "z3":
-        return str((tool_result.metadata or {}).get("result") or "").lower() in {"sat", "unsat"}
+        try:
+            assertion_count = int(metadata.get("assertion_count", 0) or 0)
+        except Exception:
+            assertion_count = 0
+        return assertion_count > 0 and str(metadata.get("result") or "").lower() in {"sat", "unsat"}
     if tool_result.tool == "script":
         return True
     return False
@@ -39,33 +47,47 @@ def choose_status(
     tool_result: ToolResult | None,
     verifier: dict[str, Any],
     critic: dict[str, Any],
+    expected_item_id: str | None = None,
+    expected_iteration: int | None = None,
 ) -> GuardDecision:
     """Return the strongest status justified by machine-observable evidence."""
 
     requested = str(requested or "OPEN").upper()
     verifier_verdict = str(verifier.get("verdict") or "INCONCLUSIVE").upper()
     critic_verdict = str(critic.get("verdict") or "REVISE").upper()
+    tmeta = dict((tool_result.metadata if tool_result else None) or {})
+
     formal_verified = bool(
         tool_result
         and tool_result.ok
         and tool_result.tool == "lean"
-        and (tool_result.metadata or {}).get("formal_verified") is True
+        and tmeta.get("formal_verified") is True
+        and tmeta.get("source_clean") is True
+        and tmeta.get("axioms_verified") is True
+        and tmeta.get("formal_binding_verified") is True
+        and (expected_item_id is None or str(tmeta.get("item_id") or "") == str(expected_item_id))
+        and (expected_iteration is None or int(tmeta.get("iteration", -1)) == int(expected_iteration))
     )
     computation_ok = _tool_is_successful_computation(tool_result)
     deterministic_counterexample = bool(
         tool_result
         and tool_result.tool == "tropical_grid"
-        and str((tool_result.metadata or {}).get("status") or "").upper() == "COUNTEREXAMPLE"
+        and str(tmeta.get("status") or "").upper() == "COUNTEREXAMPLE"
     )
     verifier_counterexample = verifier_verdict == "FAIL" and bool(str(verifier.get("counterexample") or "").strip())
 
     metadata = {
         "formal_verified": formal_verified,
+        "formal_binding_verified": bool(tmeta.get("formal_binding_verified")),
+        "axioms_verified": bool(tmeta.get("axioms_verified")),
+        "source_clean": bool(tmeta.get("source_clean")),
         "computation_ok": computation_ok,
         "verifier_verdict": verifier_verdict,
         "critic_verdict": critic_verdict,
         "deterministic_counterexample": deterministic_counterexample,
         "verifier_counterexample": verifier_counterexample,
+        "expected_item_id": expected_item_id,
+        "expected_iteration": expected_iteration,
     }
 
     if deterministic_counterexample or verifier_counterexample:
@@ -76,14 +98,14 @@ def choose_status(
             return GuardDecision(
                 requested,
                 "PROVEN",
-                "Formal checker succeeded, verifier passed the candidate, and critic did not KILL it.",
+                "Bound Lean source passed the checker, source/axiom guards, verifier PASS, and critic did not KILL it.",
                 False,
                 metadata,
             )
         return GuardDecision(
             requested,
             "OPEN",
-            "PROVEN rejected: requires successful formal checker + verifier PASS + critic not KILL.",
+            "PROVEN rejected: requires same-item/same-iteration bound Lean evidence, clean source, verified axioms, verifier PASS, and critic not KILL.",
             True,
             metadata,
         )
@@ -95,8 +117,8 @@ def choose_status(
 
     if requested == "COMPUTATION_PASS":
         if computation_ok:
-            return GuardDecision(requested, "COMPUTATION_PASS", "Successful deterministic computation evidence exists.", False, metadata)
-        return GuardDecision(requested, "OPEN", "COMPUTATION_PASS rejected: no successful deterministic tool evidence.", True, metadata)
+            return GuardDecision(requested, "COMPUTATION_PASS", "Successful non-empty deterministic computation evidence exists.", False, metadata)
+        return GuardDecision(requested, "OPEN", "COMPUTATION_PASS rejected: no meaningful successful deterministic tool evidence.", True, metadata)
 
     if requested == "FAIL":
         if critic_verdict == "KILL" or verifier_verdict == "FAIL":
