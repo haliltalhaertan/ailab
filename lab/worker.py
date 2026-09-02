@@ -21,6 +21,7 @@ from lab.project_manager import ProjectManager
 from lab.research_state import ResearchState
 from lab.run_controller import ResearchStopped, RunController
 from lab.trace import Trace
+from lab.worker_runtime import WorkerRuntimeBridge
 
 
 AgentFactory = Callable[[str, dict[str, Any]], Agent]
@@ -142,12 +143,17 @@ def _run_orchestrator(
     request: dict[str, Any],
     trace: Trace,
     agent_factory: AgentFactory,
+    bridge: WorkerRuntimeBridge,
 ) -> str:
     prompt = str(request.get("prompt") or request.get("problem") or "")
     param = int(request.get("param", request.get("iterations", 0)) or 0)
     agents = _ordered_agents(request.get("agents"), agent_factory)
     optional = _optional_agents(request.get("optional_agents"), agent_factory)
-    orchestrator = Orchestrator(trace)
+    orchestrator = Orchestrator(
+        trace,
+        cancel_check=bridge.cancel_check,
+        on_stage=bridge.on_stage,
+    )
 
     if method == "research_loop":
         if len(agents) < 2:
@@ -205,6 +211,7 @@ def run_project(project_id: str, *, agent_factory: AgentFactory = _agent) -> int
 
     trace: Trace | None = None
     controller: RunController | None = None
+    bridge: WorkerRuntimeBridge | None = None
     result = ""
     exit_code = 0
     final_status: str | None = None
@@ -250,6 +257,8 @@ def run_project(project_id: str, *, agent_factory: AgentFactory = _agent) -> int
             # Share the already-held lock with the engine. ProjectRunLock is
             # re-entrant for this object, so nested engine contexts do not race.
             lab.controller.lock = lock
+            bridge = WorkerRuntimeBridge(lab.controller)
+            trace.set_stage_listener(bridge.on_stage)
             result = lab.run(
                 str(request.get("problem") or request.get("prompt") or ""),
                 manager=agents["ResearchManager"],
@@ -273,8 +282,9 @@ def run_project(project_id: str, *, agent_factory: AgentFactory = _agent) -> int
                 current_agent="",
                 last_error="",
             )
+            bridge = WorkerRuntimeBridge(controller, background_heartbeat=True)
             controller.check_stop()
-            result = _run_orchestrator(method, request, trace, agent_factory)
+            result = _run_orchestrator(method, request, trace, agent_factory, bridge)
             controller.set_runtime(
                 status="COMPLETED",
                 current_step="Tamamlandı",
@@ -286,8 +296,9 @@ def run_project(project_id: str, *, agent_factory: AgentFactory = _agent) -> int
         exit_code = 0
         result = f"Worker stopped: {exc}"
         final_status = "STOPPED"
-        if controller is not None:
-            controller.set_runtime(
+        active_controller = controller or (bridge.controller if bridge is not None else None)
+        if active_controller is not None:
+            active_controller.set_runtime(
                 status="STOPPED",
                 current_step="Durduruldu",
                 current_agent="",
@@ -306,6 +317,10 @@ def run_project(project_id: str, *, agent_factory: AgentFactory = _agent) -> int
         if trace is not None:
             trace.log("worker_error", error=repr(exc))
     finally:
+        if bridge is not None:
+            bridge.close()
+        if trace is not None:
+            trace.set_stage_listener(None)
         try:
             atomic_write_text(root / "worker_result.md", result)
         except Exception:
