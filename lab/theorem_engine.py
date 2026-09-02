@@ -19,6 +19,7 @@ from lab.prompts import checkpoint_prompt, critic_prompt, literature_prompt, man
 from lab.research_contract import ResearchContract
 from lab.research_protocol import (
     evaluate_manager_target_proposal,
+    ledger_records,
     pilot_evidence_by_target,
     pilot_prompt_block,
     selectable_target_ids,
@@ -704,6 +705,8 @@ class TheoremResearchLab:
             allow_discovery_without_pilot=overridden,
         )
         if not selectable:
+            if not contract.open_target_ids():
+                return grouped, [], overridden
             self.controller.set_research_phase("PILOT")
             raise ResearchPaused("Discovery için seçilebilir OPEN hedef yok.")
         return grouped, selectable, overridden
@@ -747,6 +750,18 @@ class TheoremResearchLab:
                 target_id=target_id,
                 evidence=evidence.as_dict(),
             )
+            transition = contract.evaluate_target_transition(target_id, ledger_records(self.state))
+            if transition is not None:
+                updated = contract.apply_target_transition(target_id, transition)
+                contract.save(self.state.root)
+                self.trace.log(
+                    "pilot_target_transition_applied",
+                    item_id=item.id,
+                    target_id=target_id,
+                    status=updated.status,
+                    closed_by=list(updated.closed_by),
+                    reason=transition.reason,
+                )
             return item
 
     def run(
@@ -871,6 +886,16 @@ class TheoremResearchLab:
         next_task = str(runtime.get("next_task") or "").strip() or "Problemi daralt; bilinen sınırları ihlal etmeyen, çürütülebilir tek bir lemma, construction veya lower-bound mekanizması öner."
         self._set_runtime(status="RUNNING", last_error="")
 
+        if contract is not None and not selectable_ids and not contract.open_target_ids():
+            self.trace.log(
+                "run_completed_all_targets_closed",
+                completed_iterations=completed,
+                requested_iterations=int(iterations),
+                source="pre_iteration_gate",
+            )
+            final_path = self.state.checkpoint("final", note="All frozen targets already resolved by machine evidence.")
+            return "# Teorem Araştırması Sonucu\n\nTüm frozen hedefler makine kanıtıyla zaten çözüldü.\n\nCheckpoint: `" + str(final_path) + "`"
+
         papers = self._search_literature(literature_query or problem)
         literature_context = paper_context(papers)
         if literature_agent is not None:
@@ -892,6 +917,14 @@ class TheoremResearchLab:
 
         outcomes: list[IterationOutcome] = []
         for iteration in range(completed + 1, int(iterations) + 1):
+            if contract is not None and not selectable_ids:
+                self.trace.log(
+                    "run_completed_all_targets_closed",
+                    completed_iterations=int(self._runtime().get("completed_iterations", 0) or 0),
+                    requested_iterations=int(iterations),
+                    source="iteration_gate",
+                )
+                break
             self._check_stop()
             self._set_runtime(current_iteration=iteration, current_step="iteration_start")
             snapshot = self._iteration_snapshot(iteration, next_task)
