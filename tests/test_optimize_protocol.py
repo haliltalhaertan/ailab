@@ -308,3 +308,28 @@ def test_run_finishes_cleanly_when_only_target_closes_before_iteration_budget(tm
     assert agents["proposer"].calls == 1
     runtime = json.loads((state.root / "runtime.json").read_text(encoding="utf-8"))
     assert runtime["completed_iterations"] == 1
+
+
+def test_full_scope_compute_pilot_closes_without_llm_manager(tmp_path: Path):
+    state = ResearchState(tmp_path / "state")
+    _contract(state.root, target_type="COMPUTE")
+    scripts = tmp_path / "research_tools"
+    exact_name = _write_candidate_script(
+        scripts,
+        name="pilot_exact.py",
+        kind="EXACT_PASS",
+        role="INDEPENDENT_CHECKER",
+    )
+    toolbox = ResearchToolbox(script_root=scripts, lean_root=state.root / "formal", problem_pack_root=None)
+    trace = Trace("pilot-auto-close", out_dir=tmp_path / "runs")
+    lab = TheoremResearchLab(trace, state, literature=EmptyLiterature(), toolbox=toolbox)
+
+    item = lab.run_pilot(target_id="T1", script_name=exact_name)
+    trace.close()
+
+    target = ResearchContract.load(state.root).target("T1")
+    assert target.status == "CLOSED"
+    assert target.closed_by
+    assert item.kind == "experiment"
+    assert item.metadata["pilot"] is True
+    assert item.metadata["evidence"]["resolution_scope"] == "TARGET_RESOLUTION"
