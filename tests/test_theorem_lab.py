@@ -1,9 +1,11 @@
+import hashlib
 from pathlib import Path
 
 from lab.client import LLMResponse
+from lab.integrity import sha256_file
 from lab.integrity_theorem_lab import TheoremResearchLab
 from lab.research_state import ResearchState
-from lab.tools import ResearchToolbox
+from lab.tools import ResearchToolbox, ToolResult
 from lab.trace import Trace
 
 
@@ -34,6 +36,86 @@ class FakeAgent:
 class EmptyLiterature:
     def search(self, query: str, limit: int = 8):
         return []
+
+
+class BoundFormalEvidenceLab(TheoremResearchLab):
+    """Inject machine-shaped formal evidence after proposal/item binding.
+
+    This test double deliberately bypasses Lean execution. The LeanTool itself has
+    separate checker tests; here we are testing that run() carries already-verified,
+    claim-bound evidence all the way through StatusGuard and ResearchState.
+    """
+
+    def __init__(self, *args, valid_axioms: bool = True, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.valid_axioms = valid_axioms
+
+    def _tool(self, request, step_key):
+        if str((request or {}).get("tool") or "").lower() != "lean_draft":
+            return super()._tool(request, step_key)
+        assert self._active_iteration is not None
+        assert self._active_item_id
+        candidate_dir = self.state.root / "formal" / "candidates"
+        candidate_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"iter-{self._active_iteration}-{self._active_item_id}.lean"
+        candidate = candidate_dir / filename
+        candidate.write_text("theorem bound : 1 = 1 := by rfl\n", encoding="utf-8")
+        item = self.state.get(self._active_item_id)
+        metadata = {
+            "formal_verified": True,
+            "formal_binding_verified": True,
+            "axioms_verified": self.valid_axioms,
+            "source_clean": True,
+            "claim_hash": self._active_claim_hash,
+            "claim_sha256": hashlib.sha256(item.claim.encode("utf-8")).hexdigest(),
+            "item_id": self._active_item_id,
+            "iteration": self._active_iteration,
+            "file": filename,
+            "lean_file": filename,
+            "lean_sha256": sha256_file(candidate),
+            "theorem_name": "bound",
+            "theorem_type": "1 = 1",
+            "axioms": [],
+        }
+        return ToolResult(True, "lean", output="verified", metadata=metadata)
+
+
+def _formal_proposal() -> str:
+    return (
+        '{"title":"Bound","claim":"1 = 1","strategy":"formal",'
+        '"evidence_needed":["Lean"],"tool_request":{"tool":"lean_draft",'
+        '"theorem_name":"bound","theorem_type":"1 = 1",'
+        '"source":"theorem bound : 1 = 1 := by rfl"}}'
+    )
+
+
+def _run_formal_case(tmp_path: Path, *, valid_axioms: bool):
+    state = ResearchState(tmp_path / "state")
+    trace = Trace("formal-run-gate", out_dir=tmp_path / "runs")
+    lab = BoundFormalEvidenceLab(
+        trace,
+        state,
+        literature=EmptyLiterature(),
+        valid_axioms=valid_axioms,
+    )
+    report = lab.run(
+        "P",
+        manager=FakeAgent(
+            "manager",
+            ['{"decision":"KEEP","status":"PROVEN","reason":"formal evidence","next_task":"next"}'],
+        ),
+        proposer=FakeAgent("proposer", [_formal_proposal()]),
+        critic=FakeAgent("critic", ['{"verdict":"KEEP","reason":"no objection","counterexample":""}']),
+        verifier=FakeAgent(
+            "verifier",
+            ['{"verdict":"PASS","reason":"bound formal evidence","formal_proof_required":false,"counterexample":""}'],
+        ),
+        auditor=FakeAgent("auditor", ["PASS"]),
+        iterations=1,
+        checkpoint_every=0,
+    )
+    trace.close()
+    return state, trace, report
 
 
 def test_theorem_lab_persists_candidate_and_audit(tmp_path: Path):
@@ -100,3 +182,27 @@ def test_tropical_counterexample_automatically_kills_candidate(tmp_path: Path):
     counterexamples = state.list_items(kind="counterexample")
     assert len(counterexamples) == 1
     assert counterexamples[0].metadata["payload"]["status"] == "COUNTEREXAMPLE"
+
+
+def test_run_promotes_only_fully_bound_formal_evidence_to_proven(tmp_path: Path):
+    state, trace, report = _run_formal_case(tmp_path, valid_axioms=True)
+    candidate = state.list_items(kind="conjecture")[0]
+    assert candidate.status == "PROVEN"
+    assert candidate.metadata["formal_verified"] is True
+    assert candidate.metadata["formal_binding_verified"] is True
+    assert candidate.metadata["axioms_verified"] is True
+    assert candidate.metadata["source_clean"] is True
+    assert candidate.metadata["proof_seal"]
+    assert "Teorem Araştırması Sonucu" in report
+    trace_text = trace.path.read_text(encoding="utf-8")
+    assert '"new_status": "PROVEN"' in trace_text
+
+
+def test_run_downgrades_proven_when_formal_evidence_is_incomplete(tmp_path: Path):
+    state, trace, _ = _run_formal_case(tmp_path, valid_axioms=False)
+    candidate = state.list_items(kind="conjecture")[0]
+    assert candidate.status == "OPEN"
+    trace_text = trace.path.read_text(encoding="utf-8")
+    assert '"type": "status_downgraded_by_guard"' in trace_text
+    assert '"requested": "PROVEN"' in trace_text
+    assert '"granted": "OPEN"' in trace_text
