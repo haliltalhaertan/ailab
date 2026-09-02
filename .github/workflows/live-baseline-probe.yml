@@ -3,6 +3,8 @@ name: live-baseline-probe
 on:
   push:
     branches: ["baseline-live-probe"]
+  pull_request:
+    branches: ["main"]
   workflow_dispatch:
 
 jobs:
