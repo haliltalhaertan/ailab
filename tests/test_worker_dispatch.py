@@ -16,6 +16,7 @@ class FakeAgent:
     def __init__(self, name: str, raw: dict):
         self.name = str(raw.get("display_role") or raw.get("name") or name)
         self.model = str(raw.get("model") or "fake/model")
+        self.system_prompt = str(raw.get("system_prompt") or raw.get("prompt") or "")
         self.temperature = float(raw.get("temperature", raw.get("temp", 0.2)))
         self.reasoning_effort = raw.get("reasoning_effort")
         self.calls = 0
