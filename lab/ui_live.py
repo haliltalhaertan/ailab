@@ -194,6 +194,7 @@ def render_now_and_timeline(
     age = heartbeat_age_seconds(runtime)
     if status == "STALE_RUNNING":
         st.error("Worker stale görünüyor. Research Control üzerinden stale run temizliği yap.")
+        st.page_link("pages/3_Research_Control.py", label="Research Control")
     elif status == "RUNNING" and age is not None and age > 120:
         st.warning(f"Worker {int(age)} saniyedir heartbeat vermedi; worker sessiz olabilir.")
 
