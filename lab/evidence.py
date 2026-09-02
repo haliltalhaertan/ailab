@@ -184,6 +184,19 @@ def _classify(result: "ToolResult") -> tuple[str, bool, dict[str, Any] | None, d
         if declared not in EVIDENCE_KINDS or declared not in allowed:
             metadata["downgraded_from"] = declared
             return "INCONCLUSIVE", False, None, metadata
+
+        if "candidate" in payload:
+            actual_candidate_sha = candidate_sha256(payload["candidate"])
+            metadata["candidate_sha256"] = actual_candidate_sha
+            declared_candidate_sha = str(payload.get("candidate_sha256") or "").strip().lower()
+            if declared_candidate_sha:
+                metadata["candidate_sha256_declared"] = declared_candidate_sha
+                if declared_candidate_sha != actual_candidate_sha:
+                    metadata["candidate_sha256_actual"] = actual_candidate_sha
+                    metadata["downgraded_from"] = declared
+                    metadata["evidence_downgrade_reason"] = "candidate_sha256 mismatch"
+                    return "INCONCLUSIVE", False, None, metadata
+
         exhaustive = bool(payload.get("exhaustive", False))
         witness = payload.get("witness") if isinstance(payload.get("witness"), dict) else None
         if declared.startswith("EXHAUSTIVE_") and not exhaustive:
