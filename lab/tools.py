@@ -90,14 +90,21 @@ class Z3Tool:
     def __init__(self, timeout_ms: int = 30_000):
         self.timeout_ms = max(100, int(timeout_ms))
 
+    def _no_assertions(self) -> ToolResult:
+        return ToolResult(
+            False,
+            "z3",
+            error="no assertions",
+            metadata={
+                "result": "inconclusive",
+                "timeout_ms": self.timeout_ms,
+                "assertion_count": 0,
+            },
+        )
+
     def check(self, smt2: str) -> ToolResult:
         if not str(smt2 or "").strip():
-            return ToolResult(
-                False,
-                "z3",
-                error="Boş SMT-LIB sorgusu computation evidence değildir.",
-                metadata={"timeout_ms": self.timeout_ms, "assertion_count": 0},
-            )
+            return self._no_assertions()
         try:
             import z3
         except ImportError:
@@ -108,12 +115,7 @@ class Z3Tool:
             solver.add(z3.parse_smt2_string(smt2))
             assertion_count = len(solver.assertions())
             if assertion_count <= 0:
-                return ToolResult(
-                    False,
-                    "z3",
-                    error="SMT-LIB sorgusunda hiçbir assertion yok; vacuous sat evidence kabul edilmedi.",
-                    metadata={"timeout_ms": self.timeout_ms, "assertion_count": 0},
-                )
+                return self._no_assertions()
             result = solver.check()
             model = str(solver.model()) if result == z3.sat else ""
             return ToolResult(
@@ -132,7 +134,11 @@ class Z3Tool:
                 False,
                 "z3",
                 error=str(exc),
-                metadata={"timeout_ms": self.timeout_ms, "assertion_count": 0},
+                metadata={
+                    "result": "inconclusive",
+                    "timeout_ms": self.timeout_ms,
+                    "assertion_count": 0,
+                },
             )
 
 
@@ -229,8 +235,6 @@ class LeanTool:
             binding_hash = str(claim_hash or claim_sha256).strip().lower()
             if not item_id or iteration is None or not re.fullmatch(r"[0-9a-f]{64}", binding_hash):
                 raise ValueError("Formal candidate item_id/iteration/claim hash binding olmadan yazılamaz.")
-            # Never trust a model-provided marker. Remove any existing marker and
-            # write the engine-supplied binding as the first line.
             text = self.CLAIM_MARKER.sub("", text).lstrip("\n")
             bound_text = f"-- ailab-claim: {binding_hash}\n{text}"
             target = self._candidate(name)
