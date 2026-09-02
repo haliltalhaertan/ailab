@@ -17,19 +17,28 @@ PILOT_SOURCE_ORIGINS = {"BUILTIN", "CHECKED_IN"}
 
 
 def ledger_records(state: ResearchState) -> list[dict[str, Any]]:
-    """Return the machine-authored subset needed for target transition gates."""
+    """Return machine-authored records used by target transition gates.
+
+    Conjectures retain their code-assigned ``claim_role``. Deterministic pilot
+    experiments are included without fabricating one; the contract evaluator
+    may treat full-scope experiment evidence as target-resolution evidence for
+    COMPUTE/OPTIMIZE targets.
+    """
 
     records: list[dict[str, Any]] = []
-    for item in state.list_items(kind="conjecture"):
-        raw_evidence = item.metadata.get("evidence")
-        records.append(
-            {
-                "item_id": item.id,
-                "claim_role": str(item.metadata.get("claim_role") or ""),
-                "status": item.status,
-                "evidence": dict(raw_evidence) if isinstance(raw_evidence, dict) else None,
-            }
-        )
+    for kind in ("conjecture", "experiment"):
+        for item in state.list_items(kind=kind):
+            raw_evidence = item.metadata.get("evidence")
+            records.append(
+                {
+                    "item_id": item.id,
+                    "record_kind": kind,
+                    "claim_role": str(item.metadata.get("claim_role") or ""),
+                    "status": item.status,
+                    "pilot": bool(item.metadata.get("pilot")),
+                    "evidence": dict(raw_evidence) if isinstance(raw_evidence, dict) else None,
+                }
+            )
     return records
 
 
