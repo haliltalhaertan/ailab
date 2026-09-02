@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 
 from lab import TheoremResearchLab
 from lab.agent import Agent
+from lab.literature import LiteratureClient
 from lab.prompts import ROLE_LIBRARY
 from lab.research_state import ResearchState
 from lab.trace import Trace
@@ -44,7 +45,7 @@ EVENT_COUNTERS = (
 )
 
 
-class _InconclusiveLiterature:
+class _InconclusiveLiterature(LiteratureClient):
     """Deterministic stub so the probe measures the LLM pipeline, not literature-service uptime."""
 
     def search(self, query: str, limit: int = 8) -> list[Any]:
