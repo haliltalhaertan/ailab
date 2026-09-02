@@ -141,3 +141,20 @@ def test_generated_code_popen_is_confined_to_code_experiment():
         "subprocess.Popen outside code_experiment must be a pinned worker launch, never generated code: "
         + ", ".join(offenders)
     )
+
+
+def test_streamlit_entrypoints_do_not_import_orchestrator():
+    entrypoints = [REPO_ROOT / "app.py", *sorted((REPO_ROOT / "pages").glob("*.py"))]
+    offenders: list[str] = []
+    for path in entrypoints:
+        tree = _tree(path)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                if any(alias.name == "lab.orchestrator" for alias in node.names):
+                    offenders.append(str(path.relative_to(REPO_ROOT)))
+            elif isinstance(node, ast.ImportFrom):
+                if node.module == "lab.orchestrator":
+                    offenders.append(str(path.relative_to(REPO_ROOT)))
+                if node.module == "lab" and any(alias.name == "Orchestrator" for alias in node.names):
+                    offenders.append(str(path.relative_to(REPO_ROOT)))
+    assert offenders == [], "Streamlit entrypoints must launch workers instead of Orchestrator: " + ", ".join(offenders)
