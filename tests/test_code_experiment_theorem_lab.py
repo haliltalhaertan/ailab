@@ -1,7 +1,7 @@
 from lab.client import LLMResponse
 from lab.code_experiment import CODE_EXPERIMENT_SYSTEM_PROMPT
-from lab.integrity_theorem_lab import TheoremResearchLab
 from lab.research_state import ResearchState
+from lab.theorem_engine import TheoremResearchLab
 from lab.trace import Trace
 
 

@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
+from lab import baseline_probe
+from lab.agent import Agent
 from lab.baseline_probe import _markdown_report, summarize_probe
+from lab.client import LLMResponse
 
 
 def test_summarize_probe_counts_run_level_events(tmp_path: Path) -> None:
@@ -127,3 +131,104 @@ def test_markdown_report_exposes_acceptance_metrics() -> None:
     assert "guard downgrades: **1**" in text
     assert "iteration 1: `OPEN` / `REVISE`" in text
     assert "`iter:1:tool`: `z3`" in text
+
+
+class _FakeClient:
+    def __init__(self, outputs: list[str]):
+        self.outputs = list(outputs)
+
+    def complete(
+        self,
+        messages: list[dict],
+        *,
+        model: str | None = None,
+        temperature: float = 0.7,
+        max_tokens: int | None = None,
+        stream_callback: Any = None,
+        reasoning_effort: str | None = None,
+    ) -> LLMResponse:
+        del messages, temperature, max_tokens, reasoning_effort
+        if not self.outputs:
+            raise AssertionError("fake client output queue exhausted")
+        content = self.outputs.pop(0)
+        if stream_callback is not None:
+            stream_callback("content", content)
+        return LLMResponse(
+            content=content,
+            model=model or "fake/model",
+            prompt_tokens=1,
+            completion_tokens=1,
+            latency_s=0.0,
+            cost_usd=0.0,
+        )
+
+
+def test_run_probe_exercises_real_engine_with_fake_agents(tmp_path: Path, monkeypatch: Any) -> None:
+    outputs = {
+        "ResearchManager": [
+            json.dumps(
+                {
+                    "decision": "REVISE",
+                    "status": "OPEN",
+                    "reason": "baseline regression test",
+                    "next_task": "done",
+                }
+            )
+        ],
+        "Theorist": [
+            json.dumps(
+                {
+                    "title": "Toy parity claim",
+                    "claim": "For 0 <= n <= 20, n*(n+1) is even.",
+                    "tool_request": {"tool": "none"},
+                }
+            )
+        ],
+        "AdversarialCritic": [
+            json.dumps({"verdict": "OPEN", "counterexample": "", "reason": "no counterexample supplied"})
+        ],
+        "VerificationEngineer": [
+            json.dumps({"status": "OPEN", "counterexample": "", "reason": "no deterministic evidence requested"})
+        ],
+        "LiteratureScout": ["No literature lookup in fake baseline."],
+        "IndependentAuditor": ["Fake final audit completed."],
+    }
+
+    def fake_agent(role: str, model: str, max_tokens: int, reasoning_effort: str | None) -> Agent:
+        return Agent(
+            name=role,
+            system_prompt=f"fake {role}",
+            model=model,
+            temperature=0.0,
+            max_tokens=max_tokens,
+            reasoning_effort=reasoning_effort,
+            client=_FakeClient(outputs[role]),  # type: ignore[arg-type]
+        )
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-only-key")
+    monkeypatch.setattr(baseline_probe, "_git_sha", lambda: "test-sha")
+    monkeypatch.setattr(baseline_probe, "_agent", fake_agent)
+
+    report_path = baseline_probe.run_probe(
+        model="fake/model",
+        iterations=1,
+        max_tokens=128,
+        reasoning_effort="low",
+        out_dir=tmp_path / "baseline_runs",
+        problem="Toy baseline regression problem",
+    )
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+
+    assert report["run_error"] == ""
+    assert report["git_sha"] == "test-sha"
+    assert report["iterations"] == [
+        {
+            "iteration": 1,
+            "item_id": report["iterations"][0]["item_id"],
+            "decision": "REVISE",
+            "status": "OPEN",
+            "next_task": "done",
+        }
+    ]
+    assert report["total_calls"] == 6
+    assert report["event_counts"]["structured_output_repair_failed"] == 0
