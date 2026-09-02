@@ -11,7 +11,8 @@ from dotenv import load_dotenv
 from lab.openrouter_catalog import fetch_openrouter_models
 from lab.project_manager import ProjectInfo, ProjectManager
 from lab.prompts import ROLE_LIBRARY as THEOREM_ROLE_LIBRARY
-from lab.reasoning_settings import get_reasoning_effort
+from lab.reasoning_settings import API_TO_UI, UI_LEVELS, UI_TO_API, get_reasoning_effort
+from lab.ui_live import live_stage_snapshot, render_now_and_timeline
 from lab.ui_model import (
     cost_text,
     event_summary,
@@ -264,6 +265,17 @@ def build_sidebar(exp_name: str, model_ids: list[str], model_labels: dict[str, s
                 0.05,
                 key=f"t_{key}",
             )
+            default_effort = get_reasoning_effort(display_role)
+            default_effort_label = API_TO_UI.get(default_effort, "Provider default")
+            effort_label = st.selectbox(
+                "Reasoning effort",
+                UI_LEVELS,
+                index=UI_LEVELS.index(default_effort_label),
+                key=f"effort_{key}",
+            )
+            reasoning_effort = UI_TO_API[effort_label]
+            if reasoning_effort == "xhigh":
+                st.info("xhigh reasoning tek çağrıda 5–10 dakika sürebilir; canlı panelde ilerlemeyi göreceksin.")
             st.caption(f"Kullanılacak model: `{model}`")
         cfg = {
             "role": role,
@@ -271,6 +283,7 @@ def build_sidebar(exp_name: str, model_ids: list[str], model_labels: dict[str, s
             "prompt": sys_prompt,
             "model": model,
             "temp": temp,
+            "reasoning_effort": reasoning_effort,
         }
         if is_optional:
             optional[display_role] = cfg
@@ -286,7 +299,16 @@ def _event_time(event: dict) -> str:
 
 def render_timeline_event(target, event: dict) -> None:
     kind = str(event.get("type", "event"))
-    if kind in {"agent_stream", "runtime_state", "agent_start", "llm_call", "agent_error", "agent_retry"}:
+    if kind in {
+        "agent_stream",
+        "runtime_state",
+        "agent_start",
+        "llm_call",
+        "agent_error",
+        "agent_retry",
+        "stage",
+        "stage_end",
+    }:
         return
     stamp = f"`{_event_time(event)}` " if _event_time(event) else ""
     if kind == "iteration_start":
@@ -427,7 +449,7 @@ class LiveTimelineRenderer:
             reasoning_tokens = int(event.get("reasoning_tokens", 0) or 0)
             if not state["reasoning"] and reasoning_tokens:
                 state["rslot"].caption(
-                    f"Model {reasoning_tokens:,} reasoning token kullandı fakat provider reasoning metnini göstermedi."
+                    f"Sağlayıcı reasoning metnini göstermedi ({reasoning_tokens:,} token)."
                 )
             cost = event.get("cost_usd")
             cost_label = f"${float(cost):.6f}" if cost is not None else "ücret N/A"
@@ -488,41 +510,79 @@ def _read_json(path: Path, default):
         return default
 
 
-@st.fragment(run_every=1.0)
-def render_live_theorem(active: ProjectInfo) -> None:
-    """Live worker view. Section 3 generalizes the presentation for every method."""
+def _live_card_groups(events: list[dict], current_step: str) -> tuple[list[str], dict[str, list[dict]]]:
+    groups: dict[str, list[dict]] = {}
+    order: list[str] = []
+    latest_by_agent: dict[str, str] = {}
+    allowed = {"agent_start", "agent_stream", "llm_call", "agent_error"}
+    for event in events:
+        if event.get("type") not in allowed:
+            continue
+        copy = dict(event)
+        agent = str(copy.get("agent") or "Agent")
+        step_key = str(copy.get("step_key") or "")
+        if step_key:
+            latest_by_agent[agent] = step_key
+        else:
+            step_key = latest_by_agent.get(agent, "")
+            if step_key:
+                copy["step_key"] = step_key
+        if not step_key:
+            continue
+        if step_key not in groups:
+            groups[step_key] = []
+            order.append(step_key)
+        groups[step_key].append(copy)
+    ordered = list(reversed(order))
+    if current_step in ordered:
+        ordered.remove(current_step)
+        ordered.insert(0, current_step)
+    return ordered, groups
 
+
+@st.fragment(run_every=1.0)
+def render_live_run(active: ProjectInfo) -> None:
     project_root = PROJECTS.project_root(active.project_id)
     runtime = _read_json(project_root / "runtime.json", {})
     worker = _read_json(project_root / "worker.json", {})
+    request = _read_json(project_root / "worker_request.json", {})
     status = str(runtime.get("status") or worker.get("status") or active.status or "READY")
+    experiment_name = str(request.get("experiment_name") or active.experiment or "Deney")
 
-    st.subheader("Canlı Araştırma Akışı")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Durum", status)
-    c2.metric("Tur", runtime.get("current_iteration", 0))
-    c3.metric("Tamamlanan", runtime.get("completed_iterations", 0))
-    c4.metric("Aktif adım", str(runtime.get("current_step") or "-")[:32])
-    if runtime.get("next_task"):
-        st.caption(f"Sonraki hedef: {runtime['next_task']}")
+    st.subheader(f"{experiment_name} · {active.project_id}")
     if runtime.get("last_error"):
         st.error(str(runtime["last_error"]))
 
     run_dirs = runs_for_project(RUNS_DIR, active.project_id, active.project_uuid)
-    if not run_dirs:
-        if status == "RUNNING":
-            st.info("Worker başladı. İlk trace event'i bekleniyor…")
-        return
+    events: list[dict] = []
+    latest: Path | None = None
+    if run_dirs:
+        latest = run_dirs[0]
+        events = load_live_run_events(latest)
+    elif status == "RUNNING":
+        st.info("Worker başladı. İlk trace event'i bekleniyor…")
 
-    latest = run_dirs[0]
-    st.caption(f"Run: `{latest.name}` · canlı görünüm stream logunun son 2 MB bölümünü kullanır; tam kayıt Proje Geçmişi'nde durur.")
-    events = load_live_run_events(latest)
-    renderer = LiveTimelineRenderer(st.container(border=True))
-    for event in events:
-        renderer.handle(event)
+    snapshot = render_now_and_timeline(runtime, events, status=status)
+
+    if events:
+        st.markdown("#### Agent kartları")
+        order, groups = _live_card_groups(events, str(snapshot.get("step_key") or ""))
+        renderer = LiveTimelineRenderer(st.container(border=True))
+        for step_key in order:
+            for event in groups[step_key]:
+                renderer.handle(event)
+
+    c1, c2 = st.columns(2)
+    if c1.button("DURDUR", type="primary", use_container_width=True, disabled=status != "RUNNING", key="live_stop"):
+        (project_root / "stop.flag").write_text("stop requested\n", encoding="utf-8")
+        st.warning("Durdurma isteği worker'a iletildi.")
+    if c2.button("Research Control", use_container_width=True, key="live_control"):
+        st.switch_page("pages/3_Research_Control.py")
 
     result_path = project_root / "worker_result.md"
-    if result_path.exists() and status in {"COMPLETED", "STOPPED", "PAUSED_ERROR"}:
+    if result_path.exists() and status in {"COMPLETED", "STOPPED", "PAUSED_ERROR", "INTERRUPTED"}:
+        if latest is not None and (latest / "summary.json").exists():
+            summary_metrics(_read_json(latest / "summary.json", {}))
         with st.expander("Sonuç", expanded=status == "COMPLETED"):
             st.markdown(result_path.read_text(encoding="utf-8"))
 
@@ -536,7 +596,7 @@ def _worker_agent_payload(cfg: dict) -> dict:
         "model": str(cfg.get("model") or ""),
         "temperature": float(cfg.get("temp", 0.2)),
         "max_tokens": None,
-        "reasoning_effort": get_reasoning_effort(role),
+        "reasoning_effort": cfg.get("reasoning_effort"),
     }
 
 
@@ -581,7 +641,7 @@ def active_project_header(active: ProjectInfo) -> None:
         )
         if c2.button("Projeyi Değiştir", use_container_width=True):
             st.switch_page("pages/1_Projeler.py")
-        if active.status in {"RUNNING", "PAUSED_ERROR", "STOPPED", "PAUSED"}:
+        if active.status in {"RUNNING", "PAUSED_ERROR", "STOPPED", "PAUSED", "STALE_RUNNING"}:
             if st.button("Araştırma Kontrolü", type="primary"):
                 st.switch_page("pages/3_Research_Control.py")
 
@@ -648,7 +708,7 @@ def main() -> None:
 
         show_live = active.status == "RUNNING" or st.session_state.get("live_run_project") == active.project_id
         if show_live:
-            render_live_theorem(active)
+            render_live_run(active)
 
     with tab_hist:
         render_history(active)
