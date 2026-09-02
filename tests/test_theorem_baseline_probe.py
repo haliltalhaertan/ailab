@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from experiments.theorem_baseline_probe import _markdown_report, summarize_probe
+from lab.baseline_probe import _markdown_report, summarize_probe
 
 
 def test_summarize_probe_counts_run_level_events(tmp_path: Path) -> None:
