@@ -19,13 +19,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Patch contract binding into ResearchState
+      - name: Patch contract binding into production run path
         run: |
           python - <<'PY'
           from pathlib import Path
 
-          path = Path("lab/research_state.py")
-          text = path.read_text(encoding="utf-8")
+          state_path = Path("lab/research_state.py")
+          text = state_path.read_text(encoding="utf-8")
           import_old = "from lab.integrity import EvidenceSigner, atomic_write_json, read_json_tolerant, sha256_file\n"
           import_new = import_old + "from lab.research_contract import ResearchContract\n"
           if "from lab.research_contract import ResearchContract" not in text:
@@ -44,19 +44,28 @@ jobs:
           if old_checkpoint not in text:
               raise SystemExit("checkpoint anchor not found")
           text = text.replace(old_checkpoint, new_checkpoint, 1)
-          path.write_text(text, encoding="utf-8")
+          state_path.write_text(text, encoding="utf-8")
+
+          engine_path = Path("lab/theorem_engine.py")
+          engine = engine_path.read_text(encoding="utf-8")
+          old_engine = '''        self.state.freeze_problem(problem)\n        self.trace.log("problem_frozen", problem=problem)\n'''
+          new_engine = '''        try:\n            self.state.freeze_problem(problem)\n        except ValueError as exc:\n            raise ResearchPaused(f"Research contract integrity error: {exc}") from exc\n        self.trace.log("problem_frozen", problem=problem)\n'''
+          if old_engine not in engine:
+              raise SystemExit("theorem_engine freeze anchor not found")
+          engine = engine.replace(old_engine, new_engine, 1)
+          engine_path.write_text(engine, encoding="utf-8")
           PY
       - name: Run contract tests
         run: |
           python -m pip install -e ".[dev]"
           pytest -q tests/test_research_contract.py tests/test_proven_end_to_end.py
-          ruff check lab/research_contract.py lab/research_state.py tests/test_research_contract.py
-          mypy lab/research_contract.py lab/research_state.py
+          ruff check lab/research_contract.py lab/research_state.py lab/theorem_engine.py tests/test_research_contract.py
+          mypy lab/research_contract.py lab/research_state.py lab/theorem_engine.py
       - name: Commit patch
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add lab/research_state.py
+          git add lab/research_state.py lab/theorem_engine.py
           git diff --cached --quiet && exit 0
           git commit -m "feat(contract): bind frozen contract to run state"
           git push origin HEAD:feat/evidence-driven-core
