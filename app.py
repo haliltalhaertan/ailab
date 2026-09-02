@@ -8,7 +8,6 @@ import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
-from lab import Agent, Orchestrator, Trace
 from lab.openrouter_catalog import fetch_openrouter_models
 from lab.project_manager import ProjectInfo, ProjectManager
 from lab.prompts import ROLE_LIBRARY as THEOREM_ROLE_LIBRARY
@@ -23,7 +22,7 @@ from lab.ui_model import (
     tool_status,
     usage_rows,
 )
-from lab.worker_launcher import build_request_from_ui, launch_theorem_worker, write_worker_request
+from lab.worker_launcher import build_request_from_ui, launch_worker, write_worker_request
 
 load_dotenv()
 RUNS_DIR = Path("runs")
@@ -280,15 +279,6 @@ def build_sidebar(exp_name: str, model_ids: list[str], model_labels: dict[str, s
     return prompt, param, agents, optional, extras
 
 
-def _agent(cfg: dict) -> Agent:
-    return Agent(
-        name=cfg["display_role"],
-        system_prompt=cfg["prompt"],
-        model=cfg["model"],
-        temperature=cfg["temp"],
-    )
-
-
 def _event_time(event: dict) -> str:
     raw = str(event.get("ts") or "")
     return raw.split("T", 1)[1][:8] if "T" in raw else ""
@@ -500,7 +490,7 @@ def _read_json(path: Path, default):
 
 @st.fragment(run_every=1.0)
 def render_live_theorem(active: ProjectInfo) -> None:
-    """Keep the old live agent-card UX while the theorem engine runs in a safe worker."""
+    """Live worker view. Section 3 generalizes the presentation for every method."""
 
     project_root = PROJECTS.project_root(active.project_id)
     runtime = _read_json(project_root / "runtime.json", {})
@@ -537,79 +527,49 @@ def render_live_theorem(active: ProjectInfo) -> None:
             st.markdown(result_path.read_text(encoding="utf-8"))
 
 
-def execute_inline(
+def _worker_agent_payload(cfg: dict) -> dict:
+    role = str(cfg["role"])
+    return {
+        "role": role,
+        "display_role": str(cfg.get("display_role") or role),
+        "system_prompt": str(cfg.get("prompt") or ""),
+        "model": str(cfg.get("model") or ""),
+        "temperature": float(cfg.get("temp", 0.2)),
+        "max_tokens": None,
+        "reasoning_effort": get_reasoning_effort(role),
+    }
+
+
+def launch_experiment(
     exp_name: str,
     prompt: str,
     param,
     agents: list[dict],
     optional: dict[str, dict],
     extras: dict,
-) -> dict | None:
+) -> int:
     exp = EXPERIMENTS[exp_name]
     project_id = extras["project_id"]
-    PROJECTS.touch(project_id, experiment=exp_name, status="RUNNING")
-    trace = Trace(exp["slug"])
-    info = PROJECTS.get(project_id)
-    trace.log(
-        "project_context",
-        project_id=project_id,
-        project_uuid=info.project_uuid,
-        title=info.title,
-        experiment=exp_name,
-    )
-    try:
-        a_objs = [_agent(c) for c in agents]
-        o_objs = {r: _agent(c) for r, c in optional.items()}
-        orch = Orchestrator(trace)
-        method = exp["method"]
-        if method == "research_loop":
-            result = orch.research_loop(
-                prompt,
-                a_objs[0],
-                a_objs[1],
-                iterations=int(param),
-                synthesizer=o_objs.get("Raporcu"),
-            )
-        elif method == "debate":
-            result = orch.debate(prompt, a_objs[:2], rounds=int(param), judge=o_objs.get("Hakem"))
-        elif method == "pipeline":
-            result = orch.pipeline(prompt, a_objs)
-        else:
-            result = orch.panel(prompt, a_objs, synthesizer=o_objs.get("Sentezleyici"))
-        PROJECTS.touch(project_id, status="COMPLETED")
-        return {"result": result, "run_dir": str(trace.run_dir), "project_id": project_id, "exp": exp_name}
-    except Exception:
-        PROJECTS.touch(project_id, status="PAUSED_ERROR")
-        raise
-    finally:
-        trace.close()
-
-
-def launch_theorem(prompt: str, param: int, agents: list[dict], extras: dict) -> int:
-    project_id = extras["project_id"]
-    role_configs: dict[str, dict] = {}
-    for cfg in agents:
-        role = str(cfg["role"])
-        role_configs[role] = {
-            "name": role,
-            "system_prompt": cfg["prompt"],
-            "model": cfg["model"],
-            "temperature": cfg["temp"],
-            "max_tokens": None,
-            "reasoning_effort": get_reasoning_effort(role),
-        }
+    method = str(exp["method"])
+    agent_payload = [_worker_agent_payload(cfg) for cfg in agents]
+    optional_payload = {name: _worker_agent_payload(cfg) for name, cfg in optional.items()}
     request = build_request_from_ui(
         project_id=project_id,
+        experiment_method=method,
+        experiment_name=exp_name,
+        agents=agent_payload,
+        optional_agents=optional_payload,
+        prompt=prompt,
+        param=int(param or 0),
         problem=prompt,
-        iterations=int(param),
+        iterations=int(param or 0),
         literature_query=extras.get("literature_query") or None,
         checkpoint_every=int(extras.get("checkpoint_every", 2)),
-        agents=role_configs,
     )
     root = PROJECTS.project_root(project_id)
     write_worker_request(root, request)
-    PROJECTS.touch(project_id, experiment="Teorem Araştırması", status="RUNNING")
-    return launch_theorem_worker(project_id)
+    PROJECTS.touch(project_id, experiment=exp_name)
+    return launch_worker(project_id)
 
 
 def active_project_header(active: ProjectInfo) -> None:
@@ -662,13 +622,12 @@ def main() -> None:
 
     tab_run, tab_hist = st.tabs(["Deney", "Proje Geçmişi"])
     with tab_run:
-        if exp_name == "Teorem Araştırması":
-            st.info(
-                "Teorem araştırması güvenli worker process'te çalışır; fakat canlı reasoning/cevap kartları yine burada görünür. "
-                "İstersen sayfayı kapatıp sonra geri dönebilirsin."
-            )
-        running = exp_name == "Teorem Araştırması" and active.status == "RUNNING"
-        button_label = "Araştırma Çalışıyor" if running else "Deneyi Çalıştır"
+        st.info(
+            "Tüm deney türleri ayrı worker process'te çalışır. Canlı akışı burada izleyebilir, "
+            "sayfayı kapatıp daha sonra geri dönebilirsin."
+        )
+        running = active.status == "RUNNING"
+        button_label = "Deney çalışıyor…" if running else "Deneyi Çalıştır"
         if st.button(
             button_label,
             type="primary",
@@ -677,30 +636,17 @@ def main() -> None:
         ):
             if not prompt.strip():
                 st.warning("Lütfen bir problem/konu gir.")
-            elif exp_name == "Teorem Araştırması":
-                try:
-                    pid = launch_theorem(prompt, int(param), agents, extras)
-                    st.session_state["worker_pid"] = pid
-                    st.session_state["live_theorem_project"] = active.project_id
-                    st.success(f"Araştırma worker'ı başlatıldı · PID {pid}")
-                    st.rerun()
-                except Exception as exc:
-                    PROJECTS.touch(active.project_id, status="PAUSED_ERROR")
-                    st.exception(exc)
             else:
                 try:
-                    data = execute_inline(exp_name, prompt, param, agents, optional, extras)
+                    pid = launch_experiment(exp_name, prompt, param, agents, optional, extras)
+                    st.session_state["worker_pid"] = pid
+                    st.session_state["live_run_project"] = active.project_id
+                    st.success(f"Deney worker'ı başlatıldı · PID {pid}")
+                    st.rerun()
                 except Exception as exc:
                     st.exception(exc)
-                else:
-                    if data:
-                        st.success("Deney tamamlandı.")
-                        st.markdown(data["result"])
 
-        show_live = exp_name == "Teorem Araştırması" and (
-            active.status == "RUNNING"
-            or st.session_state.get("live_theorem_project") == active.project_id
-        )
+        show_live = active.status == "RUNNING" or st.session_state.get("live_run_project") == active.project_id
         if show_live:
             render_live_theorem(active)
 
