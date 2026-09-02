@@ -10,8 +10,8 @@ from typing import Any
 
 from dotenv import load_dotenv
 
+from lab import TheoremResearchLab
 from lab.agent import Agent
-from lab.integrity_theorem_lab import TheoremResearchLab
 from lab.prompts import ROLE_LIBRARY
 from lab.research_state import ResearchState
 from lab.trace import Trace
