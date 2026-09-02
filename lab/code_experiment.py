@@ -55,6 +55,18 @@ BLOCKED_NAMES = {
     "vars",
     "__import__",
 }
+BLOCKED_ATTRIBUTES = {
+    "sys",
+    "os",
+    "subprocess",
+    "builtins",
+    "importlib",
+    "ctypes",
+    "socket",
+    "modules",
+    "format_map",
+}
+BLOCKED_OPERATOR_CALLS = {"attrgetter", "methodcaller"}
 
 
 class UnsafeExperimentCode(ValueError):
@@ -82,11 +94,10 @@ class WorkspaceActionResult:
 class GuardedExperimentWorkspace:
     """Project-local authoring workspace with container-only execution.
 
-    The AST policy is defense in depth, not the security boundary. Generated
-    Python is *never* executed directly on the host. ``run_python`` requires
-    Docker or Podman and launches a disposable container with no network,
-    read-only rootfs, no Linux capabilities, no-new-privileges, memory/PID/CPU
-    limits and only this project workspace mounted writable.
+    The AST policy is best-effort defense in depth and may be bypassable; it is
+    not the security boundary. Generated Python is *never* executed directly on
+    the host. The only execution security boundary is the disposable Docker or
+    Podman container used by ``run_python``. No container means fail closed.
     """
 
     def __init__(
@@ -108,6 +119,15 @@ class GuardedExperimentWorkspace:
         self.root.mkdir(parents=True, exist_ok=True)
         self.outputs = self.root / "outputs"
         self.outputs.mkdir(exist_ok=True)
+        # Rootless/user-namespaced Docker may map container root to an unrelated
+        # host uid. Outputs are intentionally the container-writable evidence
+        # area, so make that one directory world-writable on POSIX. The rest of
+        # the workspace keeps normal host permissions.
+        if os.name != "nt":
+            try:
+                self.outputs.chmod(0o777)
+            except OSError:
+                pass
         self.timeout_s = int(timeout_s)
         self.max_file_bytes = int(max_file_bytes)
         self.max_read_chars = int(max_read_chars)
@@ -162,6 +182,7 @@ class GuardedExperimentWorkspace:
         return candidate
 
     def _validate_python(self, code: str) -> None:
+        """Reject known dangerous AST patterns; container remains the boundary."""
         try:
             tree = ast.parse(code)
         except SyntaxError as exc:
@@ -174,14 +195,25 @@ class GuardedExperimentWorkspace:
                     root = name.split(".", 1)[0]
                     if root not in allowed_imports:
                         raise UnsafeExperimentCode(f"İzin verilmeyen import: {root}")
-            # Reject blocked builtins at every load site, not only direct Call.func.
-            # This closes aliases such as ``o = open; o(...)`` and ``e = eval``.
             if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in BLOCKED_NAMES:
                 raise UnsafeExperimentCode(f"İzin verilmeyen isim erişimi: {node.id}")
-            if isinstance(node, ast.Attribute) and str(node.attr).startswith("__"):
-                raise UnsafeExperimentCode("Dunder attribute erişimi kapalıdır.")
             if isinstance(node, ast.Name) and str(node.id).startswith("__"):
                 raise UnsafeExperimentCode("Dunder isimler kapalıdır.")
+            if isinstance(node, ast.Attribute):
+                attr = str(node.attr)
+                if attr.startswith("_"):
+                    raise UnsafeExperimentCode(f"Private/dunder attribute erişimi kapalıdır: {attr}")
+                if attr in BLOCKED_ATTRIBUTES:
+                    raise UnsafeExperimentCode(f"İzin verilmeyen attribute erişimi: {attr}")
+            if isinstance(node, ast.Constant) and isinstance(node.value, str) and "__" in node.value:
+                raise UnsafeExperimentCode("String sabitlerinde dunder erişim kalıpları kapalıdır.")
+            if isinstance(node, ast.Call):
+                func = node.func
+                if isinstance(func, ast.Attribute):
+                    if func.attr in BLOCKED_OPERATOR_CALLS:
+                        raise UnsafeExperimentCode(f"İzin verilmeyen operator helper çağrısı: {func.attr}")
+                elif isinstance(func, ast.Name) and func.id in BLOCKED_OPERATOR_CALLS:
+                    raise UnsafeExperimentCode(f"İzin verilmeyen operator helper çağrısı: {func.id}")
 
     def write_file(self, path: str, content: str) -> WorkspaceActionResult:
         try:
@@ -360,7 +392,6 @@ class GuardedExperimentWorkspace:
                     proc.kill()
                     returncode = proc.wait(timeout=2)
             elapsed = time.monotonic() - started
-            # Catch very fast processes that exceed the output cap between polls.
             output_bytes = stdout_path.stat().st_size + stderr_path.stat().st_size
             if output_bytes > self.max_output_bytes and not termination_reason:
                 termination_reason = "output_limit"

@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
+
+from lab.integrity import EvidenceSigner
 
 
 def _now() -> str:
@@ -15,16 +16,20 @@ def _now() -> str:
 class StepStore:
     """SQLite-backed durable cache/partial/snapshot store.
 
-    SQLite is authoritative. Legacy JSON files are imported once when present but
-    are no longer rewritten on every token/step, avoiding quadratic file churn.
+    Completed step payloads are HMAC-sealed. This detects direct SQLite payload
+    edits before cached LLM/tool evidence can be reused. The default project-local
+    key is protection against accidental/manual edits; an external
+    ``LAB_EVIDENCE_HMAC_KEY`` is required if the key must not live beside data.
     """
 
     def __init__(self, project_root: str | Path):
         self.root = Path(project_root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.path = self.root / "research_steps.sqlite3"
+        self.signer = EvidenceSigner(self.root)
         self._init_db()
         self._migrate_legacy_json()
+        self._seal_existing_steps_once()
 
     def _connect(self) -> sqlite3.Connection:
         con = sqlite3.connect(self.path, timeout=30)
@@ -114,18 +119,52 @@ class StepStore:
                 (_now(),),
             )
 
-    @contextmanager
-    def transaction(self) -> Iterator[sqlite3.Connection]:
-        con = self._connect()
-        try:
-            con.execute("BEGIN IMMEDIATE")
-            yield con
-            con.commit()
-        except Exception:
-            con.rollback()
-            raise
-        finally:
-            con.close()
+    def _step_signature_payload(self, key: str, payload: dict[str, Any]) -> dict[str, Any]:
+        clean = dict(payload)
+        clean.pop("_evidence_signature", None)
+        clean.pop("_evidence_key_mode", None)
+        return {"step_key": key, "payload": clean}
+
+    def _seal_step(self, key: str, payload: dict[str, Any]) -> dict[str, Any]:
+        clean = dict(payload)
+        clean.pop("_evidence_signature", None)
+        clean.pop("_evidence_key_mode", None)
+        clean["_evidence_signature"] = self.signer.sign(
+            "step_cache:v1", self._step_signature_payload(key, clean)
+        )
+        clean["_evidence_key_mode"] = self.signer.mode
+        return clean
+
+    def _step_valid(self, key: str, payload: dict[str, Any]) -> bool:
+        signature = str(payload.get("_evidence_signature") or "")
+        return self.signer.verify(
+            "step_cache:v1",
+            self._step_signature_payload(key, payload),
+            signature,
+        )
+
+    def _seal_existing_steps_once(self) -> None:
+        with self._connect() as con:
+            done = con.execute("SELECT value FROM meta WHERE key='signed_cache_migrated_v1'").fetchone()
+            if done:
+                return
+            rows = con.execute("SELECT step_key,payload_json FROM steps").fetchall()
+            for row in rows:
+                try:
+                    payload = json.loads(row["payload_json"])
+                except Exception:
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                sealed = self._seal_step(str(row["step_key"]), payload)
+                con.execute(
+                    "UPDATE steps SET payload_json=?, updated_at=? WHERE step_key=?",
+                    (json.dumps(sealed, ensure_ascii=False), _now(), str(row["step_key"])),
+                )
+            con.execute(
+                "INSERT OR REPLACE INTO meta(key,value) VALUES('signed_cache_migrated_v1',?)",
+                (_now(),),
+            )
 
     @staticmethod
     def _decode(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -139,10 +178,15 @@ class StepStore:
 
     def get_step(self, key: str) -> dict[str, Any] | None:
         with self._connect() as con:
-            return self._decode(con.execute("SELECT payload_json FROM steps WHERE step_key=?", (key,)).fetchone())
+            payload = self._decode(
+                con.execute("SELECT payload_json FROM steps WHERE step_key=?", (key,)).fetchone()
+            )
+        if payload is None or not self._step_valid(key, payload):
+            return None
+        return payload
 
     def put_step(self, key: str, value: dict[str, Any]) -> None:
-        payload = dict(value)
+        payload = self._seal_step(key, dict(value))
         with self._connect() as con:
             con.execute(
                 "INSERT OR REPLACE INTO steps(step_key,status,fingerprint,payload_json,updated_at) VALUES(?,?,?,?,?)",
@@ -161,7 +205,9 @@ class StepStore:
 
     def get_partial(self, key: str) -> dict[str, Any] | None:
         with self._connect() as con:
-            return self._decode(con.execute("SELECT payload_json FROM partials WHERE step_key=?", (key,)).fetchone())
+            return self._decode(
+                con.execute("SELECT payload_json FROM partials WHERE step_key=?", (key,)).fetchone()
+            )
 
     def put_partial(self, key: str, value: dict[str, Any]) -> None:
         payload = dict(value)
@@ -196,6 +242,7 @@ class StepStore:
                     "status": row["status"],
                     "fingerprint": row["fingerprint"],
                     "model": payload.get("model"),
+                    "sealed": self._step_valid(str(row["step_key"]), payload),
                     "updated_at": row["updated_at"],
                 }
             )
@@ -221,7 +268,10 @@ class StepStore:
             ).fetchone()
         if row is None:
             return None
-        payload = json.loads(row["payload_json"])
+        try:
+            payload = json.loads(row["payload_json"])
+        except Exception:
+            payload = {}
         return {
             "iteration": int(iteration),
             "ledger_revision": row["ledger_revision"],

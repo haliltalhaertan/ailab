@@ -9,7 +9,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from lab.integrity import atomic_write_json, project_lock_is_live, read_json_tolerant
 from lab.research_state import ResearchState
+from lab.runtime_health import normalize_runtime
 
 
 def _now() -> str:
@@ -22,19 +24,11 @@ def _slug(value: str) -> str:
 
 
 def _read_json(path: Path, default: Any) -> Any:
-    if not path.exists():
-        return default
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return default
+    return read_json_tolerant(path, default)
 
 
 def _write_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    atomic_write_json(path, value)
 
 
 def _parse_time(value: str) -> datetime | None:
@@ -75,7 +69,11 @@ class ProjectInfo:
 
 
 class ProjectManager:
-    """Project-centric facade with immutable project UUIDs and indexed run history."""
+    """Project-centric facade with immutable project UUIDs and indexed run history.
+
+    ``project.json`` stores project metadata only; its status is limited to
+    READY/ARCHIVED. Execution status is authoritative in ``runtime.json``.
+    """
 
     def __init__(self, root: str | Path = "research_state", runs_dir: str | Path = "runs"):
         self.root = Path(root)
@@ -124,7 +122,15 @@ class ProjectManager:
         }
         _write_json(root / "project.json", metadata)
         state = ResearchState(root)
-        state.freeze_problem(problem, metadata={"project_id": pid, "project_uuid": project_uuid, "title": title.strip(), "created_from": "project_manager"})
+        state.freeze_problem(
+            problem,
+            metadata={
+                "project_id": pid,
+                "project_uuid": project_uuid,
+                "title": title.strip(),
+                "created_from": "project_manager",
+            },
+        )
         if activate:
             self.set_active(pid)
         return self.get(pid)
@@ -154,16 +160,60 @@ class ProjectManager:
             raw = self._legacy_metadata(root)
             _write_json(path, raw)
             return raw
+
+        changed = False
+        raw = dict(raw)
         if not str(raw.get("project_uuid") or "").strip():
-            raw = dict(raw)
             raw["project_uuid"] = uuid.uuid4().hex
             raw["uuid_migrated_at"] = _now()
+            changed = True
+
+        stored_status = str(raw.get("status") or "READY").upper()
+        if stored_status not in {"READY", "ARCHIVED"}:
+            # Preserve a legacy execution status if runtime.json did not exist,
+            # then remove it from project metadata permanently.
+            runtime_path = root / "runtime.json"
+            if not runtime_path.exists():
+                _write_json(
+                    runtime_path,
+                    {
+                        "status": stored_status,
+                        "updated_at": str(raw.get("updated_at") or _now()),
+                    },
+                )
+            raw["status"] = "ARCHIVED" if bool(raw.get("archived")) else "READY"
+            raw["status_migrated_at"] = _now()
+            changed = True
+        elif bool(raw.get("archived")) and stored_status != "ARCHIVED":
+            raw["status"] = "ARCHIVED"
+            changed = True
+        elif not bool(raw.get("archived")) and stored_status == "ARCHIVED":
+            raw["status"] = "READY"
+            changed = True
+
+        if changed:
             _write_json(path, raw)
         return raw
 
     def _runtime(self, root: Path) -> dict[str, Any]:
         value = _read_json(root / "runtime.json", {})
-        return value if isinstance(value, dict) else {}
+        runtime = value if isinstance(value, dict) else {}
+        return normalize_runtime(root, runtime)
+
+    def _write_runtime_status(self, root: Path, status: str) -> None:
+        status = str(status or "").upper()
+        if not status or status in {"READY", "ARCHIVED"}:
+            return
+        # A RUNNING transition is valid only after a project lock has a live
+        # owner. This intentionally makes UI-side pre-launch RUNNING writes no-op.
+        if status == "RUNNING" and not project_lock_is_live(root):
+            return
+        path = root / "runtime.json"
+        current = _read_json(path, {})
+        current = dict(current) if isinstance(current, dict) else {}
+        now = _now()
+        current.update({"status": status, "updated_at": now, "heartbeat_at": now})
+        _write_json(path, current)
 
     def _counts(self, root: Path) -> dict[str, int]:
         try:
@@ -182,7 +232,11 @@ class ProjectManager:
         rows = []
         if not path.exists():
             return rows
-        with path.open("r", encoding="utf-8") as handle:
+        try:
+            handle = path.open("r", encoding="utf-8")
+        except OSError:
+            return rows
+        with handle:
             for line in handle:
                 try:
                     value = json.loads(line)
@@ -250,7 +304,6 @@ class ProjectManager:
         current_uuid = str(metadata.get("project_uuid") or "")
         rows: list[dict[str, Any]] = []
         indexed = self._indexed_runs()
-        matched_ids: set[str] = set()
         for run_id, row in indexed.items():
             if str(row.get("project_id") or "") != pid:
                 continue
@@ -261,9 +314,12 @@ class ProjectManager:
             if not run_dir.exists():
                 continue
             rows.append(self._summary_row(run_dir))
-            matched_ids.add(run_id)
         if rows:
-            return sorted(rows, key=lambda x: str(x.get("started_at") or x.get("run")), reverse=True)
+            return sorted(
+                rows,
+                key=lambda x: str(x.get("started_at") or x.get("run")),
+                reverse=True,
+            )
 
         # One-time compatibility fallback for pre-index runs. New UI paths do not
         # repeatedly scan traces once index.jsonl exists.
@@ -281,7 +337,11 @@ class ProjectManager:
                     if ts and ts < created_at:
                         continue
                 rows.append(self._summary_row(trace_path.parent))
-        return sorted(rows, key=lambda x: str(x.get("started_at") or x.get("run")), reverse=True)
+        return sorted(
+            rows,
+            key=lambda x: str(x.get("started_at") or x.get("run")),
+            reverse=True,
+        )
 
     def get(self, project_id: str) -> ProjectInfo:
         pid = _slug(project_id)
@@ -292,7 +352,8 @@ class ProjectManager:
         frozen = _read_json(root / "problem_frozen.json", {})
         runtime = self._runtime(root)
         runs = self.run_summaries(pid)
-        status = str(runtime.get("status") or meta.get("status") or "READY")
+        metadata_status = "ARCHIVED" if bool(meta.get("archived")) else "READY"
+        status = str(runtime.get("status") or metadata_status)
         return ProjectInfo(
             project_id=pid,
             project_uuid=str(meta.get("project_uuid") or ""),
@@ -319,7 +380,10 @@ class ProjectManager:
         for root in self.root.iterdir():
             if not root.is_dir():
                 continue
-            if not any((root / name).exists() for name in ("project.json", "problem_frozen.json", "state.json", "runtime.json")):
+            if not any(
+                (root / name).exists()
+                for name in ("project.json", "problem_frozen.json", "state.json", "runtime.json")
+            ):
                 continue
             try:
                 info = self.get(root.name)
@@ -332,7 +396,14 @@ class ProjectManager:
 
     def set_active(self, project_id: str) -> ProjectInfo:
         info = self.get(project_id)
-        _write_json(self.active_path, {"project_id": info.project_id, "project_uuid": info.project_uuid, "updated_at": _now()})
+        _write_json(
+            self.active_path,
+            {
+                "project_id": info.project_id,
+                "project_uuid": info.project_uuid,
+                "updated_at": _now(),
+            },
+        )
         return info
 
     def active_project_id(self) -> str | None:
@@ -363,12 +434,31 @@ class ProjectManager:
         pid = _slug(project_id)
         root = self.project_root(pid)
         meta = self._base_metadata(root)
-        allowed = {"title", "description", "experiment", "literature_query", "tags", "archived", "status"}
+        metadata_fields = {
+            "title",
+            "description",
+            "experiment",
+            "literature_query",
+            "tags",
+            "archived",
+        }
         for key, value in updates.items():
-            if key in allowed:
+            if key in metadata_fields:
                 meta[key] = value
+
+        requested_status = str(updates.get("status") or "").upper()
+        if "archived" in updates:
+            meta["status"] = "ARCHIVED" if bool(meta.get("archived")) else "READY"
+        elif requested_status in {"READY", "ARCHIVED"}:
+            meta["status"] = requested_status
+            meta["archived"] = requested_status == "ARCHIVED"
+        else:
+            meta["status"] = "ARCHIVED" if bool(meta.get("archived")) else "READY"
+
         meta["updated_at"] = _now()
         _write_json(root / "project.json", meta)
+        if requested_status not in {"", "READY", "ARCHIVED"}:
+            self._write_runtime_status(root, requested_status)
         return self.get(pid)
 
     def archive(self, project_id: str, archived: bool = True) -> ProjectInfo:
@@ -377,7 +467,13 @@ class ProjectManager:
             self.clear_active()
         return info
 
-    def clone(self, project_id: str, *, title: str, new_project_id: str | None = None) -> ProjectInfo:
+    def clone(
+        self,
+        project_id: str,
+        *,
+        title: str,
+        new_project_id: str | None = None,
+    ) -> ProjectInfo:
         source = self.get(project_id)
         return self.create_project(
             title=title,

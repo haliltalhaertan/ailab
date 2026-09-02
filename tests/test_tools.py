@@ -50,9 +50,12 @@ def test_tropical_grid_checker_accepts_k3_shortest_path_circuit():
     result = TropicalGridTool().check(circuit, [0, 1, 2])
     assert result.ok
     assert result.metadata["cases_checked"] == 27
+    assert result.metadata["gate_count"] == 2
+    assert result.metadata["edge_gate_count"] == 3
+    assert "monomial" in result.metadata["warning"].lower()
 
 
-def test_tropical_grid_checker_finds_counterexample():
+def test_tropical_grid_checker_finds_functional_counterexample():
     bad = {
         "n": 3,
         "gates": [{"id": "e13", "op": "edge", "u": 1, "v": 3}],
@@ -61,3 +64,5 @@ def test_tropical_grid_checker_finds_counterexample():
     result = TropicalGridTool().check(bad, [0, 1, 2])
     assert not result.ok
     assert result.metadata["status"] == "COUNTEREXAMPLE"
+    assert result.metadata["gate_count"] == 0
+    assert result.metadata["edge_gate_count"] == 1

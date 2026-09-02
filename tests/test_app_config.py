@@ -1,6 +1,8 @@
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 
 def load_app_module():
     app_path = Path(__file__).resolve().parents[1] / "app.py"
@@ -11,10 +13,14 @@ def load_app_module():
     return module
 
 
-app = load_app_module()
+@pytest.fixture
+def app(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    return load_app_module()
 
 
-def test_theorem_research_is_available_in_ui():
+def test_theorem_research_is_available_in_ui(app):
     exp = app.EXPERIMENTS["Teorem Araştırması"]
     assert exp["method"] == "theorem_lab"
     assert exp["roles"] == [
@@ -27,13 +33,13 @@ def test_theorem_research_is_available_in_ui():
     ]
 
 
-def test_theorem_roles_have_independent_default_models():
+def test_theorem_roles_have_independent_default_models(app):
     for role in app.EXPERIMENTS["Teorem Araştırması"]["roles"]:
         assert app.default_model(role)
         assert role in app.ROLE_LIBRARY
 
 
-def test_model_search_filters_slug_and_label_case_insensitive():
+def test_model_search_filters_slug_and_label_case_insensitive(app):
     ids = ["z-ai/glm-5.3-flash", "openai/gpt-4o", "moonshotai/kimi-k3"]
     labels = {
         "z-ai/glm-5.3-flash": "Z.ai: GLM 5.3 Flash",
@@ -45,12 +51,12 @@ def test_model_search_filters_slug_and_label_case_insensitive():
     assert app.filter_models(ids, labels, "") == ids
 
 
-def test_every_experiment_explains_when_to_use_it():
+def test_every_experiment_explains_when_to_use_it(app):
     for experiment in app.EXPERIMENTS.values():
         assert experiment.get("description")
 
 
-def test_tool_execution_error_is_not_labeled_counterexample():
+def test_tool_execution_error_is_not_labeled_counterexample(app):
     label, tone = app.tool_status(
         {"ok": False, "tool": "tropical_grid", "error": "grid checker için 2 ≤ n ≤ 7 gerekli"}
     )
@@ -58,7 +64,7 @@ def test_tool_execution_error_is_not_labeled_counterexample():
     assert tone == "error"
 
 
-def test_real_counterexample_is_labeled_counterexample():
+def test_real_counterexample_is_labeled_counterexample(app):
     label, tone = app.tool_status(
         {
             "ok": False,
@@ -71,5 +77,5 @@ def test_real_counterexample_is_labeled_counterexample():
     assert tone == "error"
 
 
-def test_compact_live_renderer_is_available():
+def test_compact_live_renderer_is_available(app):
     assert hasattr(app, "LiveTimelineRenderer")
