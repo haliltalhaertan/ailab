@@ -10,6 +10,18 @@ from lab.integrity import ProjectRunLock, atomic_write_json, read_json_tolerant
 from lab.trace import Trace
 
 
+RESEARCH_PHASES = {
+    "LITERATURE",
+    "FORMALIZATION",
+    "PILOT",
+    "DISCOVERY",
+    "FALSIFICATION",
+    "PROOF",
+    "PUBLICATION",
+}
+DEFAULT_RESEARCH_PHASE = "LITERATURE"
+
+
 class ResearchStopped(RuntimeError):
     pass
 
@@ -28,6 +40,40 @@ def atomic_json(path: Path, value: Any) -> None:
 
 def read_json(path: Path, default: Any) -> Any:
     return read_json_tolerant(path, default)
+
+
+def default_runtime() -> dict[str, Any]:
+    return {
+        "status": "NEW",
+        "research_phase": DEFAULT_RESEARCH_PHASE,
+        "completed_iterations": 0,
+        "next_task": "",
+        "current_iteration": 0,
+        "current_step": "",
+        "last_error": "",
+    }
+
+
+def normalize_research_phase(value: Any) -> str:
+    phase = str(value or DEFAULT_RESEARCH_PHASE).upper()
+    if phase not in RESEARCH_PHASES:
+        raise ValueError(f"invalid research_phase: {phase}")
+    return phase
+
+
+def set_research_phase(project_root: str | Path, phase: str) -> dict[str, Any]:
+    """Persist a scientific workflow phase without changing execution status."""
+
+    root = Path(project_root)
+    path = root / "runtime.json"
+    raw = read_json_tolerant(path, None)
+    current = dict(raw) if isinstance(raw, dict) else default_runtime()
+    current.setdefault("status", "NEW")
+    current["research_phase"] = normalize_research_phase(phase)
+    current["updated_at"] = now_iso()
+    root.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(path, current)
+    return current
 
 
 def retryable(exc: Exception) -> bool:
@@ -65,20 +111,15 @@ class RunController:
         self._last_heartbeat_monotonic = 0.0
 
     def runtime(self) -> dict[str, Any]:
-        return read_json(
-            self.runtime_path,
-            {
-                "status": "NEW",
-                "completed_iterations": 0,
-                "next_task": "",
-                "current_iteration": 0,
-                "current_step": "",
-                "last_error": "",
-            },
-        )
+        value = read_json(self.runtime_path, default_runtime())
+        current = dict(value) if isinstance(value, dict) else default_runtime()
+        current.setdefault("research_phase", DEFAULT_RESEARCH_PHASE)
+        return current
 
     def set_runtime(self, **updates: Any) -> dict[str, Any]:
         value = self.runtime()
+        if "research_phase" in updates:
+            updates["research_phase"] = normalize_research_phase(updates["research_phase"])
         value.update(updates)
         now = now_iso()
         value["pid"] = os.getpid()
@@ -90,6 +131,9 @@ class RunController:
         self.trace.log("runtime_state", **value)
         self._last_heartbeat_monotonic = time.monotonic()
         return value
+
+    def set_research_phase(self, phase: str) -> dict[str, Any]:
+        return self.set_runtime(research_phase=phase)
 
     def heartbeat(self, *, min_interval_s: float = 15.0) -> None:
         now_mono = time.monotonic()
