@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 from lab import ResearchState, TheoremResearchLab, Trace
 from lab.client import LLMResponse
-from lab.evidence import evidence_from_tool_result
+from lab.evidence import evidence_from_tool_result, validate_evidence_binding
 from lab.research_contract import ResearchContract
 from lab.tools import ResearchToolbox, ToolResult
 
 
 class EmptyLiterature:
     def search(self, query: str, limit: int = 8):
+        del query, limit
         return []
 
 
@@ -137,6 +139,24 @@ def test_generated_code_experiment_cannot_claim_exact_pass():
     assert evidence.kind == "NUMERICAL_PASS"
 
 
+def test_binding_rejects_forged_strong_generated_evidence():
+    result = ToolResult(
+        True,
+        "code_experiment",
+        output="done",
+        metadata={"successful_run_count": 1},
+    )
+    evidence = evidence_from_tool_result(result)
+    forged = replace(evidence, kind="EXACT_PASS", ok=True)
+
+    bound = validate_evidence_binding(forged)
+
+    assert bound.kind == "INCONCLUSIVE"
+    assert bound.ok is False
+    assert bound.metadata["downgraded_from"] == "EXACT_PASS"
+    assert "generated evidence" in bound.metadata["evidence_downgrade_reason"]
+
+
 def test_run_level_generic_z3_unsat_cannot_open_computation_pass(tmp_path: Path):
     state, trace = _run(tmp_path, {"tool": "z3", "smt2": "(assert false)"})
     item = state.list_items(kind="conjecture")[0]
@@ -183,3 +203,42 @@ def test_run_level_script_cannot_self_promote_to_formal_proof(tmp_path: Path):
     item = state.list_items(kind="conjecture")[0]
     assert item.status == "OPEN"
     assert '"evidence_kind": "INCONCLUSIVE"' in trace.path.read_text(encoding="utf-8")
+
+
+def test_fail_path_persists_bound_evidence_on_conjecture_and_counterexample(tmp_path: Path):
+    state = ResearchState(tmp_path / "state")
+    contract = _contract(state.root)
+    agents = _agents({"tool": "none"}, requested_status="OPEN")
+    trace = Trace("fail-evidence-run", out_dir=tmp_path / "runs")
+    lab = TheoremResearchLab(trace, state, literature=EmptyLiterature())
+    deterministic_counterexample = ToolResult(
+        False,
+        "tropical_grid",
+        metadata={"status": "COUNTEREXAMPLE", "weights": {"1-2": 0}},
+    )
+    lab._tool = lambda request, step_key: deterministic_counterexample  # type: ignore[method-assign]
+
+    lab.run(
+        "P",
+        manager=agents["manager"],
+        proposer=agents["proposer"],
+        critic=agents["critic"],
+        verifier=agents["verifier"],
+        auditor=agents["auditor"],
+        iterations=1,
+        checkpoint_every=0,
+    )
+    trace.close()
+
+    conjecture = state.list_items(kind="conjecture")[0]
+    counterexample = state.list_items(kind="counterexample")[0]
+    conjecture_evidence = conjecture.metadata["evidence"]
+    counterexample_evidence = counterexample.metadata["evidence"]
+
+    assert conjecture.status == "FAIL"
+    assert conjecture_evidence["kind"] == "DETERMINISTIC_COUNTEREXAMPLE"
+    assert counterexample_evidence["kind"] == "DETERMINISTIC_COUNTEREXAMPLE"
+    assert conjecture_evidence["contract_hash"] == contract.contract_hash
+    assert counterexample_evidence["contract_hash"] == contract.contract_hash
+    assert conjecture_evidence["target_id"] == "T1"
+    assert counterexample_evidence["target_id"] == "T1"
