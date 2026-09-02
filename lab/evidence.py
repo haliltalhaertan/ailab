@@ -194,7 +194,9 @@ def _classify(result: "ToolResult") -> tuple[str, bool, dict[str, Any] | None, d
             return "INCONCLUSIVE", False, None, metadata
         return declared, exhaustive, witness, metadata
     if tool == "code_experiment":
-        if result.ok and int(metadata.get("successful_run_count", 0) or 0) > 0:
+        nested = metadata.get("evidence") if isinstance(metadata.get("evidence"), dict) else {}
+        successful_runs = metadata.get("successful_run_count", nested.get("successful_run_count", 0))
+        if result.ok and int(successful_runs or 0) > 0:
             return "NUMERICAL_PASS", False, None, metadata
         return "INCONCLUSIVE", False, None, metadata
     return "INCONCLUSIVE", False, None, metadata
@@ -208,6 +210,15 @@ def evidence_from_tool_result(
     target_id: str | None = None,
 ) -> Evidence:
     kind, exhaustive, witness, metadata = _classify(result)
+
+    # Preserve legacy behavior for successful checked-in scripts that predate
+    # the structured evidence trailer. Contract-bound projects stay fail-closed.
+    if contract is None and result.tool == "script" and result.ok and not _script_payload(result):
+        kind = "NUMERICAL_PASS"
+        exhaustive = False
+        witness = None
+        metadata.pop("downgraded_from", None)
+
     target_hash: str | None = None
     resolution_scope = "PARTIAL"
     contract_hash = ""
@@ -217,18 +228,23 @@ def evidence_from_tool_result(
             target = contract.target(target_id)
             target_hash = target.target_hash
             if target.target_type in {"COMPUTE", "OPTIMIZE"}:
-                covered = metadata.get("evidence_payload", {}).get("covered")
+                payload = metadata.get("evidence_payload")
+                covered = payload.get("covered") if isinstance(payload, dict) else None
                 if not isinstance(covered, dict):
                     covered = metadata.get("covered") if isinstance(metadata.get("covered"), dict) else None
                 resolution_scope = contract.resolution_scope(target_id, covered)
 
-    termination_reason = str(
-        metadata.get("evidence_payload", {}).get("termination_reason")
-        if isinstance(metadata.get("evidence_payload"), dict)
-        else ""
-    )
+    payload = metadata.get("evidence_payload")
+    termination_reason = str(payload.get("termination_reason") or "") if isinstance(payload, dict) else ""
     if not termination_reason:
-        termination_reason = "completed" if result.ok else ("timeout" if "timeout" in str(result.error).lower() else "error")
+        if kind == "DETERMINISTIC_COUNTEREXAMPLE" and not str(result.error or "").strip():
+            termination_reason = "completed"
+        elif result.ok:
+            termination_reason = "completed"
+        elif "timeout" in str(result.error or "").lower():
+            termination_reason = "timeout"
+        else:
+            termination_reason = "error"
     if termination_reason != "completed":
         metadata.setdefault("downgraded_from", kind)
         kind = "INCONCLUSIVE"
@@ -241,13 +257,16 @@ def evidence_from_tool_result(
     input_sha = sha256_json(request or {"tool": result.tool})
     output_sha = sha256_json(result.as_dict())
     runtime_s = float(metadata.get("runtime_s", 0.0) or 0.0)
-    evidence = Evidence(
+    semantic_ok = kind != "INCONCLUSIVE" and (
+        result.ok or kind == "DETERMINISTIC_COUNTEREXAMPLE"
+    )
+    return Evidence(
         source=result.tool,
         source_origin=_source_origin(result.tool),
         evidence_role=role,
         resolution_scope=resolution_scope,
         kind=kind,
-        ok=bool(result.ok and kind != "INCONCLUSIVE"),
+        ok=semantic_ok,
         exhaustive=exhaustive,
         termination_reason=termination_reason,
         witness=witness,
@@ -260,7 +279,6 @@ def evidence_from_tool_result(
         tool_sha256=_tool_sha(result),
         metadata=metadata,
     )
-    return evidence
 
 
 def validate_evidence_binding(
