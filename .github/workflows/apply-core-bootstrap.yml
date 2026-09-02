@@ -24,6 +24,14 @@ jobs:
           python - <<'PY'
           from pathlib import Path
 
+          contract_path = Path("lab/research_contract.py")
+          contract = contract_path.read_text(encoding="utf-8")
+          old_types = '''        current = {target.id: target for target in self.open_targets}\n        for prior in existing.open_targets:\n            target = current.get(prior.id)\n            if target is None:\n                raise ValueError("open_targets is append-only")\n            if target.statement != prior.statement or target.target_type != prior.target_type:\n                raise ValueError("target statement and target_type are immutable")\n'''
+          new_types = '''        current_targets = {entry.id: entry for entry in self.open_targets}\n        for prior_target in existing.open_targets:\n            matched_target = current_targets.get(prior_target.id)\n            if matched_target is None:\n                raise ValueError("open_targets is append-only")\n            if (\n                matched_target.statement != prior_target.statement\n                or matched_target.target_type != prior_target.target_type\n            ):\n                raise ValueError("target statement and target_type are immutable")\n'''
+          if old_types not in contract:
+              raise SystemExit("research_contract type anchor not found")
+          contract_path.write_text(contract.replace(old_types, new_types, 1), encoding="utf-8")
+
           state_path = Path("lab/research_state.py")
           text = state_path.read_text(encoding="utf-8")
           import_old = "from lab.integrity import EvidenceSigner, atomic_write_json, read_json_tolerant, sha256_file\n"
@@ -65,7 +73,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add lab/research_state.py lab/theorem_engine.py
+          git add lab/research_contract.py lab/research_state.py lab/theorem_engine.py
           git diff --cached --quiet && exit 0
           git commit -m "feat(contract): bind frozen contract to run state"
           git push origin HEAD:feat/evidence-driven-core
