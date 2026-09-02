@@ -319,17 +319,32 @@ class ResearchContract:
     ) -> TargetTransition | None:
         """Evaluate one OPEN target from machine-bound ledger records.
 
-        ``records`` are engine-produced summaries with ``item_id``, ``claim_role``,
-        ``status`` and optional ``evidence``. LLM output never directly changes a
-        target status; this method only recognizes type-specific machine gates.
+        ``records`` are engine-produced summaries with ``item_id``, optional
+        code-assigned ``claim_role``, ``record_kind``, ``status`` and evidence.
+        LLM output never directly changes target status. Full-scope deterministic
+        pilot experiments may resolve COMPUTE/OPTIMIZE targets without inventing
+        an LLM claim role.
         """
 
         target = self.target(target_id, require_open=True)
-        eligible = [
-            record
-            for record in records
-            if str(record.get("claim_role") or "") == "TARGET_RESOLUTION"
-        ]
+
+        def is_target_resolution_record(record: dict[str, Any]) -> bool:
+            if str(record.get("claim_role") or "") == "TARGET_RESOLUTION":
+                return True
+            if target.target_type not in {"COMPUTE", "OPTIMIZE"}:
+                return False
+            if str(record.get("record_kind") or "") != "experiment" or not bool(record.get("pilot")):
+                return False
+            raw = record.get("evidence")
+            if not isinstance(raw, dict):
+                return False
+            evidence = dict(raw)
+            return (
+                _evidence_is_bound(evidence, target, self.contract_hash)
+                and str(evidence.get("resolution_scope") or "") == "TARGET_RESOLUTION"
+            )
+
+        eligible = [record for record in records if is_target_resolution_record(record)]
         proven = [
             record
             for record in eligible
@@ -373,8 +388,11 @@ class ResearchContract:
                 if not isinstance(raw, dict):
                     continue
                 evidence = dict(raw)
-                if _evidence_is_bound(evidence, target, self.contract_hash):
-                    evidence_records.append((record, evidence))
+                if not _evidence_is_bound(evidence, target, self.contract_hash):
+                    continue
+                if str(evidence.get("resolution_scope") or "") != "TARGET_RESOLUTION":
+                    continue
+                evidence_records.append((record, evidence))
             searches = [
                 pair
                 for pair in evidence_records
@@ -401,7 +419,7 @@ class ResearchContract:
                         "CLOSED",
                         [_evidence_id(search), _evidence_id(checker)],
                         {"exhaustiveness_basis": "code_review", "candidate_sha256": search_candidate},
-                        "independent optimum search and checker agree on one candidate",
+                        "independent full-scope optimum search and checker agree on one candidate",
                     )
             return None
 
