@@ -8,5 +8,6 @@ __pycache__/
 .ruff_cache/
 runs/
 research_state/
+baseline_runs/
 reasoning_settings.json
 code_experiment_settings.json
