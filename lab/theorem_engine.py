@@ -5,12 +5,13 @@ import json
 import os
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from lab.agent import Agent
 from lab.code_experiment import CODE_EXPERIMENT_SYSTEM_PROMPT, CodeExperimentRunner, GuardedExperimentWorkspace, WorkspaceActionResult
 from lab.code_experiment_settings import load_code_experiment_settings, load_code_experiment_settings_from_dict
-from lab.integrity import content_fingerprint
+from lab.integrity import content_fingerprint, sha256_file
 from lab.json_io import StructuredOutputError, parse_json_object, repair_instruction
 from lab.literature import LiteratureClient, LiteratureSearchEmpty, Paper
 from lab.prompts import checkpoint_prompt, critic_prompt, literature_prompt, manager_prompt, proposal_prompt, verifier_prompt
@@ -19,7 +20,7 @@ from lab.run_controller import ResearchPaused, ResearchStopped, RunController, a
 from lab.status_guard import choose_status
 from lab.step_store import StepStore
 from lab.tool_registry import ToolRegistry
-from lab.tools import ResearchToolbox, ToolResult
+from lab.tools import LeanTool, ResearchToolbox, ToolResult
 from lab.trace import Trace
 
 
@@ -42,17 +43,7 @@ def paper_context(papers: list[Paper]) -> str:
 
 
 class TheoremResearchLab:
-    """Single production theorem workflow.
-
-    Responsibilities are composed rather than inherited:
-    - StepStore: SQLite cache, partial responses, frozen iteration snapshots
-    - RunController: lock, runtime cursor, stop and retry policy
-    - ToolRegistry: one source of truth for tool schema/dispatch
-    - ResearchState: human-readable scientific ledger
-
-    LLMs can propose statuses, but code-side evidence guards decide what is
-    actually written to the ledger.
-    """
+    """Single production theorem workflow with machine-gated evidence binding."""
 
     PARTIAL_RESUME_CHAR_LIMIT = 60_000
     PARTIAL_FLUSH_INTERVAL_S = 0.25
@@ -74,7 +65,12 @@ class TheoremResearchLab:
         self.literature = literature or LiteratureClient()
         self.step_store = StepStore(state.root)
         self.controller = RunController(state.root, trace, max_retries=max_retries)
-        self.toolbox = toolbox or ResearchToolbox()
+        if toolbox is None:
+            toolbox = ResearchToolbox(lean_root=state.root / "formal")
+        elif isinstance(getattr(toolbox, "lean", None), LeanTool):
+            timeout_s = int(getattr(toolbox.lean, "timeout_s", 120))
+            toolbox.lean = LeanTool(state.root / "formal", timeout_s=timeout_s)
+        self.toolbox = toolbox
         self.registry = ToolRegistry(self.toolbox)
         base_settings = load_code_experiment_settings()
         if code_experiment_settings_override:
@@ -96,8 +92,11 @@ class TheoremResearchLab:
         self.code_runner = CodeExperimentRunner(self.code_workspace, self.trace, max_steps=steps)
         self.registry.register("code_experiment", self._code_experiment_placeholder)
         self._literature_reliable = False
+        self._active_iteration: int | None = None
+        self._active_item_id = ""
+        self._active_claim_hash = ""
+        self._active_claim_sha256 = ""
 
-    # Compatibility helpers used by existing tests/UI.
     @property
     def runtime_path(self):
         return self.controller.runtime_path
@@ -174,8 +173,6 @@ class TheoremResearchLab:
         atomic_json(self.config_path, payload)
 
     def _llm_fingerprint(self, agent: Agent, prompt: str) -> str:
-        # Model is deliberately excluded. A model override on resume applies only
-        # to incomplete work; already-completed steps remain immutable evidence.
         return content_fingerprint(
             "llm_step:v3",
             {
@@ -434,25 +431,137 @@ class TheoremResearchLab:
         task = str(request.get("task") or request.get("goal") or "").strip() or "Aday iddiayı küçük deterministic deneylerle sınamaya çalış."
         return self.code_runner.run(agent=self.code_agent, task=task, step_key=step_key, call_agent=self._call, execute_cached=self._cached_workspace_action)
 
+    def _cached_formal_result(self, raw: dict[str, Any]) -> ToolResult:
+        result = ToolResult(
+            bool(raw.get("ok")),
+            str(raw.get("tool") or "lean"),
+            str(raw.get("output") or ""),
+            str(raw.get("error") or ""),
+            dict(raw.get("metadata") or {}),
+        )
+        metadata = dict(result.metadata or {})
+        if result.ok and metadata.get("formal_verified") is True:
+            filename = Path(str(metadata.get("file") or "")).name
+            candidate = self.state.root / "formal" / "candidates" / filename
+            if not filename or not candidate.is_file() or sha256_file(candidate) != str(metadata.get("lean_sha256") or ""):
+                return ToolResult(
+                    False,
+                    "lean",
+                    error="Cached formal evidence rejected: bound Lean file is missing or its SHA-256 changed.",
+                    metadata={**metadata, "formal_verified": False},
+                )
+        return result
+
+    def _formal_tool(self, request: dict[str, Any], step_key: str) -> ToolResult:
+        if self._active_iteration is None or not self._active_item_id:
+            return ToolResult(False, "lean", error="Formal tool current iteration/item binding olmadan çalışamaz.")
+
+        theorem_name = str(request.get("theorem_name") or "").strip()
+        theorem_type = str(request.get("theorem_type") or "").strip()
+        source = str(request.get("source") or "")
+        filename = f"iter-{self._active_iteration}-{self._active_item_id}.lean"
+        enriched = {
+            "tool": "lean_draft",
+            "file": filename,
+            "source": source,
+            "theorem_name": theorem_name,
+            "theorem_type": theorem_type,
+            "item_id": self._active_item_id,
+            "iteration": self._active_iteration,
+            "claim_hash": self._active_claim_hash,
+            "claim_sha256": self._active_claim_sha256,
+        }
+        fingerprint = content_fingerprint("bound_formal_tool:v2", enriched)
+        cached = self._cache_get(step_key)
+        if isinstance(cached, dict) and cached.get("status") == "COMPLETE" and cached.get("fingerprint") == fingerprint:
+            raw = cached.get("result")
+            if isinstance(raw, dict):
+                self.trace.log("step_reused", step_key=step_key, tool=raw.get("tool"))
+                return self._cached_formal_result(raw)
+
+        self._check_stop()
+        self._set_runtime(current_step=step_key)
+        self.trace.log("tool_start", request={k: v for k, v in enriched.items() if k != "source"}, step_key=step_key)
+        draft = self.toolbox.lean.draft_source(
+            filename,
+            source,
+            theorem_name=theorem_name,
+            theorem_type=theorem_type,
+            item_id=self._active_item_id,
+            iteration=self._active_iteration,
+            claim_hash=self._active_claim_hash,
+            claim_sha256=self._active_claim_sha256,
+        )
+        if not draft.ok:
+            result = draft
+        else:
+            dmeta = dict(draft.metadata or {})
+            result = self.toolbox.lean.check_file(
+                filename,
+                expected_sha256=str(dmeta.get("lean_sha256") or ""),
+                expected_item_id=self._active_item_id,
+                expected_iteration=self._active_iteration,
+                expected_claim_hash=self._active_claim_hash,
+                expected_claim_sha256=self._active_claim_sha256,
+                expected_theorem_name=theorem_name,
+                expected_theorem_type=theorem_type,
+            )
+            merged = dict(dmeta)
+            merged.update(result.metadata or {})
+            merged["draft_checked_same_step"] = True
+            result.metadata = merged
+        self.trace.log("tool_result", step_key=step_key, **result.as_dict())
+        self._cache_put(
+            step_key,
+            {"status": "COMPLETE", "fingerprint": fingerprint, "result": result.as_dict(), "completed_at": now_iso()},
+        )
+        return result
+
+    @staticmethod
+    def _normalize_structural_counterexample(result: ToolResult | None) -> ToolResult | None:
+        if result is None or result.tool != "tropical_grid":
+            return result
+        metadata = dict(result.metadata or {})
+        if str(metadata.get("status") or "").upper() != "STRUCTURE_MISMATCH":
+            return result
+        metadata["counterexample_type"] = "PROVENANCE_STRUCTURE_MISMATCH"
+        metadata["raw_status"] = "STRUCTURE_MISMATCH"
+        metadata["status"] = "COUNTEREXAMPLE"
+        result.metadata = metadata
+        return result
+
     def _tool(self, request: dict[str, Any] | None, step_key: str) -> ToolResult | None:
+        name = str((request or {}).get("tool") or "none").strip().lower()
+        if name == "lean":
+            result = ToolResult(
+                False,
+                "lean",
+                error="Direct lean check disabled. Use lean_draft; the engine checks the exact bound draft automatically.",
+            )
+            self.trace.log("tool_result", step_key=step_key, **result.as_dict())
+            return result
+        if name == "lean_draft":
+            return self._formal_tool(dict(request or {}), step_key)
+
         fingerprint = content_fingerprint("tool_step:v3", request or {"tool": "none"})
         cached = self._cache_get(step_key)
         if isinstance(cached, dict) and cached.get("status") == "COMPLETE" and cached.get("fingerprint") == fingerprint:
             raw = cached.get("result")
             if isinstance(raw, dict):
                 self.trace.log("step_reused", step_key=step_key, tool=raw.get("tool"))
-                return ToolResult(bool(raw.get("ok")), str(raw.get("tool") or "unknown"), str(raw.get("output") or ""), str(raw.get("error") or ""), dict(raw.get("metadata") or {}))
+                cached_result = ToolResult(bool(raw.get("ok")), str(raw.get("tool") or "unknown"), str(raw.get("output") or ""), str(raw.get("error") or ""), dict(raw.get("metadata") or {}))
+                return self._normalize_structural_counterexample(cached_result)
             return None
         self._check_stop()
         self._set_runtime(current_step=step_key)
-        name = str((request or {}).get("tool") or "none").lower()
         if name not in {"", "none"}:
             self.trace.log("tool_start", request=request, step_key=step_key)
-        result = self._run_code_experiment(request or {}, step_key) if name == "code_experiment" else self.registry.execute(request)
-        if result:
-            self.trace.log("tool_result", step_key=step_key, **result.as_dict())
-        self._cache_put(step_key, {"status": "COMPLETE", "fingerprint": fingerprint, "result": result.as_dict() if result else None, "completed_at": now_iso()})
-        return result
+        tool_result: ToolResult | None = self._run_code_experiment(request or {}, step_key) if name == "code_experiment" else self.registry.execute(request)
+        tool_result = self._normalize_structural_counterexample(tool_result)
+        if tool_result:
+            self.trace.log("tool_result", step_key=step_key, **tool_result.as_dict())
+        self._cache_put(step_key, {"status": "COMPLETE", "fingerprint": fingerprint, "result": tool_result.as_dict() if tool_result else None, "completed_at": now_iso()})
+        return tool_result
 
     def _iteration_item(self, iteration: int):
         candidates = [item for item in self.state.list_items(kind="conjecture") if int(item.metadata.get("iteration", -1)) == iteration]
@@ -497,6 +606,10 @@ class TheoremResearchLab:
                     f"Iteration {iteration} legacy integrity mismatch: cached proposal claim differs from ledger item {item.id}."
                 )
         self.step_store.update_iteration_payload(iteration, proposal=proposal, proposal_hash=proposal_hash, item_id=item.id)
+        self._active_iteration = int(iteration)
+        self._active_item_id = item.id
+        self._active_claim_hash = content_fingerprint("claim:v1", item.claim)
+        self._active_claim_sha256 = hashlib.sha256(item.claim.encode("utf-8")).hexdigest()
         return item
 
     def run(
@@ -514,33 +627,33 @@ class TheoremResearchLab:
         literature_query: str | None = None,
         checkpoint_every: int = 2,
     ) -> str:
-        if code_agent is None:
-            code_agent = Agent(
-                name="CodeExperimentAgent",
-                system_prompt=CODE_EXPERIMENT_SYSTEM_PROMPT,
-                model=str(self.code_settings.get("model") or os.environ.get("LAB_CODE_EXPERIMENT_MODEL") or proposer.model),
-                temperature=0.2,
-                max_tokens=proposer.max_tokens,
-            )
-        elif not code_agent.system_prompt.strip():
-            code_agent.system_prompt = CODE_EXPERIMENT_SYSTEM_PROMPT
-        self.code_agent = code_agent
-        agents = {
-            "ResearchManager": manager,
-            "Theorist": proposer,
-            "AdversarialCritic": critic,
-            "VerificationEngineer": verifier,
-            "IndependentAuditor": auditor,
-        }
-        if literature_agent is not None:
-            agents["LiteratureScout"] = literature_agent
-        agents["CodeExperimentAgent"] = code_agent
-        self._save_config(problem, iterations, literature_query, checkpoint_every, agents)
-        self.controller.clear_stale_stop()
         try:
             with self.controller.lock:
                 self.trace.log("project_lock_acquired", project_root=str(self.state.root), pid=os.getpid())
                 try:
+                    if code_agent is None:
+                        code_agent = Agent(
+                            name="CodeExperimentAgent",
+                            system_prompt=CODE_EXPERIMENT_SYSTEM_PROMPT,
+                            model=str(self.code_settings.get("model") or os.environ.get("LAB_CODE_EXPERIMENT_MODEL") or proposer.model),
+                            temperature=0.2,
+                            max_tokens=proposer.max_tokens,
+                        )
+                    elif not code_agent.system_prompt.strip():
+                        code_agent.system_prompt = CODE_EXPERIMENT_SYSTEM_PROMPT
+                    self.code_agent = code_agent
+                    agents = {
+                        "ResearchManager": manager,
+                        "Theorist": proposer,
+                        "AdversarialCritic": critic,
+                        "VerificationEngineer": verifier,
+                        "IndependentAuditor": auditor,
+                    }
+                    if literature_agent is not None:
+                        agents["LiteratureScout"] = literature_agent
+                    agents["CodeExperimentAgent"] = code_agent
+                    self._save_config(problem, iterations, literature_query, checkpoint_every, agents)
+                    self.controller.clear_stale_stop()
                     result = self._run_inner(
                         problem,
                         manager=manager,
@@ -555,16 +668,25 @@ class TheoremResearchLab:
                     )
                     self._set_runtime(status="COMPLETED", last_error="")
                     return result
+                except ResearchStopped as exc:
+                    self._set_runtime(status="STOPPED", last_error=str(exc))
+                    self.trace.log("run_stopped", error=str(exc))
+                    return "# Araştırma durduruldu\n\nKalıcı state, iteration snapshot ve tamamlanan adımlar korundu. Devam edildiğinde ilk tamamlanmamış adımdan ilerlenir."
+                except ResearchPaused as exc:
+                    self._set_runtime(status="PAUSED_ERROR", last_error=str(exc))
+                    self.trace.log("run_paused", error=str(exc))
+                    return f"# Araştırma hata nedeniyle beklemeye alındı\n\n{exc}\n\nBelirsiz/bozuk structured output veya integrity uyuşmazlığı sessizce geçilmedi."
+                except Exception as exc:
+                    self._set_runtime(status="PAUSED_ERROR", last_error=repr(exc))
+                    self.trace.log("run_unhandled_error", error=repr(exc))
+                    raise
                 finally:
                     self.trace.log("project_lock_releasing", project_root=str(self.state.root))
-        except ResearchStopped as exc:
-            self._set_runtime(status="STOPPED", last_error=str(exc))
-            self.trace.log("run_stopped", error=str(exc))
-            return "# Araştırma durduruldu\n\nKalıcı state, iteration snapshot ve tamamlanan adımlar korundu. Devam edildiğinde ilk tamamlanmamış adımdan ilerlenir."
-        except ResearchPaused as exc:
-            self._set_runtime(status="PAUSED_ERROR", last_error=str(exc))
-            self.trace.log("run_paused", error=str(exc))
-            return f"# Araştırma hata nedeniyle beklemeye alındı\n\n{exc}\n\nBelirsiz/bozuk structured output veya integrity uyuşmazlığı sessizce geçilmedi."
+        finally:
+            self._active_iteration = None
+            self._active_item_id = ""
+            self._active_claim_hash = ""
+            self._active_claim_sha256 = ""
 
     def _run_inner(
         self,
@@ -644,10 +766,18 @@ class TheoremResearchLab:
             )
             decision = str(manager_decision.get("decision") or "REVISE").upper()
             requested_status = str(manager_decision.get("status") or "OPEN").upper()
-            # Formal verification is machine-triggered; manager omission cannot hide it.
             if tool_result and tool_result.tool == "lean" and tool_result.ok and (tool_result.metadata or {}).get("formal_verified"):
                 requested_status = "PROVEN"
-            guard = choose_status(requested_status, tool_result=tool_result, verifier=verification, critic=critique)
+            expected_claim_hash = content_fingerprint("claim:v1", item.claim)
+            guard = choose_status(
+                requested_status,
+                tool_result=tool_result,
+                verifier=verification,
+                critic=critique,
+                expected_item_id=item.id,
+                expected_iteration=iteration,
+                expected_claim_hash=expected_claim_hash,
+            )
             status = guard.granted
             if guard.downgraded:
                 self.trace.log(
@@ -678,14 +808,11 @@ class TheoremResearchLab:
                 if tool_result:
                     evidence.append("Tool: " + json.dumps(tool_result.as_dict(), ensure_ascii=False))
                 metadata: dict[str, Any] = {"status_guard": guard.metadata, "proposal_hash": item.metadata.get("proposal_hash")}
-                if status == "PROVEN" and tool_result:
-                    metadata.update(
-                        {
-                            "formal_verified": True,
-                            "lean_file": (tool_result.metadata or {}).get("file"),
-                            "lean_sha256": (tool_result.metadata or {}).get("lean_sha256"),
-                        }
-                    )
+                if status == "PROVEN" and tool_result and tool_result.tool == "lean":
+                    formal_metadata = dict(tool_result.metadata or {})
+                    formal_metadata["formal_verified"] = True
+                    formal_metadata["lean_file"] = str(formal_metadata.get("file") or "")
+                    metadata.update(formal_metadata)
                 self.state.update_item(item.id, status=status, evidence=evidence, metadata=metadata)
 
             old_status = item.status
