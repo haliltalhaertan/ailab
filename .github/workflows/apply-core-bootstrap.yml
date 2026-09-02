@@ -1,0 +1,62 @@
+name: apply-core-bootstrap
+
+on:
+  push:
+    branches:
+      - feat/evidence-driven-core
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Patch contract binding into ResearchState
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("lab/research_state.py")
+          text = path.read_text(encoding="utf-8")
+          import_old = "from lab.integrity import EvidenceSigner, atomic_write_json, read_json_tolerant, sha256_file\n"
+          import_new = import_old + "from lab.research_contract import ResearchContract\n"
+          if "from lab.research_contract import ResearchContract" not in text:
+              if import_old not in text:
+                  raise SystemExit("research_state import anchor not found")
+              text = text.replace(import_old, import_new, 1)
+
+          old = '''    def freeze_problem(\n        self,\n        problem: str,\n        metadata: dict[str, Any] | None = None,\n        *,\n        overwrite: bool = False,\n    ) -> None:\n        payload = {"problem": problem.strip(), "metadata": metadata or {}, "frozen_at": _now()}\n        if self.problem_path.exists() and not overwrite:\n            existing = read_json_tolerant(self.problem_path, {})\n            if str(existing.get("problem", "")).strip() != problem.strip():\n                raise ValueError(\n                    "Bu research_state başka bir problem için dondurulmuş. Yeni bir project_id kullan veya overwrite=True ver."\n                )\n            return\n        atomic_write_json(self.problem_path, payload)\n'''
+          new = '''    def freeze_problem(\n        self,\n        problem: str,\n        metadata: dict[str, Any] | None = None,\n        *,\n        overwrite: bool = False,\n    ) -> None:\n        contract = ResearchContract.load_optional(self.root)\n        merged_metadata = dict(metadata or {})\n        if contract is not None:\n            if not contract.frozen:\n                raise ValueError("Research contract must be frozen before a research run.")\n            if contract.problem.strip() != problem.strip():\n                raise ValueError("Research contract problem does not match problem_frozen.json / run problem.")\n            merged_metadata["contract_hash"] = contract.contract_hash\n\n        payload = {"problem": problem.strip(), "metadata": merged_metadata, "frozen_at": _now()}\n        if self.problem_path.exists() and not overwrite:\n            existing = read_json_tolerant(self.problem_path, {})\n            if str(existing.get("problem", "")).strip() != problem.strip():\n                raise ValueError(\n                    "Bu research_state başka bir problem için dondurulmuş. Yeni bir project_id kullan veya overwrite=True ver."\n                )\n            if contract is not None:\n                existing_metadata = dict(existing.get("metadata") or {})\n                bound_hash = str(existing_metadata.get("contract_hash") or "")\n                if bound_hash and bound_hash != contract.contract_hash:\n                    raise ValueError("Research contract hash mismatch against the frozen project binding.")\n                if not bound_hash:\n                    existing_metadata["contract_hash"] = contract.contract_hash\n                    existing["metadata"] = existing_metadata\n                    atomic_write_json(self.problem_path, existing)\n            return\n        atomic_write_json(self.problem_path, payload)\n'''
+          if old not in text:
+              raise SystemExit("freeze_problem anchor not found")
+          text = text.replace(old, new, 1)
+
+          old_checkpoint = '''        payload = {\n            "created_at": _now(),\n            "label": label,\n            "note": note,\n            "problem": self.frozen_problem(),\n            "state": self._read_state(),\n            "revision": self.revision(),\n        }\n'''
+          new_checkpoint = '''        contract = ResearchContract.load_optional(self.root)\n        payload = {\n            "created_at": _now(),\n            "label": label,\n            "note": note,\n            "problem": self.frozen_problem(),\n            "contract_hash": contract.contract_hash if contract is not None and contract.frozen else "",\n            "state": self._read_state(),\n            "revision": self.revision(),\n        }\n'''
+          if old_checkpoint not in text:
+              raise SystemExit("checkpoint anchor not found")
+          text = text.replace(old_checkpoint, new_checkpoint, 1)
+          path.write_text(text, encoding="utf-8")
+          PY
+      - name: Run contract tests
+        run: |
+          python -m pip install -e ".[dev]"
+          pytest -q tests/test_research_contract.py tests/test_proven_end_to_end.py
+          ruff check lab/research_contract.py lab/research_state.py tests/test_research_contract.py
+          mypy lab/research_contract.py lab/research_state.py
+      - name: Commit patch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add lab/research_state.py
+          git diff --cached --quiet && exit 0
+          git commit -m "feat(contract): bind frozen contract to run state"
+          git push origin HEAD:feat/evidence-driven-core
