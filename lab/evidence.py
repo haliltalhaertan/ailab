@@ -289,6 +289,15 @@ def validate_evidence_binding(
 ) -> Evidence:
     if evidence.termination_reason != "completed":
         return evidence.downgrade("termination was not completed", downgraded_from=evidence.kind)
+    if evidence.source_origin == "GENERATED" and evidence.kind not in {
+        "NUMERICAL_PASS",
+        "SOLVER_RESULT",
+        "INCONCLUSIVE",
+    }:
+        return evidence.downgrade(
+            "generated evidence cannot claim a strong evidence kind",
+            downgraded_from=evidence.kind,
+        )
     if contract is None:
         return evidence
     if not contract.frozen or evidence.contract_hash != contract.contract_hash:
