@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import time
 import uuid
 from dataclasses import dataclass, field
 from itertools import product
@@ -32,9 +34,22 @@ class ToolResult:
             "metadata": self.metadata,
         }
 
+    def as_evidence(
+        self,
+        *,
+        request: dict[str, Any] | None = None,
+        contract=None,
+        target_id: str | None = None,
+    ):
+        from lab.evidence import evidence_from_tool_result
+
+        return evidence_from_tool_result(
+            self, request=request, contract=contract, target_id=target_id
+        )
+
 
 class ScriptTool:
-    """Runs only human-reviewed Python scripts checked into research_tools/."""
+    """Runs only checked-in research scripts; static AST policy caps evidence."""
 
     def __init__(self, root: str | Path = "research_tools", timeout_s: int = 30):
         self.root = Path(root).resolve()
@@ -52,11 +67,76 @@ class ScriptTool:
             raise FileNotFoundError(candidate)
         return candidate
 
+    @staticmethod
+    def _literal_assignment(tree: ast.Module, name: str):
+        for node in tree.body:
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if not any(isinstance(target, ast.Name) and target.id == name for target in targets):
+                continue
+            value = node.value
+            if value is None:
+                return None
+            try:
+                return ast.literal_eval(value)
+            except (ValueError, TypeError):
+                return None
+        return None
+
+    @classmethod
+    def _policy(cls, script: Path) -> dict[str, Any]:
+        try:
+            tree = ast.parse(script.read_text(encoding="utf-8"), filename=str(script))
+        except (OSError, SyntaxError):
+            return {
+                "allowed_evidence_kinds": ["INCONCLUSIVE"],
+                "accepts_specification": False,
+                "evidence_role": "GENERAL",
+                "policy_error": "static declarations could not be parsed",
+            }
+        raw_allowed = cls._literal_assignment(tree, "AILAB_ALLOWED_EVIDENCE_KINDS")
+        allowed = (
+            {str(value).upper() for value in raw_allowed}
+            if isinstance(raw_allowed, (list, tuple, set))
+            else {"NUMERICAL_PASS", "INCONCLUSIVE"}
+        )
+        accepts_specification = cls._literal_assignment(tree, "AILAB_ACCEPTS_SPECIFICATION") is True
+        role = str(cls._literal_assignment(tree, "AILAB_EVIDENCE_ROLE") or "GENERAL").upper()
+        policy_error = ""
+        if "FORMAL_PROOF" in allowed:
+            allowed = {"INCONCLUSIVE"}
+            policy_error = "checked-in scripts cannot self-declare FORMAL_PROOF"
+        if accepts_specification:
+            allowed &= {"SOLVER_RESULT", "NUMERICAL_PASS", "INCONCLUSIVE"}
+        allowed.add("INCONCLUSIVE")
+        if role not in {"SEARCH_CERTIFICATE", "INDEPENDENT_CHECKER", "GENERAL"}:
+            role = "GENERAL"
+        return {
+            "allowed_evidence_kinds": sorted(allowed),
+            "accepts_specification": accepts_specification,
+            "evidence_role": role,
+            "policy_error": policy_error,
+        }
+
+    @staticmethod
+    def _payload(stdout: str) -> dict[str, Any] | None:
+        lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+        if not lines:
+            return None
+        try:
+            payload = json.loads(lines[-1])
+        except json.JSONDecodeError:
+            return None
+        return dict(payload) if isinstance(payload, dict) else None
+
     def run(self, name: str, args: list[str] | None = None) -> ToolResult:
+        started = time.monotonic()
         try:
             script = self._resolve(name)
         except Exception as exc:
-            return ToolResult(False, "script", error=str(exc))
+            return ToolResult(False, "script", error=str(exc), metadata={"runtime_s": time.monotonic() - started})
+        policy = self._policy(script)
         env = {"PATH": os.environ.get("PATH", ""), "PYTHONIOENCODING": "utf-8"}
         try:
             proc = subprocess.run(
@@ -69,18 +149,35 @@ class ScriptTool:
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:
-            return ToolResult(False, "script", error=f"timeout ({self.timeout_s}s): {exc}")
+            return ToolResult(
+                False,
+                "script",
+                error=f"timeout ({self.timeout_s}s): {exc}",
+                metadata={
+                    **policy,
+                    "script": name,
+                    "args": args or [],
+                    "script_sha256": sha256_file(script),
+                    "runtime_s": time.monotonic() - started,
+                },
+            )
+        payload = self._payload(proc.stdout)
+        metadata = {
+            **policy,
+            "returncode": proc.returncode,
+            "script": name,
+            "args": args or [],
+            "script_sha256": sha256_file(script),
+            "runtime_s": time.monotonic() - started,
+        }
+        if payload is not None:
+            metadata["evidence_payload"] = payload
         return ToolResult(
             proc.returncode == 0,
             "script",
             output=proc.stdout.strip(),
             error=proc.stderr.strip(),
-            metadata={
-                "returncode": proc.returncode,
-                "script": name,
-                "args": args or [],
-                "script_sha256": sha256_file(script),
-            },
+            metadata=metadata,
         )
 
 

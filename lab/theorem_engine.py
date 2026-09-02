@@ -11,10 +11,12 @@ from typing import Any
 from lab.agent import Agent
 from lab.code_experiment import CODE_EXPERIMENT_SYSTEM_PROMPT, CodeExperimentRunner, GuardedExperimentWorkspace, WorkspaceActionResult
 from lab.code_experiment_settings import load_code_experiment_settings, load_code_experiment_settings_from_dict
+from lab.evidence import evidence_from_tool_result, validate_evidence_binding
 from lab.integrity import content_fingerprint, sha256_file
 from lab.json_io import StructuredOutputError, parse_json_object, repair_instruction
 from lab.literature import LiteratureClient, LiteratureSearchEmpty, Paper
 from lab.prompts import checkpoint_prompt, critic_prompt, literature_prompt, manager_prompt, proposal_prompt, verifier_prompt
+from lab.research_contract import ResearchContract
 from lab.research_state import ResearchState
 from lab.run_controller import ResearchPaused, ResearchStopped, RunController, atomic_json, now_iso, retryable
 from lab.status_guard import choose_status
@@ -702,7 +704,10 @@ class TheoremResearchLab:
         literature_query: str | None,
         checkpoint_every: int,
     ) -> str:
-        self.state.freeze_problem(problem)
+        try:
+            self.state.freeze_problem(problem)
+        except ValueError as exc:
+            raise ResearchPaused(f"Research contract integrity error: {exc}") from exc
         self.trace.log("problem_frozen", problem=problem)
         runtime = self._runtime()
         completed = int(runtime.get("completed_iterations", 0) or 0)
@@ -748,6 +753,34 @@ class TheoremResearchLab:
             request = proposal.get("tool_request")
             tool_request = request if isinstance(request, dict) else None
             tool_result = self._tool(tool_request, f"iter:{iteration}:tool")
+            contract = ResearchContract.load_optional(self.state.root)
+            target_id = str(proposal.get("target_id") or "").strip() or None
+            bound_evidence = None
+            if tool_result is not None:
+                try:
+                    bound_evidence = evidence_from_tool_result(
+                        tool_result,
+                        request=tool_request,
+                        contract=contract,
+                        target_id=target_id,
+                    )
+                    bound_evidence = validate_evidence_binding(bound_evidence, contract=contract)
+                except (KeyError, ValueError) as exc:
+                    self.trace.log(
+                        "evidence_binding_rejected",
+                        iteration=iteration,
+                        item_id=item.id,
+                        target_id=target_id,
+                        error=str(exc),
+                    )
+                if bound_evidence is not None:
+                    self.trace.log(
+                        "tool_result_evidence",
+                        iteration=iteration,
+                        item_id=item.id,
+                        evidence_kind=bound_evidence.kind,
+                        evidence=bound_evidence.as_dict(),
+                    )
 
             verification = self._call_json(
                 verifier,
@@ -777,6 +810,8 @@ class TheoremResearchLab:
                 expected_item_id=item.id,
                 expected_iteration=iteration,
                 expected_claim_hash=expected_claim_hash,
+                evidence=bound_evidence,
+                contract=contract,
             )
             status = guard.granted
             if guard.downgraded:
@@ -791,12 +826,17 @@ class TheoremResearchLab:
                 )
 
             counterexample = str(verification.get("counterexample") or critique.get("counterexample") or "").strip()
-            tool_counterexample = bool(tool_result and tool_result.tool == "tropical_grid" and str((tool_result.metadata or {}).get("status") or "").upper() == "COUNTEREXAMPLE")
-            if status == "FAIL" and (tool_counterexample or counterexample):
+            deterministic_tool_counterexample = bool(
+                bound_evidence
+                and bound_evidence.kind == "DETERMINISTIC_COUNTEREXAMPLE"
+                and bound_evidence.witness is not None
+            )
+            if status == "FAIL" and (deterministic_tool_counterexample or counterexample):
                 existing = [x for x in self.state.list_items(kind="counterexample") if x.metadata.get("target_id") == item.id]
                 if not existing:
-                    desc = "Deterministic tropical grid counterexample" if tool_counterexample else counterexample
-                    counter = self.state.add_counterexample(item.id, desc, payload=(tool_result.metadata if tool_counterexample and tool_result else None))
+                    desc = "Deterministically verified tool counterexample" if deterministic_tool_counterexample else counterexample
+                    payload = bound_evidence.witness if deterministic_tool_counterexample and bound_evidence else None
+                    counter = self.state.add_counterexample(item.id, desc, payload=payload)
                     self.trace.log("state_change", action="counterexample", item_id=counter.id, target_id=item.id, kind="counterexample", status="KNOWN", detail=desc)
             else:
                 evidence = [
@@ -807,7 +847,12 @@ class TheoremResearchLab:
                 ]
                 if tool_result:
                     evidence.append("Tool: " + json.dumps(tool_result.as_dict(), ensure_ascii=False))
-                metadata: dict[str, Any] = {"status_guard": guard.metadata, "proposal_hash": item.metadata.get("proposal_hash")}
+                metadata: dict[str, Any] = {
+                    "status_guard": guard.metadata,
+                    "proposal_hash": item.metadata.get("proposal_hash"),
+                }
+                if bound_evidence is not None:
+                    metadata["evidence"] = bound_evidence.as_dict()
                 if status == "PROVEN" and tool_result and tool_result.tool == "lean":
                     formal_metadata = dict(tool_result.metadata or {})
                     formal_metadata["formal_verified"] = True
