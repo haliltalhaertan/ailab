@@ -647,7 +647,15 @@ class TheoremResearchLab:
             # Formal verification is machine-triggered; manager omission cannot hide it.
             if tool_result and tool_result.tool == "lean" and tool_result.ok and (tool_result.metadata or {}).get("formal_verified"):
                 requested_status = "PROVEN"
-            guard = choose_status(requested_status, tool_result=tool_result, verifier=verification, critic=critique)
+            guard = choose_status(
+                requested_status,
+                tool_result=tool_result,
+                verifier=verification,
+                critic=critique,
+                expected_item_id=item.id,
+                expected_iteration=iteration,
+                expected_claim_hash=content_fingerprint("claim:v1", claim),
+            )
             status = guard.granted
             if guard.downgraded:
                 self.trace.log(
@@ -679,13 +687,10 @@ class TheoremResearchLab:
                     evidence.append("Tool: " + json.dumps(tool_result.as_dict(), ensure_ascii=False))
                 metadata: dict[str, Any] = {"status_guard": guard.metadata, "proposal_hash": item.metadata.get("proposal_hash")}
                 if status == "PROVEN" and tool_result:
-                    metadata.update(
-                        {
-                            "formal_verified": True,
-                            "lean_file": (tool_result.metadata or {}).get("file"),
-                            "lean_sha256": (tool_result.metadata or {}).get("lean_sha256"),
-                        }
-                    )
+                    formal_metadata = dict(tool_result.metadata or {})
+                    if formal_metadata.get("file") and not formal_metadata.get("lean_file"):
+                        formal_metadata["lean_file"] = formal_metadata["file"]
+                    metadata.update(formal_metadata)
                 self.state.update_item(item.id, status=status, evidence=evidence, metadata=metadata)
 
             old_status = item.status
