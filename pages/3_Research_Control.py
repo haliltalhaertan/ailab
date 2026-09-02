@@ -9,15 +9,16 @@ from lab.openrouter_catalog import fetch_openrouter_models
 from lab.project_manager import ProjectManager
 from lab.runtime_health import cleanup_stale_run
 from lab.step_store import StepStore
-from lab.ui_model import filter_models, load_run_events, runs_for_project
-from lab.worker_launcher import launch_theorem_worker, write_worker_request
+from lab.ui_live import render_now_and_timeline
+from lab.ui_model import filter_models, load_live_run_events, runs_for_project
+from lab.worker_launcher import launch_worker, write_worker_request
 
 ROOT = Path("research_state")
 RUNS = Path("runs")
 pm = ProjectManager(ROOT)
 st.set_page_config(page_title="Araştırma Kontrolü", layout="wide")
 st.title("Araştırma Kontrolü")
-st.caption("Teorem araştırması Streamlit'ten bağımsız worker process'te çalışır. Bu sayfadan izle, durdur veya devam ettir.")
+st.caption("Tüm deneyler Streamlit'ten bağımsız worker process'te çalışır. Buradan canlı izle, durdur veya yeniden başlat.")
 
 FALLBACK_MODELS = [
     "openai/gpt-4o-mini",
@@ -67,7 +68,12 @@ if not projects:
 ids = [p.project_id for p in projects]
 active_id = pm.active_project_id()
 index = ids.index(active_id) if active_id in ids else 0
-selected_id = st.selectbox("Proje", ids, index=index, format_func=lambda pid: next((p.title for p in projects if p.project_id == pid), pid))
+selected_id = st.selectbox(
+    "Proje",
+    ids,
+    index=index,
+    format_func=lambda pid: next((p.title for p in projects if p.project_id == pid), pid),
+)
 if selected_id != active_id:
     pm.set_active(selected_id)
 project_info = pm.get(selected_id)
@@ -78,6 +84,11 @@ worker_path = project / "worker.json"
 request_path = project / "worker_request.json"
 stop_path = project / "stop.flag"
 store = StepStore(project)
+request = read_json(request_path, {})
+experiment_method = str(request.get("experiment_method") or "theorem_lab")
+experiment_name = str(request.get("experiment_name") or project_info.experiment or "Deney")
+
+st.caption(f"**{experiment_name}** · `{selected_id}` · method `{experiment_method}`")
 
 
 @st.fragment(run_every=1.0)
@@ -85,42 +96,24 @@ def live_status() -> None:
     current_info = pm.get(selected_id)
     runtime = dict(current_info.runtime or {})
     worker = read_json(worker_path, {})
-    counts = store.counts()
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Durum", current_info.status)
-    c2.metric("Tamamlanan tur", runtime.get("completed_iterations", 0))
-    c3.metric("Şu anki tur", runtime.get("current_iteration", 0))
-    c4.metric("Tamamlanan adım", counts["complete_steps"])
-    c5.metric("Partial", counts["partials"])
-    st.write("**Şu anki adım:**", runtime.get("current_step", "-"))
     if worker.get("pid"):
         st.caption(f"Worker PID: `{worker.get('pid')}` · run `{worker.get('run_id', '-')}`")
-    if current_info.status == "STALE_RUNNING":
-        st.warning(
-            "RUNNING kaydı canlı worker ile doğrulanamadı. "
-            + str(runtime.get("stale_reason") or "Worker/heartbeat bilgisi stale.")
-        )
-    if runtime.get("next_task"):
-        st.write("**Sonraki araştırma hedefi:**", runtime["next_task"])
     if runtime.get("last_error"):
-        st.error(runtime["last_error"])
+        st.error(str(runtime["last_error"]))
 
     run_dirs = runs_for_project(RUNS, selected_id, current_info.project_uuid)
-    if run_dirs:
-        latest = run_dirs[0]
-        events = load_run_events(latest, include_stream=False)[-15:]
-        if events:
-            with st.expander("Son olaylar", expanded=True):
-                for event in events:
-                    kind = event.get("type", "event")
-                    if kind == "iteration_end":
-                        st.write(f"Tur {event.get('iteration')}: {event.get('item_id')} → {event.get('status')}")
-                    elif kind == "status_downgraded_by_guard":
-                        st.warning(f"Guard {event.get('requested')} → {event.get('granted')}: {event.get('reason')}")
-                    elif kind in {"run_paused", "worker_error", "literature_search_inconclusive"}:
-                        st.warning(str(event.get("error") or event.get("warning") or kind))
-                    elif kind == "llm_call":
-                        st.caption(f"{event.get('agent')} tamamlandı · {event.get('total_tokens', 0)} token")
+    events = load_live_run_events(run_dirs[0]) if run_dirs else []
+    render_now_and_timeline(runtime, events, status=current_info.status)
+
+    if experiment_method == "theorem_lab":
+        counts = store.counts()
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Tamamlanan tur", runtime.get("completed_iterations", 0))
+        c2.metric("Şu anki tur", runtime.get("current_iteration", 0))
+        c3.metric("Tamamlanan adım", counts["complete_steps"])
+        c4.metric("Partial", counts["partials"])
+        if runtime.get("next_task"):
+            st.write("**Sonraki araştırma hedefi:**", runtime["next_task"])
 
     result_path = project / "worker_result.md"
     if result_path.exists() and current_info.status in {"COMPLETED", "STOPPED", "PAUSED_ERROR", "INTERRUPTED"}:
@@ -130,11 +123,17 @@ def live_status() -> None:
 
 live_status()
 
+current_info = pm.get(selected_id)
 left, right = st.columns(2)
 with left:
-    if st.button("DURDUR", type="primary", use_container_width=True):
+    if st.button(
+        "DURDUR",
+        type="primary",
+        use_container_width=True,
+        disabled=current_info.status != "RUNNING",
+    ):
         stop_path.write_text("stop requested\n", encoding="utf-8")
-        st.warning("Durdurma isteği yazıldı. Worker LLM/deney adımını mümkün olan ilk güvenli noktada durduracak.")
+        st.warning("Durdurma isteği yazıldı. Worker mümkün olan ilk güvenli noktada duracak.")
 with right:
     if st.button("Durdurma isteğini iptal et", use_container_width=True):
         stop_path.unlink(missing_ok=True)
@@ -142,102 +141,138 @@ with right:
 
 current_info = pm.get(selected_id)
 if current_info.status == "STALE_RUNNING":
-    st.warning("Stale worker kaydı bulundu. Temizlemek yalnız stale run.lock/runtime işaretini kaldırır; step cache ve partial içerikler korunur.")
+    st.warning(
+        "Stale worker kaydı bulundu. Temizlemek yalnız stale run.lock/runtime işaretini kaldırır; "
+        "theorem step cache ve partial içerikler varsa korunur."
+    )
     if st.button("Stale run'ı temizle", use_container_width=True):
         try:
             cleanup_stale_run(project)
         except Exception as exc:
             st.exception(exc)
         else:
-            st.success("Stale run temizlendi; durum INTERRUPTED. Kaldığı yerden devam edebilirsin.")
+            st.success("Stale run temizlendi; durum INTERRUPTED.")
             st.rerun()
 
 st.divider()
-st.subheader("Kaldığı yerden devam et")
 config = read_json(config_path, {})
-if not config:
-    st.warning("Bu proje için run_config.json yok. Ana sayfada ilk theorem run'ını başlat.")
-else:
-    st.caption(
-        "Model değiştirirsen yalnız henüz tamamlanmamış adımlar yeni modeli kullanır. Tamamlanmış step cache'i model değişikliği yüzünden yeniden ücretlendirilmez. "
-        "System prompt / temperature / reasoning effort değişirse ilgili step fingerprint'i bilinçli olarak değişir."
-    )
-    model_ids, model_labels, model_error = model_catalog()
-    if model_error:
-        st.warning(f"OpenRouter katalog uyarısı: {model_error}")
-    edited_agents: dict[str, dict] = {}
-    changed_models: list[str] = []
-    for role, raw in config.get("agents", {}).items():
-        st.write(f"**{role}**")
-        st.caption(f"reasoning: `{raw.get('reasoning_effort') or 'provider-default'}`")
-        wanted_default = str(raw.get("model") or "")
-        query = st.text_input(
-            f"{role} model ara",
-            placeholder="örn. glm, kimi, 5.3, flash",
-            key=f"resume_search_{selected_id}_{role}",
-        )
-        choices = filter_models(model_ids, model_labels, query)
-        if not query and wanted_default and wanted_default not in choices:
-            choices.insert(0, wanted_default)
-            model_labels.setdefault(wanted_default, wanted_default)
-        if choices:
-            preferred = wanted_default if wanted_default in choices else choices[0]
-            selected_model = st.selectbox(
-                f"{role} OpenRouter modeli",
-                choices,
-                index=choices.index(preferred),
-                format_func=lambda mid: model_labels.get(mid, mid),
-                key=f"resume_model_{selected_id}_{role}_{query.casefold()}",
-            )
-        else:
-            st.warning("Eşleşen model yok. Manuel model ID girebilirsin.")
-            selected_model = wanted_default
-        manual = st.text_input(
-            f"{role} manuel model ID (opsiyonel)",
-            key=f"resume_manual_{selected_id}_{role}",
-        ).strip()
-        value = manual or selected_model
-        st.caption(f"Kullanılacak model: `{value}`")
-        edited = dict(raw)
-        edited["model"] = value
-        edited_agents[role] = edited
-        if value != wanted_default:
-            changed_models.append(role)
-    if changed_models:
-        st.info("Model override: " + ", ".join(changed_models) + ". Tamamlanmış adımlar korunacak; override yalnız incomplete/partial adımlarda etkili.")
 
-    current_info = pm.get(selected_id)
-    running = current_info.status == "RUNNING"
-    if st.button("ŞİMDİ DEVAM ET", type="primary", use_container_width=True, disabled=running):
+if experiment_method != "theorem_lab":
+    st.subheader("Yeniden çalıştır")
+    st.caption(
+        "Theorem dışı deneylerde step-level resume yoktur. Aynı worker isteğini yeni bir run olarak yeniden başlatabilirsin."
+    )
+    running = pm.get(selected_id).status == "RUNNING"
+    if not request:
+        st.warning("Yeniden çalıştırılacak worker_request.json bulunamadı.")
+    elif st.button("YENİDEN ÇALIŞTIR", type="primary", use_container_width=True, disabled=running):
         stop_path.unlink(missing_ok=True)
-        frozen = read_json(project / "problem_frozen.json", {})
-        request = {
-            "request_version": 1,
-            "project_id": selected_id,
-            "project_uuid": project_info.project_uuid,
-            "problem": str(config.get("problem") or frozen.get("problem") or ""),
-            "iterations": int(config.get("iterations", 5)),
-            "literature_query": config.get("literature_query"),
-            "checkpoint_every": int(config.get("checkpoint_every", 2)),
-            "agents": edited_agents,
-            "code_experiment": config.get("code_experiment") or {},
-        }
-        write_worker_request(project, request)
+        retry_request = dict(request)
+        retry_request["project_id"] = selected_id
+        retry_request["project_uuid"] = project_info.project_uuid
+        write_worker_request(project, retry_request)
         try:
-            pid = launch_theorem_worker(selected_id, root=ROOT)
+            pid = launch_worker(selected_id, root=ROOT)
         except Exception as exc:
             st.exception(exc)
         else:
             st.success(f"Worker başlatıldı: PID {pid}")
             st.rerun()
+else:
+    st.subheader("Kaldığı yerden devam et")
+    if not config:
+        st.warning("Bu proje için run_config.json yok. Ana sayfada ilk theorem run'ını başlat.")
+    else:
+        st.caption(
+            "Model değiştirirsen yalnız henüz tamamlanmamış adımlar yeni modeli kullanır. Tamamlanmış step cache'i "
+            "model değişikliği yüzünden yeniden ücretlendirilmez. System prompt / temperature / reasoning effort değişirse "
+            "ilgili step fingerprint'i bilinçli olarak değişir."
+        )
+        model_ids, model_labels, model_error = model_catalog()
+        if model_error:
+            st.warning(f"OpenRouter katalog uyarısı: {model_error}")
+        edited_agents: dict[str, dict] = {}
+        changed_models: list[str] = []
+        for role, raw in config.get("agents", {}).items():
+            st.write(f"**{role}**")
+            st.caption(f"reasoning: `{raw.get('reasoning_effort') or 'provider-default'}`")
+            wanted_default = str(raw.get("model") or "")
+            query = st.text_input(
+                f"{role} model ara",
+                placeholder="örn. glm, kimi, 5.3, flash",
+                key=f"resume_search_{selected_id}_{role}",
+            )
+            choices = filter_models(model_ids, model_labels, query)
+            if not query and wanted_default and wanted_default not in choices:
+                choices.insert(0, wanted_default)
+                model_labels.setdefault(wanted_default, wanted_default)
+            if choices:
+                preferred = wanted_default if wanted_default in choices else choices[0]
+                selected_model = st.selectbox(
+                    f"{role} OpenRouter modeli",
+                    choices,
+                    index=choices.index(preferred),
+                    format_func=lambda mid: model_labels.get(mid, mid),
+                    key=f"resume_model_{selected_id}_{role}_{query.casefold()}",
+                )
+            else:
+                st.warning("Eşleşen model yok. Manuel model ID girebilirsin.")
+                selected_model = wanted_default
+            manual = st.text_input(
+                f"{role} manuel model ID (opsiyonel)",
+                key=f"resume_manual_{selected_id}_{role}",
+            ).strip()
+            value = manual or selected_model
+            st.caption(f"Kullanılacak model: `{value}`")
+            edited = dict(raw)
+            edited["model"] = value
+            edited_agents[role] = edited
+            if value != wanted_default:
+                changed_models.append(role)
+        if changed_models:
+            st.info(
+                "Model override: "
+                + ", ".join(changed_models)
+                + ". Tamamlanmış adımlar korunacak; override yalnız incomplete/partial adımlarda etkili."
+            )
 
-with st.expander("Kaydedilmiş run config", expanded=False):
-    st.json(config)
+        running = pm.get(selected_id).status == "RUNNING"
+        if st.button("ŞİMDİ DEVAM ET", type="primary", use_container_width=True, disabled=running):
+            stop_path.unlink(missing_ok=True)
+            frozen = read_json(project / "problem_frozen.json", {})
+            resume_request = {
+                "request_version": 2,
+                "project_id": selected_id,
+                "project_uuid": project_info.project_uuid,
+                "experiment_method": "theorem_lab",
+                "experiment_name": "Teorem Araştırması",
+                "problem": str(config.get("problem") or frozen.get("problem") or ""),
+                "prompt": str(config.get("problem") or frozen.get("problem") or ""),
+                "iterations": int(config.get("iterations", 5)),
+                "param": int(config.get("iterations", 5)),
+                "literature_query": config.get("literature_query"),
+                "checkpoint_every": int(config.get("checkpoint_every", 2)),
+                "agents": edited_agents,
+                "optional_agents": {},
+                "code_experiment": config.get("code_experiment") or {},
+            }
+            write_worker_request(project, resume_request)
+            try:
+                pid = launch_worker(selected_id, root=ROOT)
+            except Exception as exc:
+                st.exception(exc)
+            else:
+                st.success(f"Worker başlatıldı: PID {pid}")
+                st.rerun()
+
+if experiment_method == "theorem_lab":
+    with st.expander("Kaydedilmiş run config", expanded=False):
+        st.json(config)
+    with st.expander("Partial/soft-resume adımları", expanded=False):
+        st.json(store.list_partials())
+    with st.expander("Step cache", expanded=False):
+        st.dataframe(store.list_steps(), use_container_width=True, hide_index=True)
 with st.expander("Runtime cursor", expanded=False):
     st.json(read_json(runtime_path, {}))
-with st.expander("Partial/soft-resume adımları", expanded=False):
-    st.json(store.list_partials())
-with st.expander("Step cache", expanded=False):
-    st.dataframe(store.list_steps(), use_container_width=True, hide_index=True)
 with st.expander("Worker isteği", expanded=False):
     st.json(read_json(request_path, {}))
