@@ -1,0 +1,40 @@
+name: baseline-probe
+
+on:
+  push:
+    branches:
+      - baseline/two-iteration-probe
+
+jobs:
+  real-llm-baseline:
+    runs-on: ubuntu-latest
+    env:
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: python -m pip install -e ".[dev]"
+      - name: Require OpenRouter secret
+        shell: bash
+        run: |
+          if [ -z "$OPENROUTER_API_KEY" ]; then
+            echo "::error::Repository secret OPENROUTER_API_KEY is not configured."
+            exit 2
+          fi
+      - name: Run two-iteration baseline
+        run: >-
+          python experiments/theorem_baseline_probe.py
+          --iterations 2
+          --model z-ai/glm-5.3-flash
+          --reasoning-effort low
+          --max-tokens 1200
+      - name: Upload baseline artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ailab-two-iteration-baseline
+          path: baseline_runs/
+          if-no-files-found: warn
