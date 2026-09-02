@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from lab.evidence import evidence_from_tool_result
 from lab.research_state import ResearchState
 from lab.status_guard import choose_status
 from lab.tools import ToolResult
@@ -38,9 +39,13 @@ def test_deterministic_tropical_counterexample_forces_fail_and_can_be_recorded(t
         "tropical_grid",
         metadata={"status": "COUNTEREXAMPLE", "weights": {"1-2": 0}},
     )
+    evidence = evidence_from_tool_result(tool)
+    assert evidence.kind == "DETERMINISTIC_COUNTEREXAMPLE"
+    assert evidence.ok is True
     decision = choose_status(
         "OPEN",
         tool_result=tool,
+        evidence=evidence,
         verifier={"verdict": "INCONCLUSIVE", "counterexample": ""},
         critic={"verdict": "KEEP", "counterexample": ""},
     )
@@ -58,7 +63,7 @@ def test_deterministic_tropical_counterexample_forces_fail_and_can_be_recorded(t
     assert counterexample.metadata["target_id"] == candidate.id
 
 
-def test_verified_script_counterexample_is_deterministic():
+def test_unbound_script_metadata_cannot_self_declare_counterexample():
     decision = choose_status(
         "OPEN",
         tool_result=ToolResult(
@@ -69,5 +74,5 @@ def test_verified_script_counterexample_is_deterministic():
         verifier={"verdict": "INCONCLUSIVE", "counterexample": ""},
         critic={"verdict": "KEEP", "counterexample": ""},
     )
-    assert decision.granted == "FAIL"
-    assert decision.metadata["deterministic_counterexample_type"] == "VERIFIED_TOOL"
+    assert decision.granted == "OPEN"
+    assert decision.metadata["deterministic_counterexample"] is False

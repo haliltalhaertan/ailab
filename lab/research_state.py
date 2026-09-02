@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from lab.integrity import EvidenceSigner, atomic_write_json, read_json_tolerant, sha256_file
+from lab.research_contract import ResearchContract
 
 
 VALID_STATUSES = {
@@ -194,13 +195,31 @@ class ResearchState:
         *,
         overwrite: bool = False,
     ) -> None:
-        payload = {"problem": problem.strip(), "metadata": metadata or {}, "frozen_at": _now()}
+        contract = ResearchContract.load_optional(self.root)
+        merged_metadata = dict(metadata or {})
+        if contract is not None:
+            if not contract.frozen:
+                raise ValueError("Research contract must be frozen before a research run.")
+            if contract.problem.strip() != problem.strip():
+                raise ValueError("Research contract problem does not match problem_frozen.json / run problem.")
+            merged_metadata["contract_hash"] = contract.contract_hash
+
+        payload = {"problem": problem.strip(), "metadata": merged_metadata, "frozen_at": _now()}
         if self.problem_path.exists() and not overwrite:
             existing = read_json_tolerant(self.problem_path, {})
             if str(existing.get("problem", "")).strip() != problem.strip():
                 raise ValueError(
                     "Bu research_state başka bir problem için dondurulmuş. Yeni bir project_id kullan veya overwrite=True ver."
                 )
+            if contract is not None:
+                existing_metadata = dict(existing.get("metadata") or {})
+                bound_hash = str(existing_metadata.get("contract_hash") or "")
+                if bound_hash and bound_hash != contract.contract_hash:
+                    raise ValueError("Research contract hash mismatch against the frozen project binding.")
+                if not bound_hash:
+                    existing_metadata["contract_hash"] = contract.contract_hash
+                    existing["metadata"] = existing_metadata
+                    atomic_write_json(self.problem_path, existing)
             return
         atomic_write_json(self.problem_path, payload)
 
@@ -375,11 +394,13 @@ class ResearchState:
 
     def checkpoint(self, label: str, note: str = "") -> Path:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        contract = ResearchContract.load_optional(self.root)
         payload = {
             "created_at": _now(),
             "label": label,
             "note": note,
             "problem": self.frozen_problem(),
+            "contract_hash": contract.contract_hash if contract is not None and contract.frozen else "",
             "state": self._read_state(),
             "revision": self.revision(),
         }
