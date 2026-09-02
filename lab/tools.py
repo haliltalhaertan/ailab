@@ -49,23 +49,51 @@ class ToolResult:
 
 
 class ScriptTool:
-    """Runs only checked-in research scripts; static AST policy caps evidence."""
+    """Runs only checked-in scripts from explicit trusted roots.
 
-    def __init__(self, root: str | Path = "research_tools", timeout_s: int = 30):
-        self.root = Path(root).resolve()
+    ``research_tools/`` remains the primary root. Production may add
+    ``problem_packs/`` as a second human-reviewed root; relative paths are
+    resolved independently inside each root and ambiguity fails closed.
+    """
+
+    def __init__(
+        self,
+        root: str | Path = "research_tools",
+        timeout_s: int = 30,
+        *,
+        trusted_roots: list[str | Path] | tuple[str | Path, ...] | None = None,
+    ):
+        roots = [Path(root).resolve()]
+        for raw in trusted_roots or ():
+            candidate = Path(raw).resolve()
+            if candidate not in roots:
+                roots.append(candidate)
+        self.root = roots[0]
+        self.trusted_roots = tuple(roots)
         self.timeout_s = int(timeout_s)
 
-    def _resolve(self, name: str) -> Path:
-        candidate = (self.root / name).resolve()
-        try:
-            candidate.relative_to(self.root)
-        except ValueError as exc:
-            raise ValueError("Script path research_tools dışına çıkamaz.") from exc
-        if candidate.suffix != ".py":
+    def _resolve(self, name: str) -> tuple[Path, Path]:
+        requested = Path(str(name or ""))
+        if requested.is_absolute() or ".." in requested.parts:
+            raise ValueError("Script path trusted roots dışına çıkamaz.")
+        if requested.suffix != ".py":
             raise ValueError("Yalnızca .py araştırma scriptleri çalıştırılabilir.")
-        if not candidate.is_file():
-            raise FileNotFoundError(candidate)
-        return candidate
+
+        matches: list[tuple[Path, Path]] = []
+        for root in self.trusted_roots:
+            candidate = (root / requested).resolve()
+            try:
+                candidate.relative_to(root)
+            except ValueError:
+                continue
+            if candidate.is_file():
+                matches.append((candidate, root))
+
+        if len(matches) > 1:
+            raise ValueError("Script birden fazla trusted root içinde bulundu; belirsiz yol reddedildi.")
+        if matches:
+            return matches[0]
+        raise FileNotFoundError((self.root / requested).resolve())
 
     @staticmethod
     def _literal_assignment(tree: ast.Module, name: str):
@@ -133,7 +161,7 @@ class ScriptTool:
     def run(self, name: str, args: list[str] | None = None) -> ToolResult:
         started = time.monotonic()
         try:
-            script = self._resolve(name)
+            script, script_root = self._resolve(name)
         except Exception as exc:
             return ToolResult(False, "script", error=str(exc), metadata={"runtime_s": time.monotonic() - started})
         policy = self._policy(script)
@@ -141,7 +169,7 @@ class ScriptTool:
         try:
             proc = subprocess.run(
                 [sys.executable, "-I", str(script), *(args or [])],
-                cwd=str(self.root),
+                cwd=str(script_root),
                 env=env,
                 text=True,
                 capture_output=True,
@@ -508,6 +536,9 @@ class TropicalGridTool:
     This tool intentionally does not compare symbolic monomial/provenance
     structure. Passing it means only that the candidate circuit agrees with the
     reference shortest-path function on the tested finite weight grid.
+
+    It remains in the core temporarily for backward compatibility; the first
+    Tropical problem pack will move the domain-specific checker out of ``lab``.
     """
 
     WARNING = (
@@ -644,8 +675,10 @@ class ResearchToolbox:
         self,
         script_root: str | Path = "research_tools",
         lean_root: str | Path = "formal",
+        problem_pack_root: str | Path | None = "problem_packs",
     ):
-        self.scripts = ScriptTool(script_root)
+        secondary_roots = [problem_pack_root] if problem_pack_root is not None else []
+        self.scripts = ScriptTool(script_root, trusted_roots=secondary_roots)
         self.z3 = Z3Tool()
         self.lean = LeanTool(lean_root)
         self.tropical_grid = TropicalGridTool()
