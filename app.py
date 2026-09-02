@@ -12,7 +12,7 @@ from lab.openrouter_catalog import fetch_openrouter_models
 from lab.project_manager import ProjectInfo, ProjectManager
 from lab.prompts import ROLE_LIBRARY as THEOREM_ROLE_LIBRARY
 from lab.reasoning_settings import API_TO_UI, UI_LEVELS, UI_TO_API, get_reasoning_effort
-from lab.ui_live import live_stage_snapshot, render_now_and_timeline
+from lab.ui_live import render_now_and_timeline
 from lab.ui_model import (
     cost_text,
     event_summary,
