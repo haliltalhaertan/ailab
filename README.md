@@ -51,19 +51,21 @@ StepStore RunController ToolRegistry
        Trace / Audit
 ```
 
-Üretim theorem workflow'u yalnız `lab/theorem_engine.py` içinde bulunur. Eski theorem-lab modülleri yalnız compatibility shim'dir; araştırma mantığının ikinci kopyasını taşımaz.
+Theorem workflow'unun ana yürütme mantığı `lab/theorem_engine.py` içindedir. Evidence/integrity katmanı `lab/integrity_theorem_lab.py` üzerinden birleşik `TheoremResearchLab` sınıfını sağlar; eski theorem-lab compatibility shim dosyaları kaldırılmıştır.
 
 Başlıca runtime dosyaları:
 
 ```text
 research_state/<project_id>/
-  project.json
+  project.json              # proje metadata'sı; READY/ARCHIVED
   problem_frozen.json
-  state.json
+  state.json                # araştırma ledger'ı
   theorem_graph.json
-  runtime.json
+  runtime.json              # çalışma statüsünün tek kaynağı
   run_config.json
   research_steps.sqlite3
+  worker.json               # gerçek worker pid/run_id/launched_at
+  worker_launch.json        # launcher pid + platform/breakaway bilgisi
   run.lock                  # yalnız aktif run sırasında
   checkpoints/
   workspace/
@@ -103,10 +105,11 @@ Amaç LLM'leri "ispat üreten chatbot" olarak değil, kontrollü ve denetlenebil
 
 Bir LLM'nin veya birden fazla LLM'nin "doğru görünüyor" demesi bir iddiayı `[PROVEN]` yapmaz.
 
-Durumlar:
+Araştırma ledger durumları:
 
 ```text
 OPEN
+REFUTATION_CANDIDATE
 COMPUTATION_PASS
 PROOF_CANDIDATE
 PROVEN
@@ -116,34 +119,51 @@ BARRIER
 DROPPED
 ```
 
+Ayrıca worker sağlığı için UI/runtime katmanında türetilen `STALE_RUNNING` tanısı vardır. Bu bir matematiksel evidence statüsü değildir: persisted `RUNNING` kaydı canlı `run.lock` sahibi veya güncel heartbeat ile doğrulanamadığında gösterilir. Kullanıcı `Stale run'ı temizle` işlemini açıkça seçerse stale kilit kaldırılır ve runtime `INTERRUPTED` olur; step cache ve partial çalışma korunur.
+
 Merkezi evidence guard LLM'nin istediği status ile gerçekten mevcut evidence'ı karşılaştırır:
 
-- `COMPUTATION_PASS`: deterministic başarılı compute evidence gerekir.
+- `REFUTATION_CANDIDATE`: LLM'nin öne sürdüğü ama deterministic olarak doğrulanmamış karşıörnek; araştırma alanını kalıcı kapatmaz.
+- `COMPUTATION_PASS`: anlamlı ve başarılı deterministic compute evidence gerekir. Z3 için en az bir assertion; tropical grid için en az bir gerçekten kontrol edilmiş case gerekir.
 - `PROOF_CANDIDATE`: verifier/critic değerlendirmesi gerekir; formal ispat değildir.
-- `PROVEN`: başarılı formal checker sonucu ve `formal_verified=true` metadata gerekir.
-- `FAIL`: deterministic counterexample veya açık counterexample evidence gerekir.
+- `PROVEN`: aynı ledger item/iteration/claim'e bağlı başarılı Lean evidence, temiz kaynak, axiom audit, verifier PASS ve critic'in KILL etmemesi gerekir.
+- `FAIL`: yalnız deterministic olarak doğrulanmış counterexample yolu kalıcı matematiksel FAIL üretebilir. LLM-only negatif kanaat FAIL değildir.
 
 Manager daha güçlü bir status ister fakat evidence yoksa durum otomatik olarak daha düşük güven seviyesine indirilir ve trace'e kaydedilir.
 
 ### Formal doğrulama yolu
 
-LLM formal bir aday üretmek isterse `lean_draft` aracıyla proje içindeki `formal/candidates/` alanına Lean dosyası yazar. Daha sonra `LeanTool` dosyayı gerçek Lean checker ile çalıştırır. Yalnız checker başarıyla tamamlanırsa `formal_verified=true` üretilebilir ve `PROVEN` gate'i açılabilir.
+LLM formal bir aday üretmek isterse `lean_draft` aracıyla proje içindeki `formal/candidates/` alanına Lean dosyası yazar. Engine aday kaynağını mevcut ledger item'ına, iteration'a ve claim hash'ine bağlar; dosyanın SHA-256 değeri de doğrulama zincirine alınır.
 
-Lean kurulu değilse formal doğrulama başarısız/inconclusive kalır; LLM görüşü bunun yerine geçmez.
+Lean source kapısı `sorry`, `admit`, `axiom`, `opaque`, `native_decide`, `set_option`, `partial def` ve diğer tanımlı escape-hatch kalıplarını reddeder. Checker `-DwarningAsError=true` ile çalıştırılır; compiler çıktısında `sorry`/axiom şüphesi görülürse başarı kabul edilmez. `#print axioms` sonucu izin verilen axiom kümesine karşı denetlenir.
+
+Dolayısıyla yalnız `returncode == 0` olması `[PROVEN]` için yeterli değildir. Claim hash, item/iteration, theorem adı/türü, source SHA, source-clean ve axiom doğrulamaları aynı evidence zincirinde uyuşmalıdır. Lean kurulu değilse veya host Lean çalıştırmaya açıkça izin verilmemişse formal doğrulama başarısız/inconclusive kalır; LLM görüşü bunun yerine geçmez.
 
 ## Durdur / devam bütünlüğü
 
 Theorem run'ı Streamlit render thread'inde değil ayrı worker process'te çalışır. Tarayıcı kapansa bile worker yaşamaya devam edebilir. Research Control sayfasındaki STOP isteği `stop.flag` üzerinden worker'a iletilir.
 
-Tamamlanan step'ler SQLite `StepStore` içinde content fingerprint ile saklanır. Yarım provider-visible çalışma `reasoning`, `reasoning_details` ve `content` ile birlikte partial kayıt olarak tutulur.
+Proje `run.lock` kilidi mutable run işlemlerinden önce alınır. Worker kilidi almadan `run_config.json`, stale stop flag, worker identity veya runtime çalışma durumunu değiştirmez. Aynı projede ikinci worker lock alamazsa aktif worker'ın dosyalarını overwrite etmez; yalnız ayrı bir busy tanısı yazabilir.
+
+Windows launcher önce `CREATE_BREAKAWAY_FROM_JOB` ile başlatmayı dener. Parent job bunu reddederse daha zayıf detached flag'lere geri döner ve `worker_launch.json` içinde `breakaway=false` kaydeder; breakaway'in her Windows ortamında garanti edildiği iddia edilmez.
+
+`runtime.json` heartbeat ile güncellenir. RUNNING state için lock kayıp/ölü veya heartbeat 120 saniyeden eskiyse sistem bunu `STALE_RUNNING` olarak teşhis edebilir ve kullanıcıya güvenli resume yolu açar.
+
+Tamamlanan step'ler SQLite `StepStore` içinde content fingerprint ile saklanır. Tamamlanan step cache payload'ları HMAC ile seal edilir; seal uyuşmazsa cache yeniden kullanılmaz. Yarım provider-visible çalışma `reasoning`, `reasoning_details` ve `content` ile birlikte partial kayıt olarak tutulur.
 
 Her iteration başında ledger context, ledger revision ve next task dondurulur. Resume sırasında proposer'ın ürettiği claim dondurulmuş proposal ile uyuşmazsa yeni evidence eski conjecture'a sessizce bağlanmaz; run fail-closed biçimde `PAUSED_ERROR` durumuna geçer.
 
 Bu gerçek provider KV-cache resume değildir. Provider'ın gizli inference state'i API tarafından verilmediğinde yalnız provider-visible reasoning/content güvenli biçimde yeniden kullanılabilir.
 
+## Araştırma state'i bütünlük sınırı
+
+`PROVEN` evidence kayıtları HMAC proof seal taşır ve bağlı Lean dosyasının canlı SHA-256 değeri yeniden kontrol edilir. Tamamlanmış StepStore cache kayıtları da HMAC ile doğrulanır. `LAB_EVIDENCE_HMAC_KEY` dışarıdan verildiğinde anahtar proje verisinin dışında tutulabilir; varsayılan proje-local key modu daha çok kazara veya basit manuel değişiklikleri tespit etmeye yöneliktir.
+
+Buna karşılık **bütün `state.json` dosyasının canonical items+events içeriği için global read-time seal uygulanmaz**. Audit'teki opsiyonel tam-state integrity maddesi bilinçli olarak kapsam dışında bırakılmıştır; proje dosya sistemini ve yerel HMAC anahtarını değiştirebilen bir yöneticiye karşı genel tamper-proof ledger garantisi verilmez. Güvenlik/evidence iddiaları yukarıdaki daha dar PROVEN ve cache kontrolleriyle sınırlıdır.
+
 ## CodeExperimentAgent güvenlik modeli
 
-LLM tarafından üretilen Python **host Python process'inde çalıştırılmaz**. CodeExperimentAgent deney çalıştırabilmek için Docker veya Podman ister.
+LLM tarafından üretilen Python **host Python process'inde çalıştırılmaz**. CodeExperimentAgent deney çalıştırabilmek için Docker veya Podman ister. Container runtime bulunamazsa sistem host execution'a düşmez; deney **fail closed** olur.
 
 Container şu güvenlik sınırlarıyla başlatılır:
 
@@ -160,9 +180,7 @@ stdout/stderr byte limit
 yalnız project workspace writable bind mount
 ```
 
-Container runtime bulunamazsa sistem host execution'a düşmez; deney **fail closed** olur.
-
-AST doğrulaması ayrıca defense-in-depth sağlar: `open`, `eval`, `exec`, `__import__`, `os`, `subprocess`, `socket` gibi doğrudan veya alias edilmiş riskli yollar reddedilir. Asıl security boundary AST değil container'dır.
+AST doğrulaması yalnız **best-effort defense-in-depth** preflight kontrolüdür ve güvenlik sandbox'ı değildir. Bilinen riskli import/attribute/dunder/string/call kalıplarını erkenden reddeder fakat Python AST politikasının tüm olası bypass'ları kapattığı varsayılmaz. Üretilen kod için tek yürütme güvenlik sınırı container izolasyonudur.
 
 Agent'ın workspace araçları:
 
@@ -205,14 +223,16 @@ Theorem pipeline'daki yapılandırılmış LLM çıktıları fail-closed parse e
 `ToolRegistry` theorem promptuna sunulan tool şemalarıyla gerçek dispatch'in tek kaynağıdır.
 
 - **ScriptTool:** yalnız review edilmiş `research_tools/` scriptlerini çalıştırır.
-- **Z3Tool:** SMT-LIB doğrulaması; solver timeout'u vardır.
-- **TropicalGridTool:** küçük-n exhaustive counterexample araması; PASS genel ispat değildir.
-- **LeanTool:** formal checker.
+- **Z3Tool:** assertionsız SMT-LIB girdisini `inconclusive / no assertions` sayar; sat/unsat computation evidence için gerçek assertion gerekir.
+- **TropicalGridTool:** nonnegative ağırlıkların seçilen sonlu gridinde min-plus shortest-path **fonksiyon eşitliğini** test eder. `GRID_PASS`, simple-path provenance polynomial ile formal/monomial-level eşitlik ispatı değildir. `gate_count` yalnız internal non-edge gate sayısıdır; `edge_gate_count` ayrıca raporlanır.
+- **LeanTool:** claim-bound formal checker.
 - **CodeExperimentAgent:** container içindeki yeni deney kodu döngüsü.
 
 ## Araştırma state'i ve eşzamanlılık
 
-Aynı proje üzerinde aynı anda iki theorem worker çalıştırılamaz. `run.lock` atomik proje kilididir; ikinci process lock alamazsa state/cache'e yazmadan durur.
+Aynı proje üzerinde aynı anda iki theorem worker çalıştırılamaz. `run.lock` atomik proje kilididir; ikinci process lock alamazsa aktif run'ın mutable state/config dosyalarına dokunmadan durur.
+
+Çalışma statüsünün authoritative kaynağı `runtime.json`'dır. `project.json.status` yalnız proje metadata durumu olan `READY`/`ARCHIVED` için kullanılır; `worker.json` ise statü kaynağı değildir ve yalnız gerçek worker identity bilgisini taşır.
 
 Run klasörleri mikro-saniye + UUID tabanlı benzersiz `run_id` kullanır. İnsan tarafından okunabilir `project_id` yanında immutable `project_uuid` vardır; bir proje silinip aynı ID ile yeniden oluşturulursa eski run geçmişi yeni projeye bağlanmaz.
 
@@ -270,10 +290,11 @@ pytest: Python 3.12
 pytest: Python 3.13
 Ruff
 mypy
+container-integration
 ```
 
-Container execution testleri Docker Hub/network'e bağımlı değildir; external runtime deterministik test double ile doğrulanırken production command'in network/rootfs/capability/resource izolasyon flagleri ayrıca assert edilir.
+Normal pytest testlerinin container runtime gerektiren davranışsal testi Docker bulunmuyorsa `skip` eder. Ayrı `container-integration` GitHub Actions job'ı Docker bulunan Ubuntu runner üzerinde gerçek container davranışını kontrol eder: network izolasyonu, read-only root filesystem, yalnız writable workspace output alanı ve timeout sonrası container temizliği. AST unit testleri ayrıca best-effort policy davranışını doğrular fakat container güvenlik sınırının yerine geçmez.
 
-Son audit-hardening değişiklikleri bu matrisin tamamı yeşil olmadan `main`e alınmaz.
+Son audit-hardening değişiklikleri bu kalite kapısının tamamı yeşil olmadan `main`e alınmaz.
 
 Amaç, çok sayıda ikna edici metin üretmek değil; yanlış hipotezleri mümkün olduğunca erken öldürmek ve her güçlü iddiayı gerçekten sahip olduğu evidence seviyesinde tutmaktır.
