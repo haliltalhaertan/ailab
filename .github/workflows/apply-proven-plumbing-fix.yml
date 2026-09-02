@@ -1,0 +1,50 @@
+name: apply-proven-plumbing-fix
+
+on:
+  push:
+    branches: ["baseline-live-probe"]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: baseline-live-probe
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Patch theorem engine
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("lab/theorem_engine.py")
+          text = path.read_text(encoding="utf-8")
+
+          old_guard = """            guard = choose_status(requested_status, tool_result=tool_result, verifier=verification, critic=critique)\n"""
+          new_guard = """            guard = choose_status(\n                requested_status,\n                tool_result=tool_result,\n                verifier=verification,\n                critic=critique,\n                expected_item_id=item.id,\n                expected_iteration=iteration,\n                expected_claim_hash=content_fingerprint(\"claim:v1\", claim),\n            )\n"""
+
+          old_metadata = """                if status == \"PROVEN\" and tool_result:\n                    metadata.update(\n                        {\n                            \"formal_verified\": True,\n                            \"lean_file\": (tool_result.metadata or {}).get(\"file\"),\n                            \"lean_sha256\": (tool_result.metadata or {}).get(\"lean_sha256\"),\n                        }\n                    )\n"""
+          new_metadata = """                if status == \"PROVEN\" and tool_result:\n                    formal_metadata = dict(tool_result.metadata or {})\n                    if formal_metadata.get(\"file\") and not formal_metadata.get(\"lean_file\"):\n                        formal_metadata[\"lean_file\"] = formal_metadata[\"file\"]\n                    metadata.update(formal_metadata)\n"""
+
+          if old_guard not in text:
+              raise SystemExit("expected choose_status call not found; refusing blind patch")
+          if old_metadata not in text:
+              raise SystemExit("expected PROVEN metadata block not found; refusing blind patch")
+
+          text = text.replace(old_guard, new_guard, 1).replace(old_metadata, new_metadata, 1)
+          path.write_text(text, encoding="utf-8")
+          PY
+      - name: Show exact patch
+        run: git diff --check && git diff -- lab/theorem_engine.py
+      - name: Commit fix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add lab/theorem_engine.py
+          git commit -m "Fix bound formal evidence propagation"
+          git push origin HEAD:baseline-live-probe
