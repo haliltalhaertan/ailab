@@ -85,6 +85,7 @@ def live_stage_snapshot(
             "model": "",
             "reasoning_effort": None,
             "step_key": "",
+            "finished": False,
         }
 
     stage = stages[-1]
@@ -154,3 +155,67 @@ def format_duration(seconds: float) -> str:
     if hours:
         return f"{hours:02d}:{minutes:02d}:{secs:02d}"
     return f"{minutes:02d}:{secs:02d}"
+
+
+def _clock(value: Any) -> str:
+    parsed = parse_ts(value)
+    return parsed.astimezone().strftime("%H:%M:%S") if parsed else "--:--:--"
+
+
+def render_now_and_timeline(
+    runtime: dict[str, Any],
+    events: list[dict[str, Any]],
+    *,
+    status: str,
+) -> dict[str, Any]:
+    """Shared Streamlit component used by the home page and Research Control."""
+
+    import streamlit as st
+
+    snapshot = live_stage_snapshot(runtime, events)
+    st.markdown("#### Şimdi")
+    label = snapshot.get("label") or "Worker hazırlanıyor"
+    token_prefix = "~" if snapshot.get("token_estimated") else ""
+    reasoning = int(snapshot.get("reasoning_tokens", 0) or 0)
+    line = (
+        f"**{label}** · {format_duration(float(snapshot.get('elapsed_s', 0.0) or 0.0))} · "
+        f"{token_prefix}{int(snapshot.get('total_tokens', 0) or 0):,} token "
+        f"(reasoning {token_prefix}{reasoning:,})"
+    )
+    st.markdown(line)
+    details = []
+    if snapshot.get("agent"):
+        details.append(str(snapshot["agent"]))
+    if snapshot.get("model"):
+        details.append(str(snapshot["model"]))
+    details.append(f"effort: {snapshot.get('reasoning_effort') or 'provider-default'}")
+    st.caption(" · ".join(details))
+
+    age = heartbeat_age_seconds(runtime)
+    if status == "STALE_RUNNING":
+        st.error("Worker stale görünüyor. Research Control üzerinden stale run temizliği yap.")
+    elif status == "RUNNING" and age is not None and age > 120:
+        st.warning(f"Worker {int(age)} saniyedir heartbeat vermedi; worker sessiz olabilir.")
+
+    index = snapshot.get("index")
+    total = snapshot.get("total")
+    if isinstance(index, int) and isinstance(total, int) and total > 0:
+        progress = min(1.0, max(0.0, index / total))
+        st.progress(progress, text=f"İlerleme · {index}/{total}")
+    elif status == "RUNNING":
+        st.caption("İlerleme · toplam çağrı sayısı bu workflow için önceden kesin değil.")
+
+    rows = stage_timeline(events)
+    st.markdown("#### Zaman çizelgesi")
+    if not rows:
+        st.caption("Tamamlanan aşama henüz yok.")
+    else:
+        for row in rows[-30:]:
+            cost = row.get("cost_usd")
+            cost_text = f"${float(cost):.4f}" if cost is not None else "ücret N/A"
+            st.caption(
+                f"{_clock(row.get('started_at'))} → {_clock(row.get('finished_at'))} · "
+                f"{row.get('label') or row.get('agent')} · {float(row.get('duration_s', 0.0)):.1f} sn · "
+                f"{int(row.get('total_tokens', 0) or 0):,} token · {cost_text}"
+            )
+    return snapshot
