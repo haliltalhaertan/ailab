@@ -1,0 +1,88 @@
+name: live-baseline-probe
+
+on:
+  push:
+    branches:
+      - probe/live-baseline-20260902
+
+jobs:
+  two-turn-live-probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      LAB_MANAGER_MODEL: openai/gpt-4o-mini
+      LAB_PROPOSER_MODEL: openai/gpt-4o-mini
+      LAB_CRITIC_MODEL: openai/gpt-4o-mini
+      LAB_VERIFIER_MODEL: openai/gpt-4o-mini
+      LAB_LITERATURE_MODEL: openai/gpt-4o-mini
+      LAB_AUDITOR_MODEL: openai/gpt-4o-mini
+      LAB_LLM_TIMEOUT_S: "120"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: python -m pip install -e ".[dev]"
+      - name: Run two-turn live theorem probe
+        id: probe
+        continue-on-error: true
+        run: |
+          python experiments/theorem_research.py \
+            "Investigate the finite conjecture: for every integer n with 0 <= n <= 7, n*(n+1) is even. Use two research turns to propose, test, criticize, and manage a small rigorous claim; do not assume the conjecture is already proved." \
+            "baseline-probe" \
+            2
+      - name: Summarize protocol trace
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          from collections import Counter
+          from pathlib import Path
+
+          runs = sorted(Path("runs").glob("*baseline-probe"), key=lambda p: p.stat().st_mtime)
+          if not runs:
+              print("BASELINE_PROBE: no run directory")
+              raise SystemExit(0)
+          run = runs[-1]
+          trace = run / "trace.jsonl"
+          summary = run / "summary.json"
+          events = []
+          if trace.exists():
+              for line in trace.read_text(encoding="utf-8").splitlines():
+                  try:
+                      events.append(json.loads(line))
+                  except json.JSONDecodeError:
+                      pass
+          types = Counter(str(e.get("type") or "") for e in events)
+          repairs = types["structured_output_repaired"]
+          parse_failures = types["structured_output_parse_failed"]
+          downgrades = [e for e in events if e.get("type") == "status_downgraded_by_guard"]
+          iterations = [e for e in events if e.get("type") == "iteration_end"]
+          tool_results = [e for e in events if e.get("type") == "tool_result"]
+          agent_errors = [e for e in events if e.get("type") == "agent_error"]
+          print(f"BASELINE_RUN_DIR={run}")
+          print(f"JSON_PARSE_FAILURES={parse_failures}")
+          print(f"JSON_REPAIRS={repairs}")
+          print(f"GUARD_DOWNGRADES={len(downgrades)}")
+          print(f"ITERATIONS_COMPLETED={len(iterations)}")
+          print(f"TOOL_RESULTS={len(tool_results)}")
+          print(f"AGENT_ERRORS={len(agent_errors)}")
+          for e in iterations:
+              print("ITERATION_END", json.dumps({k: e.get(k) for k in ("iteration", "item_id", "decision", "status", "next_task")}, ensure_ascii=False))
+          for e in downgrades:
+              print("GUARD_DOWNGRADE", json.dumps({k: e.get(k) for k in ("iteration", "item_id", "requested", "granted", "reason")}, ensure_ascii=False))
+          if summary.exists():
+              s = json.loads(summary.read_text(encoding="utf-8"))
+              print("SUMMARY", json.dumps({k: s.get(k) for k in ("total_calls", "total_tokens", "total_cost_usd", "cost_complete", "wall_time_s")}, ensure_ascii=False))
+          PY
+      - name: Upload baseline trace
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-baseline-probe
+          path: |
+            runs/
+            research_state/baseline-probe/
+          if-no-files-found: warn
