@@ -13,3 +13,11 @@ Pack scripts are invoked through `ScriptTool` by a path relative to the trusted 
 Search and checking are separate trust paths. A pack's `search*.py` and `check*.py` scripts must not import each other and must not share pack-local helper modules such as `common.py` or `*_semantics.py`. If both need the same semantics, duplicate the small trusted definition or validate it independently; shared implementation would defeat the independent-checker boundary.
 
 `lab/` must never import `problem_packs`. The engine treats pack scripts as checked-in evidence producers, not as core Python dependencies. Generated code continues to use the separate guarded `code_experiment` path and does not gain trusted-pack privileges.
+
+## Research contract v1 conventions
+
+Problem packs inherit the following deliberate v1 constraints. They are fail-closed design choices, not implicit future behavior:
+
+- `parameters` is frozen as one semantic block. v1 does not split semantic parameters from operational/tuning parameters; changing any frozen parameter requires a new contract rather than silently mutating the active one.
+- Evidence-to-contract binding is authoritative in ledger item metadata and checkpoints. `run_config.json` may carry the frozen `contract_hash` for observability/resume configuration, but it is not the mathematical evidence ledger.
+- `TARGET_RESOLUTION` claim assignment uses whitespace-normalized exact equality with the frozen target statement. v1 does not infer semantic equivalence between differently worded statements; equivalent reformulations remain `SUBCLAIM` unless the frozen target itself is changed through an explicit new contract/target lifecycle.
