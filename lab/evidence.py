@@ -194,7 +194,8 @@ def _classify(result: "ToolResult") -> tuple[str, bool, dict[str, Any] | None, d
             return "INCONCLUSIVE", False, None, metadata
         return declared, exhaustive, witness, metadata
     if tool == "code_experiment":
-        nested = metadata.get("evidence") if isinstance(metadata.get("evidence"), dict) else {}
+        nested_value = metadata.get("evidence")
+        nested: dict[str, Any] = dict(nested_value) if isinstance(nested_value, dict) else {}
         successful_runs = metadata.get("successful_run_count", nested.get("successful_run_count", 0))
         if result.ok and int(successful_runs or 0) > 0:
             return "NUMERICAL_PASS", False, None, metadata
