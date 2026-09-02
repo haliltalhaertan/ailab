@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from lab.integrity import atomic_write_json, read_json_tolerant
+from lab.integrity import atomic_write_json, project_lock_is_live, read_json_tolerant
 from lab.research_state import ResearchState
 from lab.runtime_health import normalize_runtime
 
@@ -69,7 +69,11 @@ class ProjectInfo:
 
 
 class ProjectManager:
-    """Project-centric facade with immutable project UUIDs and indexed run history."""
+    """Project-centric facade with immutable project UUIDs and indexed run history.
+
+    ``project.json`` stores project metadata only; its status is limited to
+    READY/ARCHIVED. Execution status is authoritative in ``runtime.json``.
+    """
 
     def __init__(self, root: str | Path = "research_state", runs_dir: str | Path = "runs"):
         self.root = Path(root)
@@ -156,17 +160,60 @@ class ProjectManager:
             raw = self._legacy_metadata(root)
             _write_json(path, raw)
             return raw
+
+        changed = False
+        raw = dict(raw)
         if not str(raw.get("project_uuid") or "").strip():
-            raw = dict(raw)
             raw["project_uuid"] = uuid.uuid4().hex
             raw["uuid_migrated_at"] = _now()
+            changed = True
+
+        stored_status = str(raw.get("status") or "READY").upper()
+        if stored_status not in {"READY", "ARCHIVED"}:
+            # Preserve a legacy execution status if runtime.json did not exist,
+            # then remove it from project metadata permanently.
+            runtime_path = root / "runtime.json"
+            if not runtime_path.exists():
+                _write_json(
+                    runtime_path,
+                    {
+                        "status": stored_status,
+                        "updated_at": str(raw.get("updated_at") or _now()),
+                    },
+                )
+            raw["status"] = "ARCHIVED" if bool(raw.get("archived")) else "READY"
+            raw["status_migrated_at"] = _now()
+            changed = True
+        elif bool(raw.get("archived")) and stored_status != "ARCHIVED":
+            raw["status"] = "ARCHIVED"
+            changed = True
+        elif not bool(raw.get("archived")) and stored_status == "ARCHIVED":
+            raw["status"] = "READY"
+            changed = True
+
+        if changed:
             _write_json(path, raw)
         return raw
 
     def _runtime(self, root: Path) -> dict[str, Any]:
         value = _read_json(root / "runtime.json", {})
         runtime = value if isinstance(value, dict) else {}
-        return normalize_runtime(root, runtime, persist=True)
+        return normalize_runtime(root, runtime)
+
+    def _write_runtime_status(self, root: Path, status: str) -> None:
+        status = str(status or "").upper()
+        if not status or status in {"READY", "ARCHIVED"}:
+            return
+        # A RUNNING transition is valid only after a project lock has a live
+        # owner. This intentionally makes UI-side pre-launch RUNNING writes no-op.
+        if status == "RUNNING" and not project_lock_is_live(root):
+            return
+        path = root / "runtime.json"
+        current = _read_json(path, {})
+        current = dict(current) if isinstance(current, dict) else {}
+        now = _now()
+        current.update({"status": status, "updated_at": now, "heartbeat_at": now})
+        _write_json(path, current)
 
     def _counts(self, root: Path) -> dict[str, int]:
         try:
@@ -257,7 +304,6 @@ class ProjectManager:
         current_uuid = str(metadata.get("project_uuid") or "")
         rows: list[dict[str, Any]] = []
         indexed = self._indexed_runs()
-        matched_ids: set[str] = set()
         for run_id, row in indexed.items():
             if str(row.get("project_id") or "") != pid:
                 continue
@@ -268,7 +314,6 @@ class ProjectManager:
             if not run_dir.exists():
                 continue
             rows.append(self._summary_row(run_dir))
-            matched_ids.add(run_id)
         if rows:
             return sorted(
                 rows,
@@ -307,7 +352,8 @@ class ProjectManager:
         frozen = _read_json(root / "problem_frozen.json", {})
         runtime = self._runtime(root)
         runs = self.run_summaries(pid)
-        status = str(runtime.get("status") or meta.get("status") or "READY")
+        metadata_status = "ARCHIVED" if bool(meta.get("archived")) else "READY"
+        status = str(runtime.get("status") or metadata_status)
         return ProjectInfo(
             project_id=pid,
             project_uuid=str(meta.get("project_uuid") or ""),
@@ -388,20 +434,31 @@ class ProjectManager:
         pid = _slug(project_id)
         root = self.project_root(pid)
         meta = self._base_metadata(root)
-        allowed = {
+        metadata_fields = {
             "title",
             "description",
             "experiment",
             "literature_query",
             "tags",
             "archived",
-            "status",
         }
         for key, value in updates.items():
-            if key in allowed:
+            if key in metadata_fields:
                 meta[key] = value
+
+        requested_status = str(updates.get("status") or "").upper()
+        if "archived" in updates:
+            meta["status"] = "ARCHIVED" if bool(meta.get("archived")) else "READY"
+        elif requested_status in {"READY", "ARCHIVED"}:
+            meta["status"] = requested_status
+            meta["archived"] = requested_status == "ARCHIVED"
+        else:
+            meta["status"] = "ARCHIVED" if bool(meta.get("archived")) else "READY"
+
         meta["updated_at"] = _now()
         _write_json(root / "project.json", meta)
+        if requested_status not in {"", "READY", "ARCHIVED"}:
+            self._write_runtime_status(root, requested_status)
         return self.get(pid)
 
     def archive(self, project_id: str, archived: bool = True) -> ProjectInfo:

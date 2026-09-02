@@ -68,17 +68,22 @@ def write_worker_request(project_root: str | Path, payload: dict[str, Any]) -> P
     return path
 
 
-def _windows_popen(command: list[str], kwargs: dict[str, Any]) -> subprocess.Popen:
+def _windows_popen(
+    command: list[str], kwargs: dict[str, Any]
+) -> tuple[subprocess.Popen, bool]:
     base_flags = 0
     base_flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     base_flags |= getattr(subprocess, "DETACHED_PROCESS", 0)
     breakaway = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
     try:
-        return subprocess.Popen(command, **kwargs, creationflags=base_flags | breakaway)
+        return (
+            subprocess.Popen(command, **kwargs, creationflags=base_flags | breakaway),
+            True,
+        )
     except OSError:
-        # Some parent jobs disallow BREAKAWAY_OK. Fall back to the strongest flags
-        # available; stale-runtime recovery still makes a hard-killed child resumable.
-        return subprocess.Popen(command, **kwargs, creationflags=base_flags)
+        # Some Windows parent jobs disallow BREAKAWAY_OK. Retry without it and
+        # make the weaker launch mode observable instead of silently claiming it.
+        return subprocess.Popen(command, **kwargs, creationflags=base_flags), False
 
 
 def launch_theorem_worker(project_id: str, *, root: str | Path = "research_state") -> int:
@@ -104,13 +109,27 @@ def launch_theorem_worker(project_id: str, *, root: str | Path = "research_state
         "close_fds": os.name != "nt",
     }
     try:
+        breakaway: bool | None
         if os.name == "nt":
-            proc = _windows_popen(command, kwargs)
+            proc, breakaway = _windows_popen(command, kwargs)
         else:
             proc = subprocess.Popen(command, **kwargs, start_new_session=True)
+            breakaway = None
 
-        # Wait briefly for the *actual* worker to publish run.lock. This also
-        # handles venv launcher stubs whose Popen.pid is not the final Python PID.
+        # Launcher identity is deliberately separate from worker.json. The
+        # worker itself publishes its real PID only after it owns run.lock.
+        atomic_write_json(
+            project_root / "worker_launch.json",
+            {
+                "launcher_pid": int(proc.pid),
+                "launched_at": _now(),
+                "breakaway": breakaway,
+                "platform": os.name,
+            },
+        )
+
+        # Wait briefly for the actual worker to publish run.lock. This handles
+        # venv launcher stubs whose Popen.pid is not the final Python PID.
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
             owner = project_lock_owner(project_root)

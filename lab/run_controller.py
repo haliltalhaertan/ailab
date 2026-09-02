@@ -80,27 +80,30 @@ class RunController:
     def set_runtime(self, **updates: Any) -> dict[str, Any]:
         value = self.runtime()
         value.update(updates)
+        now = now_iso()
         value["pid"] = os.getpid()
-        value["updated_at"] = now_iso()
-        if str(value.get("status") or "").upper() == "RUNNING":
-            value["heartbeat_at"] = value["updated_at"]
+        value["updated_at"] = now
+        # Every runtime mutation is also proof-of-life. This avoids a long-lived
+        # RUNNING state whose latest cursor update is newer than its heartbeat.
+        value["heartbeat_at"] = now
         atomic_json(self.runtime_path, value)
         self.trace.log("runtime_state", **value)
         self._last_heartbeat_monotonic = time.monotonic()
         return value
 
-    def heartbeat(self, *, min_interval_s: float = 2.0) -> None:
-        now = time.monotonic()
-        if now - self._last_heartbeat_monotonic < float(min_interval_s):
+    def heartbeat(self, *, min_interval_s: float = 15.0) -> None:
+        now_mono = time.monotonic()
+        if now_mono - self._last_heartbeat_monotonic < float(min_interval_s):
             return
         value = self.runtime()
         if str(value.get("status") or "").upper() != "RUNNING":
             return
+        now = now_iso()
         value["pid"] = os.getpid()
-        value["heartbeat_at"] = now_iso()
-        value["updated_at"] = value["heartbeat_at"]
+        value["heartbeat_at"] = now
+        value["updated_at"] = now
         atomic_json(self.runtime_path, value)
-        self._last_heartbeat_monotonic = now
+        self._last_heartbeat_monotonic = now_mono
 
     def check_stop(self) -> None:
         self.heartbeat()

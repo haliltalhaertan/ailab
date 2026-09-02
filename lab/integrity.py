@@ -34,10 +34,15 @@ def atomic_write_text(
     text: str,
     *,
     encoding: str = "utf-8",
-    attempts: int = 10,
-    initial_backoff_s: float = 0.01,
+    attempts: int = 5,
+    initial_backoff_s: float = 0.05,
 ) -> None:
-    """Durably replace a text file, retrying Windows sharing violations."""
+    """Durably replace a text file, retrying Windows sharing violations.
+
+    Temporary names include the process id so concurrent workers never share a
+    fixed ``*.tmp`` path. Permission/sharing violations are retried a bounded
+    five times by default with a fixed 50 ms backoff, then surfaced to callers.
+    """
 
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -50,21 +55,21 @@ def atomic_write_text(
                 os.fsync(handle.fileno())
             except OSError:
                 pass
+        retries = max(1, int(attempts))
         delay = max(0.0, float(initial_backoff_s))
         last_error: OSError | None = None
-        for attempt in range(max(1, int(attempts))):
+        for attempt in range(retries):
             try:
                 os.replace(tmp, target)
                 return
             except PermissionError as exc:
                 last_error = exc
             except OSError as exc:
-                if getattr(exc, "winerror", None) not in {5, 32, None}:
+                if getattr(exc, "winerror", None) not in {5, 32}:
                     raise
                 last_error = exc
-            if attempt + 1 < max(1, int(attempts)):
+            if attempt + 1 < retries:
                 time.sleep(delay)
-                delay = min(max(delay * 2, 0.01), 0.25)
         if last_error is not None:
             raise last_error
         raise OSError(f"atomic replace failed for {target}")

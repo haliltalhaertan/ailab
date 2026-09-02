@@ -6,6 +6,7 @@ from pathlib import Path
 import streamlit as st
 
 from lab.project_manager import ProjectManager
+from lab.runtime_health import cleanup_stale_run
 from lab.step_store import StepStore
 from lab.ui_model import load_run_events, runs_for_project
 from lab.worker_launcher import launch_theorem_worker, write_worker_request
@@ -52,11 +53,12 @@ store = StepStore(project)
 
 @st.fragment(run_every=1.0)
 def live_status() -> None:
-    runtime = read_json(runtime_path, {})
+    current_info = pm.get(selected_id)
+    runtime = dict(current_info.runtime or {})
     worker = read_json(worker_path, {})
     counts = store.counts()
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Durum", runtime.get("status", worker.get("status", "READY")))
+    c1.metric("Durum", current_info.status)
     c2.metric("Tamamlanan tur", runtime.get("completed_iterations", 0))
     c3.metric("Şu anki tur", runtime.get("current_iteration", 0))
     c4.metric("Tamamlanan adım", counts["complete_steps"])
@@ -64,12 +66,17 @@ def live_status() -> None:
     st.write("**Şu anki adım:**", runtime.get("current_step", "-"))
     if worker.get("pid"):
         st.caption(f"Worker PID: `{worker.get('pid')}` · run `{worker.get('run_id', '-')}`")
+    if current_info.status == "STALE_RUNNING":
+        st.warning(
+            "RUNNING kaydı canlı worker ile doğrulanamadı. "
+            + str(runtime.get("stale_reason") or "Worker/heartbeat bilgisi stale.")
+        )
     if runtime.get("next_task"):
         st.write("**Sonraki araştırma hedefi:**", runtime["next_task"])
     if runtime.get("last_error"):
         st.error(runtime["last_error"])
 
-    run_dirs = runs_for_project(RUNS, selected_id, project_info.project_uuid)
+    run_dirs = runs_for_project(RUNS, selected_id, current_info.project_uuid)
     if run_dirs:
         latest = run_dirs[0]
         events = load_run_events(latest, include_stream=False)[-15:]
@@ -87,7 +94,7 @@ def live_status() -> None:
                         st.caption(f"{event.get('agent')} tamamlandı · {event.get('total_tokens', 0)} token")
 
     result_path = project / "worker_result.md"
-    if result_path.exists() and str(runtime.get("status") or worker.get("status") or "") in {"COMPLETED", "STOPPED", "PAUSED_ERROR"}:
+    if result_path.exists() and current_info.status in {"COMPLETED", "STOPPED", "PAUSED_ERROR", "INTERRUPTED"}:
         with st.expander("Son worker sonucu", expanded=False):
             st.markdown(result_path.read_text(encoding="utf-8"))
 
@@ -104,6 +111,18 @@ with right:
         stop_path.unlink(missing_ok=True)
         st.success("Stop flag kaldırıldı.")
 
+current_info = pm.get(selected_id)
+if current_info.status == "STALE_RUNNING":
+    st.warning("Stale worker kaydı bulundu. Temizlemek yalnız stale run.lock/runtime işaretini kaldırır; step cache ve partial içerikler korunur.")
+    if st.button("Stale run'ı temizle", use_container_width=True):
+        try:
+            cleanup_stale_run(project)
+        except Exception as exc:
+            st.exception(exc)
+        else:
+            st.success("Stale run temizlendi; durum INTERRUPTED. Kaldığı yerden devam edebilirsin.")
+            st.rerun()
+
 st.divider()
 st.subheader("Kaldığı yerden devam et")
 config = read_json(config_path, {})
@@ -117,9 +136,6 @@ else:
     edited_agents: dict[str, dict] = {}
     changed_models: list[str] = []
     for role, raw in config.get("agents", {}).items():
-        if role == "CodeExperimentAgent":
-            # It may still be edited; keep it in the request.
-            pass
         col1, col2 = st.columns([1, 2])
         col1.write(f"**{role}**")
         col1.caption(f"reasoning: `{raw.get('reasoning_effort') or 'provider-default'}`")
@@ -132,8 +148,8 @@ else:
     if changed_models:
         st.info("Model override: " + ", ".join(changed_models) + ". Tamamlanmış adımlar korunacak; override yalnız incomplete/partial adımlarda etkili.")
 
-    runtime = read_json(runtime_path, {})
-    running = str(runtime.get("status") or "") == "RUNNING"
+    current_info = pm.get(selected_id)
+    running = current_info.status == "RUNNING"
     if st.button("ŞİMDİ DEVAM ET", type="primary", use_container_width=True, disabled=running):
         stop_path.unlink(missing_ok=True)
         frozen = read_json(project / "problem_frozen.json", {})
@@ -154,7 +170,6 @@ else:
         except Exception as exc:
             st.exception(exc)
         else:
-            pm.touch(selected_id, status="RUNNING")
             st.success(f"Worker başlatıldı: PID {pid}")
             st.rerun()
 

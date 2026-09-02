@@ -13,6 +13,7 @@ import lab.integrity as integrity
 from lab.integrity import ProjectBusyError, ProjectRunLock, atomic_write_text, sha256_file
 from lab.project_manager import ProjectManager
 from lab.research_state import ResearchState
+from lab.runtime_health import cleanup_stale_run
 from lab.step_store import StepStore
 from lab.tools import LeanTool, TropicalGridTool, Z3Tool
 from lab.worker_launcher import write_worker_request
@@ -35,12 +36,19 @@ def test_atomic_write_retries_windows_style_permission_error(tmp_path, monkeypat
     assert calls["n"] == 3
 
 
-def test_dead_worker_running_state_becomes_interrupted(tmp_path):
+def test_dead_worker_running_state_is_stale_until_explicit_cleanup(tmp_path):
     pm = ProjectManager(tmp_path / "research_state", tmp_path / "runs")
     project = pm.create_project(title="Dead worker", project_id="dead-worker", problem="P", activate=False)
     root = pm.project_root(project.project_id)
     (root / "runtime.json").write_text(
-        json.dumps({"status": "RUNNING", "completed_iterations": 1, "updated_at": "2000-01-01T00:00:00+00:00"}),
+        json.dumps(
+            {
+                "status": "RUNNING",
+                "completed_iterations": 1,
+                "heartbeat_at": "2000-01-01T00:00:00+00:00",
+                "updated_at": "2000-01-01T00:00:00+00:00",
+            }
+        ),
         encoding="utf-8",
     )
     (root / "run.lock").write_text(
@@ -48,23 +56,33 @@ def test_dead_worker_running_state_becomes_interrupted(tmp_path):
         encoding="utf-8",
     )
     (root / "worker.json").write_text(
-        json.dumps({"status": "RUNNING", "actual_pid": 99999998, "started_at": "2000-01-01T00:00:00+00:00"}),
+        json.dumps({"pid": 99999998, "run_id": "dead-run", "launched_at": "2000-01-01T00:00:00+00:00"}),
         encoding="utf-8",
     )
 
     info = pm.get(project.project_id)
-    assert info.status == "INTERRUPTED"
+    assert info.status == "STALE_RUNNING"
     persisted = json.loads((root / "runtime.json").read_text(encoding="utf-8"))
-    assert persisted["status"] == "INTERRUPTED"
-    assert "no longer alive" in persisted["last_error"]
+    assert persisted["status"] == "RUNNING"
+
+    cleaned = cleanup_stale_run(root)
+    assert cleaned["status"] == "INTERRUPTED"
+    assert not (root / "run.lock").exists()
+    assert pm.get(project.project_id).status == "INTERRUPTED"
 
 
-def test_live_lock_keeps_running_state(tmp_path):
+def test_live_lock_and_recent_heartbeat_keep_running_state(tmp_path):
     pm = ProjectManager(tmp_path / "research_state", tmp_path / "runs")
     project = pm.create_project(title="Live worker", project_id="live-worker", problem="P", activate=False)
     root = pm.project_root(project.project_id)
     (root / "runtime.json").write_text(
-        json.dumps({"status": "RUNNING", "updated_at": "2000-01-01T00:00:00+00:00"}),
+        json.dumps(
+            {
+                "status": "RUNNING",
+                "heartbeat_at": "2999-01-01T00:00:00+00:00",
+                "updated_at": "2999-01-01T00:00:00+00:00",
+            }
+        ),
         encoding="utf-8",
     )
     (root / "run.lock").write_text(
