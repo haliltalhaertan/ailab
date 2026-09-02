@@ -70,7 +70,7 @@ def _contract(*, policy: str, target_type: str = "COMPUTE") -> ResearchContract:
     )
 
 
-def _write_exact_script(root: Path, name: str = "exact.py") -> str:
+def _write_exact_script(root: Path, name: str = "exact.py", *, covered_max: int = 2) -> str:
     root.mkdir(parents=True, exist_ok=True)
     (root / name).write_text(
         "\n".join(
@@ -82,7 +82,7 @@ def _write_exact_script(root: Path, name: str = "exact.py") -> str:
                 '    "kind": "EXACT_PASS",',
                 '    "termination_reason": "completed",',
                 '    "exhaustive": False,',
-                '    "covered": {"n": {"type": "integer_range", "min": 1, "max": 2}},',
+                f'    "covered": {{"n": {{"type": "integer_range", "min": 1, "max": {covered_max}}}}},',
                 "}))",
             ]
         ),
@@ -172,13 +172,13 @@ def test_required_pilot_gate_stops_before_theorist(tmp_path: Path):
     assert runtime["completed_iterations"] == 0
 
 
-def test_bound_pilot_opens_run_and_is_injected_into_theorist_prompt(tmp_path: Path):
+def test_bound_partial_pilot_opens_run_and_is_injected_into_theorist_prompt(tmp_path: Path):
     state = ResearchState(tmp_path / "state")
     contract = _contract(policy="REQUIRED")
     contract.save(state.root)
     contract.freeze(state.root, frozen_problem="P")
     script_root = tmp_path / "research_tools"
-    script_name = _write_exact_script(script_root)
+    script_name = _write_exact_script(script_root, covered_max=1)
     toolbox = ResearchToolbox(
         script_root=script_root,
         lean_root=state.root / "formal",
@@ -192,6 +192,8 @@ def test_bound_pilot_opens_run_and_is_injected_into_theorist_prompt(tmp_path: Pa
     assert pilot_evidence["kind"] == "EXACT_PASS"
     assert pilot_evidence["contract_hash"] == contract.contract_hash
     assert pilot_evidence["target_id"] == "T1"
+    assert pilot_evidence["resolution_scope"] == "PARTIAL"
+    assert ResearchContract.load(state.root).target("T1").status == "OPEN"
 
     agents = _agents()
     report = _run(lab, agents)
