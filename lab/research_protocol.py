@@ -46,7 +46,7 @@ def pilot_evidence_by_target(
     contract: ResearchContract,
     state: ResearchState,
 ) -> dict[str, list[dict[str, Any]]]:
-    """Return only evidence that is strong enough to open the discovery gate."""
+    """Return strong bound pilot evidence, including evidence for resolved targets."""
 
     grouped: dict[str, list[dict[str, Any]]] = {}
     for item in state.list_items():
@@ -58,8 +58,8 @@ def pilot_evidence_by_target(
         if not target_id:
             continue
         try:
-            target = contract.target(target_id, require_open=True)
-        except (KeyError, ValueError):
+            target = contract.target(target_id)
+        except KeyError:
             continue
         if str(evidence.get("contract_hash") or "") != contract.contract_hash:
             continue
