@@ -1,17 +1,19 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from lab.integrity import atomic_write_json, content_fingerprint, read_json_tolerant
+from lab.run_controller import set_research_phase
 
 
 CONTRACT_VERSION = 1
 PILOT_POLICIES = {"REQUIRED", "OPTIONAL", "NOT_APPLICABLE"}
 TARGET_TYPES = {"PROVE", "DISPROVE", "OPTIMIZE", "COMPUTE", "DISCOVER"}
 TARGET_STATUSES = {"OPEN", "CLOSED", "FAILED", "SUPERSEDED"}
+CLAIM_ROLES = {"SUBCLAIM", "TARGET_RESOLUTION"}
 SCOPE_TYPES = {"integer_range", "enum"}
 FROZEN_FIELDS = (
     "problem",
@@ -107,6 +109,20 @@ def scope_covers(scope: dict[str, Any] | None, covered: dict[str, Any] | None) -
     return True
 
 
+def _evidence_id(evidence: dict[str, Any]) -> str:
+    return content_fingerprint("evidence-ledger:v1", evidence)
+
+
+def _evidence_is_bound(evidence: dict[str, Any], target: "ResearchTarget", contract_hash: str) -> bool:
+    return (
+        str(evidence.get("contract_hash") or "") == contract_hash
+        and str(evidence.get("target_id") or "") == target.id
+        and str(evidence.get("target_hash") or "") == target.target_hash
+        and str(evidence.get("termination_reason") or "") == "completed"
+        and bool(evidence.get("ok"))
+    )
+
+
 @dataclass(frozen=True)
 class ResearchTarget:
     id: str
@@ -128,6 +144,14 @@ class ResearchTarget:
                 "target_type": self.target_type,
             },
         )
+
+
+@dataclass(frozen=True)
+class TargetTransition:
+    status: str
+    closed_by: list[str]
+    metadata: dict[str, Any]
+    reason: str
 
 
 @dataclass
@@ -273,9 +297,171 @@ class ResearchContract:
                 return target
         raise KeyError(target_id)
 
+    def open_target_ids(self) -> list[str]:
+        return [target.id for target in self.open_targets if target.status == "OPEN"]
+
+    def claim_role(self, target_id: str, claim: str) -> str:
+        target = self.target(target_id)
+        claim_hash = content_fingerprint("claim:v1", _compact(claim))
+        target_claim_hash = content_fingerprint("claim:v1", _compact(target.statement))
+        return "TARGET_RESOLUTION" if claim_hash == target_claim_hash else "SUBCLAIM"
+
     def resolution_scope(self, target_id: str, covered: dict[str, Any] | None) -> str:
         target = self.target(target_id)
         return "TARGET_RESOLUTION" if scope_covers(target.scope, covered) else "PARTIAL"
+
+    def evaluate_target_transition(
+        self,
+        target_id: str,
+        records: list[dict[str, Any]],
+        *,
+        human_approved: bool = False,
+    ) -> TargetTransition | None:
+        """Evaluate one OPEN target from machine-bound ledger records.
+
+        ``records`` are engine-produced summaries with ``item_id``, ``claim_role``,
+        ``status`` and optional ``evidence``. LLM output never directly changes a
+        target status; this method only recognizes type-specific machine gates.
+        """
+
+        target = self.target(target_id, require_open=True)
+        eligible = [
+            record
+            for record in records
+            if str(record.get("claim_role") or "") == "TARGET_RESOLUTION"
+        ]
+        proven = [
+            record
+            for record in eligible
+            if str(record.get("status") or "").upper() == "PROVEN"
+            and isinstance(record.get("evidence"), dict)
+            and _evidence_is_bound(dict(record["evidence"]), target, self.contract_hash)
+            and str(dict(record["evidence"]).get("kind") or "") == "FORMAL_PROOF"
+        ]
+        counterexamples = [
+            record
+            for record in eligible
+            if isinstance(record.get("evidence"), dict)
+            and _evidence_is_bound(dict(record["evidence"]), target, self.contract_hash)
+            and str(dict(record["evidence"]).get("kind") or "") == "DETERMINISTIC_COUNTEREXAMPLE"
+        ]
+
+        if target.target_type == "PROVE":
+            if proven:
+                record = proven[-1]
+                return TargetTransition("CLOSED", [str(record.get("item_id") or "")], {}, "target-resolution formal proof")
+            if counterexamples:
+                record = counterexamples[-1]
+                evidence = dict(record["evidence"])
+                return TargetTransition("FAILED", [_evidence_id(evidence)], {}, "target-resolution deterministic counterexample")
+            return None
+
+        if target.target_type == "DISPROVE":
+            if counterexamples:
+                record = counterexamples[-1]
+                evidence = dict(record["evidence"])
+                return TargetTransition("CLOSED", [_evidence_id(evidence)], {}, "target-resolution deterministic counterexample")
+            if proven:
+                record = proven[-1]
+                return TargetTransition("FAILED", [str(record.get("item_id") or "")], {}, "target-resolution formal proof")
+            return None
+
+        if target.target_type == "OPTIMIZE":
+            evidence_records: list[tuple[dict[str, Any], dict[str, Any]]] = []
+            for record in eligible:
+                raw = record.get("evidence")
+                if not isinstance(raw, dict):
+                    continue
+                evidence = dict(raw)
+                if _evidence_is_bound(evidence, target, self.contract_hash):
+                    evidence_records.append((record, evidence))
+            searches = [
+                pair
+                for pair in evidence_records
+                if pair[1].get("kind") == "EXHAUSTIVE_OPTIMUM"
+                and pair[1].get("evidence_role") == "SEARCH_CERTIFICATE"
+            ]
+            checkers = [
+                pair
+                for pair in evidence_records
+                if pair[1].get("kind") == "EXACT_PASS"
+                and pair[1].get("evidence_role") == "INDEPENDENT_CHECKER"
+            ]
+            for _search_record, search in searches:
+                search_candidate = str(dict(search.get("metadata") or {}).get("candidate_sha256") or "")
+                if not search_candidate:
+                    continue
+                for _check_record, checker in checkers:
+                    checker_candidate = str(dict(checker.get("metadata") or {}).get("candidate_sha256") or "")
+                    if checker_candidate != search_candidate:
+                        continue
+                    if str(search.get("tool_sha256") or "") == str(checker.get("tool_sha256") or ""):
+                        continue
+                    return TargetTransition(
+                        "CLOSED",
+                        [_evidence_id(search), _evidence_id(checker)],
+                        {"exhaustiveness_basis": "code_review", "candidate_sha256": search_candidate},
+                        "independent optimum search and checker agree on one candidate",
+                    )
+            return None
+
+        if target.target_type == "COMPUTE":
+            accepted: list[dict[str, Any]] = []
+            for record in eligible:
+                raw = record.get("evidence")
+                if not isinstance(raw, dict):
+                    continue
+                evidence = dict(raw)
+                if not _evidence_is_bound(evidence, target, self.contract_hash):
+                    continue
+                if str(evidence.get("resolution_scope") or "") != "TARGET_RESOLUTION":
+                    continue
+                kind = str(evidence.get("kind") or "")
+                if kind == "EXACT_PASS" or kind.startswith("EXHAUSTIVE_"):
+                    accepted.append(evidence)
+            if not accepted:
+                return None
+            by_tool: dict[str, dict[str, Any]] = {}
+            for evidence in accepted:
+                by_tool.setdefault(str(evidence.get("tool_sha256") or ""), evidence)
+            selected = list(by_tool.values())[:2]
+            return TargetTransition(
+                "CLOSED",
+                [_evidence_id(evidence) for evidence in selected],
+                {"single_source": len(selected) == 1},
+                "target-resolution deterministic computation",
+            )
+
+        if target.target_type == "DISCOVER" and human_approved:
+            return TargetTransition(
+                "CLOSED",
+                [f"human:{_now()}"],
+                {"human_approved": True},
+                "human-approved discovery target",
+            )
+        return None
+
+    def apply_target_transition(self, target_id: str, transition: TargetTransition) -> ResearchTarget:
+        target = self.target(target_id, require_open=True)
+        if transition.status not in {"CLOSED", "FAILED"}:
+            raise ValueError(f"unsupported automatic target transition: {transition.status}")
+        updated = replace(
+            target,
+            status=transition.status,
+            closed_by=list(transition.closed_by),
+            metadata={**target.metadata, **transition.metadata, "transition_reason": transition.reason},
+        )
+        self.open_targets = [updated if entry.id == target_id else entry for entry in self.open_targets]
+        return updated
+
+    def supersede_target(self, target_id: str, superseded_by: str) -> ResearchTarget:
+        target = self.target(target_id, require_open=True)
+        replacement = self.target(superseded_by, require_open=True)
+        if replacement.id == target.id:
+            raise ValueError("target cannot supersede itself")
+        updated = replace(target, status="SUPERSEDED", superseded_by=replacement.id)
+        self.open_targets = [updated if entry.id == target_id else entry for entry in self.open_targets]
+        return updated
 
     def to_dict(self, *, include_integrity: bool = True) -> dict[str, Any]:
         payload = {
@@ -330,6 +516,10 @@ class ResearchContract:
             self.contract_hash = self.compute_hash()
             self.frozen_at = self.frozen_at or _now()
         atomic_write_json(path, self.to_dict())
+        if self.frozen and (existing is None or not existing.frozen):
+            set_research_phase(root, "DISCOVERY" if self.pilot_policy == "NOT_APPLICABLE" else "PILOT")
+        elif not self.frozen and (existing is None or not existing.frozen):
+            set_research_phase(root, "FORMALIZATION")
         return path
 
     def freeze(self, root: str | Path, *, frozen_problem: str | None = None) -> str:
@@ -347,7 +537,8 @@ class ResearchContract:
         self.save(root)
         return self.contract_hash
 
-    def prompt_block(self) -> str:
+    def prompt_block(self, *, target_ids: list[str] | None = None) -> str:
+        allowed = set(target_ids) if target_ids is not None else None
         known = "\n".join(
             f"- {item.get('statement', '')} [{item.get('status', 'KNOWN')}] ({item.get('source', '')})"
             for item in self.known_results
@@ -355,7 +546,7 @@ class ResearchContract:
         targets = "\n".join(
             f"- {target.id} [{target.target_type}] {target.statement}"
             for target in self.open_targets
-            if target.status == "OPEN"
+            if target.status == "OPEN" and (allowed is None or target.id in allowed)
         ) or "- (none)"
         forbidden = "\n".join(f"- {claim}" for claim in self.forbidden_claims) or "- (none)"
         return (
@@ -367,5 +558,6 @@ class ResearchContract:
             f"OPEN TARGETS:\n{targets}\n\n"
             f"FORBIDDEN CLAIMS:\n{forbidden}\n\n"
             f"PILOT POLICY: {self.pilot_policy}\n"
+            "Theorist proposals must choose exactly one listed target_id. claim_role is assigned by code, not by the LLM.\n"
             "--- END FROZEN RESEARCH CONTRACT ---"
         )
