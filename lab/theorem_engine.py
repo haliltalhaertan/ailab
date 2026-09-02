@@ -926,7 +926,7 @@ class TheoremResearchLab:
             if contract is not None and target_id is not None:
                 target = contract.target(target_id, require_open=True)
                 role = contract.claim_role(target_id, claim)
-                protocol_metadata = {
+                protocol_metadata: dict[str, Any] = {
                     "target_id": target_id,
                     "target_hash": target.target_hash,
                     "claim_role": role,
