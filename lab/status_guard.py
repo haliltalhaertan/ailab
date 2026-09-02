@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from lab.evidence import Evidence, evidence_from_tool_result, validate_evidence_binding
+from lab.research_contract import ResearchContract
 from lab.tools import ToolResult
 
 
@@ -15,39 +17,6 @@ class GuardDecision:
     metadata: dict[str, Any]
 
 
-def _tool_is_successful_computation(tool_result: ToolResult | None) -> bool:
-    if tool_result is None or not tool_result.ok:
-        return False
-    metadata = dict(tool_result.metadata or {})
-    if tool_result.tool == "code_experiment":
-        evidence = metadata.get("evidence") or {}
-        try:
-            return int(evidence.get("successful_run_count", 0)) > 0
-        except Exception:
-            return False
-    if tool_result.tool == "tropical_grid":
-        try:
-            cases_checked = int(metadata.get("cases_checked", 0) or 0)
-        except Exception:
-            cases_checked = 0
-        return (
-            str(metadata.get("status") or "").upper() == "GRID_PASS"
-            and cases_checked > 0
-        )
-    if tool_result.tool == "z3":
-        try:
-            assertion_count = int(metadata.get("assertion_count", 0) or 0)
-        except Exception:
-            assertion_count = 0
-        return assertion_count > 0 and str(metadata.get("result") or "").lower() in {
-            "sat",
-            "unsat",
-        }
-    if tool_result.tool == "script":
-        return True
-    return False
-
-
 def choose_status(
     requested: str,
     *,
@@ -57,6 +26,8 @@ def choose_status(
     expected_item_id: str | None = None,
     expected_iteration: int | None = None,
     expected_claim_hash: str | None = None,
+    evidence: Evidence | None = None,
+    contract: ResearchContract | None = None,
 ) -> GuardDecision:
     """Return the strongest status justified by machine-observable evidence."""
 
@@ -64,6 +35,11 @@ def choose_status(
     verifier_verdict = str(verifier.get("verdict") or "INCONCLUSIVE").upper()
     critic_verdict = str(critic.get("verdict") or "REVISE").upper()
     tmeta = dict((tool_result.metadata if tool_result else None) or {})
+    bound_evidence = evidence
+    if bound_evidence is None and tool_result is not None:
+        bound_evidence = evidence_from_tool_result(tool_result, contract=contract)
+    if bound_evidence is not None:
+        bound_evidence = validate_evidence_binding(bound_evidence, contract=contract)
 
     claim_hash_matches = bool(
         expected_claim_hash
@@ -78,28 +54,27 @@ def choose_status(
         and tmeta.get("axioms_verified") is True
         and tmeta.get("formal_binding_verified") is True
         and claim_hash_matches
-        and (
-            expected_item_id is None
-            or str(tmeta.get("item_id") or "") == str(expected_item_id)
-        )
-        and (
-            expected_iteration is None
-            or int(tmeta.get("iteration", -1)) == int(expected_iteration)
-        )
+        and (expected_item_id is None or str(tmeta.get("item_id") or "") == str(expected_item_id))
+        and (expected_iteration is None or int(tmeta.get("iteration", -1)) == int(expected_iteration))
     )
-    computation_ok = _tool_is_successful_computation(tool_result)
-
-    tropical_counterexample = bool(
-        tool_result
-        and tool_result.tool == "tropical_grid"
-        and str(tmeta.get("status") or "").upper() == "COUNTEREXAMPLE"
+    evidence_kind = bound_evidence.kind if bound_evidence is not None else "INCONCLUSIVE"
+    computation_ok = bool(
+        bound_evidence
+        and bound_evidence.ok
+        and evidence_kind
+        in {
+            "EXACT_PASS",
+            "EXHAUSTIVE_NO_SOLUTION",
+            "EXHAUSTIVE_OPTIMUM",
+            "NUMERICAL_PASS",
+        }
     )
-    verified_tool_counterexample = bool(
-        tool_result
-        and tool_result.tool in {"script", "code_experiment"}
-        and tmeta.get("counterexample_verified") is True
+    deterministic_counterexample = bool(
+        bound_evidence
+        and bound_evidence.ok
+        and evidence_kind == "DETERMINISTIC_COUNTEREXAMPLE"
+        and bound_evidence.witness is not None
     )
-    deterministic_counterexample = tropical_counterexample or verified_tool_counterexample
 
     verifier_counterexample = str(verifier.get("counterexample") or "").strip()
     critic_counterexample = str(critic.get("counterexample") or "").strip()
@@ -118,27 +93,20 @@ def choose_status(
         "verifier_verdict": verifier_verdict,
         "critic_verdict": critic_verdict,
         "deterministic_counterexample": deterministic_counterexample,
-        "deterministic_counterexample_type": (
-            "TROPICAL_GRID"
-            if tropical_counterexample
-            else "VERIFIED_TOOL"
-            if verified_tool_counterexample
-            else ""
-        ),
+        "deterministic_counterexample_type": evidence_kind if deterministic_counterexample else "",
         "llm_counterexample": llm_counterexample,
         "llm_refutation_candidate": llm_refutation_candidate,
         "expected_item_id": expected_item_id,
         "expected_iteration": expected_iteration,
+        "evidence_kind": evidence_kind,
+        "evidence_hash": bound_evidence.evidence_hash if bound_evidence else "",
+        "source_origin": bound_evidence.source_origin if bound_evidence else "",
+        "evidence_role": bound_evidence.evidence_role if bound_evidence else "",
+        "resolution_scope": bound_evidence.resolution_scope if bound_evidence else "",
     }
 
     if deterministic_counterexample:
-        return GuardDecision(
-            requested,
-            "FAIL",
-            "Deterministically verified counterexample evidence forces FAIL.",
-            requested != "FAIL",
-            metadata,
-        )
+        return GuardDecision(requested, "FAIL", "Deterministically verified counterexample evidence forces FAIL.", requested != "FAIL", metadata)
 
     if llm_refutation_candidate:
         return GuardDecision(
@@ -168,34 +136,16 @@ def choose_status(
 
     if requested == "PROOF_CANDIDATE":
         if verifier_verdict == "PASS" and critic_verdict != "KILL":
-            return GuardDecision(
-                requested,
-                "PROOF_CANDIDATE",
-                "Verifier PASS and critic did not KILL.",
-                False,
-                metadata,
-            )
-        return GuardDecision(
-            requested,
-            "OPEN",
-            "PROOF_CANDIDATE rejected by verifier/critic guard.",
-            True,
-            metadata,
-        )
+            return GuardDecision(requested, "PROOF_CANDIDATE", "Verifier PASS and critic did not KILL.", False, metadata)
+        return GuardDecision(requested, "OPEN", "PROOF_CANDIDATE rejected by verifier/critic guard.", True, metadata)
 
     if requested == "COMPUTATION_PASS":
         if computation_ok:
-            return GuardDecision(
-                requested,
-                "COMPUTATION_PASS",
-                "Successful non-empty deterministic computation evidence exists.",
-                False,
-                metadata,
-            )
+            return GuardDecision(requested, "COMPUTATION_PASS", "Bound machine evidence justifies computation status.", False, metadata)
         return GuardDecision(
             requested,
             "OPEN",
-            "COMPUTATION_PASS rejected: no meaningful successful deterministic tool evidence.",
+            f"COMPUTATION_PASS rejected: evidence kind {evidence_kind} is not sufficient.",
             True,
             metadata,
         )
@@ -209,13 +159,7 @@ def choose_status(
                 True,
                 metadata,
             )
-        return GuardDecision(
-            requested,
-            "OPEN",
-            "FAIL rejected: insufficient deterministic failure evidence.",
-            True,
-            metadata,
-        )
+        return GuardDecision(requested, "OPEN", "FAIL rejected: insufficient deterministic failure evidence.", True, metadata)
 
     if requested == "REFUTATION_CANDIDATE":
         return GuardDecision(
@@ -227,18 +171,6 @@ def choose_status(
         )
 
     if requested == "DROPPED":
-        return GuardDecision(
-            requested,
-            "DROPPED",
-            "Manager explicitly closed the research direction.",
-            False,
-            metadata,
-        )
+        return GuardDecision(requested, "DROPPED", "Manager explicitly closed the research direction.", False, metadata)
 
-    return GuardDecision(
-        requested,
-        "OPEN",
-        "OPEN is always admissible.",
-        requested != "OPEN",
-        metadata,
-    )
+    return GuardDecision(requested, "OPEN", "OPEN is always admissible.", requested != "OPEN", metadata)
