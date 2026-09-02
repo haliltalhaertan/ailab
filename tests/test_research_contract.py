@@ -88,6 +88,7 @@ def _agents():
                     {
                         "title": "Small claim",
                         "claim": "3 + 4 = 7",
+                        "target_id": "T1",
                         "strategy": "direct",
                         "evidence_needed": [],
                         "tool_request": {"tool": "none"},

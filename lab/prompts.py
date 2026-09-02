@@ -21,6 +21,7 @@ def proposal_schema(registry: ToolRegistry | None = None) -> dict[str, Any]:
     return {
         "title": "...",
         "claim": "...",
+        "target_id": "",
         "strategy": "...",
         "evidence_needed": ["..."],
         "tool_request": {
@@ -58,13 +59,19 @@ def proposal_prompt(
     ledger: str,
     next_task: str,
     registry: ToolRegistry | None = None,
+    *,
+    contract_block: str = "",
+    pilot_block: str = "",
 ) -> str:
     return (
         f"PROBLEM (frozen):\n{problem}\n\n"
         f"LITERATURE SCREEN:\n{literature}\n\n"
         f"RESEARCH LEDGER SNAPSHOT (frozen for this iteration):\n{ledger}\n\n"
-        f"CURRENT TASK:\n{next_task}\n\n"
+        f"CURRENT TASK:\n{next_task}\n"
+        f"{contract_block}{pilot_block}\n\n"
         "Produce exactly one research candidate. Do not reopen a FAIL/DROPPED idea listed in the ledger. "
+        "When a frozen research contract is present, target_id MUST be one of the OPEN TARGETS shown in the contract block; "
+        "do not invent claim_role because code assigns SUBCLAIM/TARGET_RESOLUTION. "
         "A REFUTATION_CANDIDATE is still active: when relevant, prioritize checking its claimed counterexample with a deterministic tool instead of treating it as settled. "
         "Separate proved facts from assumptions. If computation/formal checking is useful, request one tool. "
         "For lean_draft, theorem_name and theorem_type are mandatory and must describe the exact single theorem/lemma in source; "
@@ -116,24 +123,36 @@ def manager_prompt(
     tool_result: dict | None,
     verification: dict,
     critique: dict,
+    *,
+    contract_block: str = "",
 ) -> str:
     return (
         f"Frozen problem:\n{problem}\n\nCandidate {item_id}: {claim}\n\n"
         f"Tool:\n{json.dumps(tool_result, ensure_ascii=False, indent=2)}\n"
         f"Verifier:\n{json.dumps(verification, ensure_ascii=False, indent=2)}\n"
-        f"Critic:\n{json.dumps(critique, ensure_ascii=False, indent=2)}\n\n"
-        "Choose research direction. Status is a REQUEST only; code-side evidence guards may downgrade it. "
+        f"Critic:\n{json.dumps(critique, ensure_ascii=False, indent=2)}\n"
+        f"{contract_block}\n\n"
+        "Choose research direction. Status and target transitions are REQUESTS only; code-side evidence guards may downgrade or reject them. "
         "An LLM-written counterexample is only a REFUTATION_CANDIDATE until a deterministic tool verifies it; make deterministic verification the next task rather than treating the claim as dead. "
-        "Do not claim PROVEN unless a successful same-item bound formal checker result is explicitly present. Return ONLY JSON: "
+        "Do not claim PROVEN unless a successful same-item bound formal checker result is explicitly present. "
+        "If you propose a target transition, put it in target_proposal; code will apply it only when the target-type evidence gate is satisfied. Return ONLY JSON: "
         '{"decision":"KEEP|REVISE|KILL|CHECKPOINT","status":"OPEN|REFUTATION_CANDIDATE|COMPUTATION_PASS|PROOF_CANDIDATE|PROVEN|FAIL|DROPPED",'
-        '"reason":"...","next_task":"..."}'
+        '"reason":"...","next_task":"...","target_proposal":{"target_id":"","status":"CLOSED|FAILED|SUPERSEDED","superseded_by":""}}'
     )
 
 
-def checkpoint_prompt(problem: str, ledger: str, iteration: int, *, final: bool = False) -> str:
+def checkpoint_prompt(
+    problem: str,
+    ledger: str,
+    iteration: int,
+    *,
+    final: bool = False,
+    contract_block: str = "",
+) -> str:
     label = "FINAL INDEPENDENT AUDIT" if final else f"INDEPENDENT AUDIT CHECKPOINT AFTER ITERATION {iteration}"
     return (
-        f"{label}\n\nFrozen problem:\n{problem}\n\nLedger:\n{ledger}\n\n"
+        f"{label}\n\nFrozen problem:\n{problem}\n\nLedger:\n{ledger}\n{contract_block}\n\n"
         "Audit with zero trust. Look for LLM opinion being treated as evidence, reopened failed ideas, claim/evidence mismatches, "
-        "formal statement/claim mismatches, and novelty overclaims. Return PASS / PASS-WITH-GAPS / FAIL with reasons."
+        "formal statement/claim mismatches, novelty overclaims, and whether pilot_policy/forbidden_claims are being respected. "
+        "Return PASS / PASS-WITH-GAPS / FAIL with reasons."
     )

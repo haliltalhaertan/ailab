@@ -4,7 +4,7 @@ import hashlib
 import json
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +17,13 @@ from lab.json_io import StructuredOutputError, parse_json_object, repair_instruc
 from lab.literature import LiteratureClient, LiteratureSearchEmpty, Paper
 from lab.prompts import checkpoint_prompt, critic_prompt, literature_prompt, manager_prompt, proposal_prompt, verifier_prompt
 from lab.research_contract import ResearchContract
+from lab.research_protocol import (
+    evaluate_manager_target_proposal,
+    ledger_records,
+    pilot_evidence_by_target,
+    pilot_prompt_block,
+    selectable_target_ids,
+)
 from lab.research_state import ResearchState
 from lab.run_controller import ResearchPaused, ResearchStopped, RunController, atomic_json, now_iso, retryable
 from lab.status_guard import choose_status
@@ -149,15 +156,20 @@ class TheoremResearchLab:
         literature_query: str | None,
         checkpoint_every: int,
         agents: dict[str, Agent],
+        *,
+        allow_discovery_without_pilot: bool = False,
     ) -> None:
         if self.code_agent is not None:
             agents = {**agents, "CodeExperimentAgent": self.code_agent}
+        contract = ResearchContract.load_optional(self.state.root)
         payload = {
             "config_version": 3,
             "problem": problem,
             "iterations": int(iterations),
             "literature_query": literature_query,
             "checkpoint_every": int(checkpoint_every),
+            "allow_discovery_without_pilot": bool(allow_discovery_without_pilot),
+            "contract_hash": contract.contract_hash if contract is not None and contract.frozen else "",
             "agents": {
                 role: {
                     "name": agent.name,
@@ -614,6 +626,144 @@ class TheoremResearchLab:
         self._active_claim_sha256 = hashlib.sha256(item.claim.encode("utf-8")).hexdigest()
         return item
 
+    def _validate_proposal_target(
+        self,
+        proposer: Agent,
+        proposal: dict[str, Any],
+        *,
+        contract: ResearchContract | None,
+        selectable_ids: list[str],
+        iteration: int,
+    ) -> tuple[dict[str, Any], str | None]:
+        if contract is None:
+            return proposal, None
+
+        def valid_target(value: dict[str, Any]) -> str | None:
+            target_id = str(value.get("target_id") or "").strip()
+            if target_id not in selectable_ids:
+                return None
+            try:
+                contract.target(target_id, require_open=True)
+            except (KeyError, ValueError):
+                return None
+            return target_id
+
+        target_id = valid_target(proposal)
+        if target_id:
+            return proposal, target_id
+        self.trace.log(
+            "proposal_target_rejected",
+            iteration=iteration,
+            selected=str(proposal.get("target_id") or ""),
+            valid_target_ids=selectable_ids,
+        )
+        repair = (
+            "The previous proposal violated the frozen research target protocol. "
+            f"Choose exactly one target_id from {json.dumps(selectable_ids, ensure_ascii=False)} and return the COMPLETE corrected proposal JSON. "
+            "Do not invent claim_role; code assigns it. Previous proposal:\n"
+            + json.dumps(proposal, ensure_ascii=False)
+        )
+        repaired = self._call_json(proposer, repair, f"iter:{iteration}:target_repair")
+        target_id = valid_target(repaired)
+        if not target_id:
+            self.trace.log(
+                "proposal_target_rejected",
+                iteration=iteration,
+                selected=str(repaired.get("target_id") or ""),
+                valid_target_ids=selectable_ids,
+                after_repair=True,
+            )
+            raise ResearchPaused("Theorist geçerli bir open target seçemedi")
+        return repaired, target_id
+
+    def _pilot_gate(
+        self,
+        contract: ResearchContract | None,
+        *,
+        allow_discovery_without_pilot: bool,
+    ) -> tuple[dict[str, list[dict[str, Any]]], list[str], bool]:
+        if contract is None:
+            return {}, [], False
+        if not contract.frozen:
+            self.controller.set_research_phase("FORMALIZATION")
+            raise ResearchPaused("Research contract dondurulmadan discovery başlatılamaz.")
+        grouped = pilot_evidence_by_target(contract, self.state)
+        overridden = False
+        if contract.pilot_policy == "REQUIRED" and not grouped:
+            if allow_discovery_without_pilot:
+                overridden = True
+                self.trace.log("pilot_gate_overridden", contract_hash=contract.contract_hash)
+            else:
+                self.controller.set_research_phase("PILOT")
+                self.trace.log("pilot_missing", contract_hash=contract.contract_hash, pilot_policy=contract.pilot_policy)
+                raise ResearchPaused("Pilot evidence yok; deterministic pilot çalıştırılmadan LLM discovery başlatılmaz.")
+        elif contract.pilot_policy == "OPTIONAL" and not grouped:
+            self.trace.log("pilot_missing", contract_hash=contract.contract_hash, pilot_policy=contract.pilot_policy)
+        selectable = selectable_target_ids(
+            contract,
+            grouped,
+            allow_discovery_without_pilot=overridden,
+        )
+        if not selectable:
+            if not contract.open_target_ids():
+                return grouped, [], overridden
+            self.controller.set_research_phase("PILOT")
+            raise ResearchPaused("Discovery için seçilebilir OPEN hedef yok.")
+        return grouped, selectable, overridden
+
+    def run_pilot(
+        self,
+        *,
+        target_id: str,
+        script_name: str,
+        args: list[str] | None = None,
+    ):
+        """Run one deterministic checked-in pilot without entering the LLM loop."""
+
+        with self.controller.lock:
+            contract = ResearchContract.load(self.state.root)
+            if not contract.frozen:
+                raise ResearchPaused("Pilot run için frozen research contract gerekli.")
+            contract.target(target_id, require_open=True)
+            self.controller.set_research_phase("PILOT")
+            request = {"tool": "script", "name": script_name, "args": list(args or [])}
+            result = self._tool(request, f"pilot:{target_id}:{content_fingerprint('pilot:v1', request)[:16]}")
+            if result is None:
+                raise ResearchPaused("Deterministic pilot tool result üretmedi.")
+            evidence = evidence_from_tool_result(result, request=request, contract=contract, target_id=target_id)
+            evidence = validate_evidence_binding(evidence, contract=contract)
+            item = self.state.add_item(
+                "experiment",
+                title=f"Deterministic pilot for {target_id}",
+                claim=f"Pilot script {script_name}",
+                status="KNOWN",
+                metadata={
+                    "target_id": target_id,
+                    "contract_hash": contract.contract_hash,
+                    "evidence": evidence.as_dict(),
+                    "pilot": True,
+                },
+            )
+            self.trace.log(
+                "pilot_result",
+                item_id=item.id,
+                target_id=target_id,
+                evidence=evidence.as_dict(),
+            )
+            transition = contract.evaluate_target_transition(target_id, ledger_records(self.state))
+            if transition is not None:
+                updated = contract.apply_target_transition(target_id, transition)
+                contract.save(self.state.root)
+                self.trace.log(
+                    "pilot_target_transition_applied",
+                    item_id=item.id,
+                    target_id=target_id,
+                    status=updated.status,
+                    closed_by=list(updated.closed_by),
+                    reason=transition.reason,
+                )
+            return item
+
     def run(
         self,
         problem: str,
@@ -628,6 +778,7 @@ class TheoremResearchLab:
         iterations: int = 5,
         literature_query: str | None = None,
         checkpoint_every: int = 2,
+        allow_discovery_without_pilot: bool = False,
     ) -> str:
         try:
             with self.controller.lock:
@@ -654,7 +805,14 @@ class TheoremResearchLab:
                     if literature_agent is not None:
                         agents["LiteratureScout"] = literature_agent
                     agents["CodeExperimentAgent"] = code_agent
-                    self._save_config(problem, iterations, literature_query, checkpoint_every, agents)
+                    self._save_config(
+                        problem,
+                        iterations,
+                        literature_query,
+                        checkpoint_every,
+                        agents,
+                        allow_discovery_without_pilot=allow_discovery_without_pilot,
+                    )
                     self.controller.clear_stale_stop()
                     result = self._run_inner(
                         problem,
@@ -667,6 +825,7 @@ class TheoremResearchLab:
                         iterations=iterations,
                         literature_query=literature_query,
                         checkpoint_every=checkpoint_every,
+                        allow_discovery_without_pilot=allow_discovery_without_pilot,
                     )
                     self._set_runtime(status="COMPLETED", last_error="")
                     return result
@@ -703,16 +862,39 @@ class TheoremResearchLab:
         iterations: int,
         literature_query: str | None,
         checkpoint_every: int,
+        allow_discovery_without_pilot: bool,
     ) -> str:
         try:
             self.state.freeze_problem(problem)
         except ValueError as exc:
             raise ResearchPaused(f"Research contract integrity error: {exc}") from exc
         self.trace.log("problem_frozen", problem=problem)
+
+        try:
+            contract = ResearchContract.load_optional(self.state.root)
+        except ValueError as exc:
+            raise ResearchPaused(f"Research contract integrity error: {exc}") from exc
+        pilot_groups, selectable_ids, gate_overridden = self._pilot_gate(
+            contract,
+            allow_discovery_without_pilot=allow_discovery_without_pilot,
+        )
+        contract_block = contract.prompt_block(target_ids=selectable_ids) if contract is not None else ""
+        pilot_block = pilot_prompt_block(contract, pilot_groups) if contract is not None else ""
+
         runtime = self._runtime()
         completed = int(runtime.get("completed_iterations", 0) or 0)
         next_task = str(runtime.get("next_task") or "").strip() or "Problemi daralt; bilinen sınırları ihlal etmeyen, çürütülebilir tek bir lemma, construction veya lower-bound mekanizması öner."
         self._set_runtime(status="RUNNING", last_error="")
+
+        if contract is not None and not selectable_ids and not contract.open_target_ids():
+            self.trace.log(
+                "run_completed_all_targets_closed",
+                completed_iterations=completed,
+                requested_iterations=int(iterations),
+                source="pre_iteration_gate",
+            )
+            final_path = self.state.checkpoint("final", note="All frozen targets already resolved by machine evidence.")
+            return "# Teorem Araştırması Sonucu\n\nTüm frozen hedefler makine kanıtıyla zaten çözüldü.\n\nCheckpoint: `" + str(final_path) + "`"
 
         papers = self._search_literature(literature_query or problem)
         literature_context = paper_context(papers)
@@ -735,6 +917,14 @@ class TheoremResearchLab:
 
         outcomes: list[IterationOutcome] = []
         for iteration in range(completed + 1, int(iterations) + 1):
+            if contract is not None and not selectable_ids:
+                self.trace.log(
+                    "run_completed_all_targets_closed",
+                    completed_iterations=int(self._runtime().get("completed_iterations", 0) or 0),
+                    requested_iterations=int(iterations),
+                    source="iteration_gate",
+                )
+                break
             self._check_stop()
             self._set_runtime(current_iteration=iteration, current_step="iteration_start")
             snapshot = self._iteration_snapshot(iteration, next_task)
@@ -742,19 +932,54 @@ class TheoremResearchLab:
             ledger_context = str(snapshot.get("ledger_context") or "")
             self.trace.log("iteration_start", iteration=iteration, next_task=frozen_next_task, ledger_revision=snapshot.get("ledger_revision"))
 
+            if contract is not None:
+                self.controller.set_research_phase("DISCOVERY")
             proposal = self._call_json(
                 proposer,
-                proposal_prompt(problem, literature_context, ledger_context, frozen_next_task, self.registry),
+                proposal_prompt(
+                    problem,
+                    literature_context,
+                    ledger_context,
+                    frozen_next_task,
+                    self.registry,
+                    contract_block=contract_block,
+                    pilot_block=pilot_block,
+                ),
                 f"iter:{iteration}:proposer",
+            )
+            proposal, target_id = self._validate_proposal_target(
+                proposer,
+                proposal,
+                contract=contract,
+                selectable_ids=selectable_ids,
+                iteration=iteration,
             )
             item = self._ensure_item_matches_proposal(iteration, proposal, snapshot)
             claim = item.claim
+            if contract is not None and target_id is not None:
+                target = contract.target(target_id, require_open=True)
+                role = contract.claim_role(target_id, claim)
+                protocol_metadata: dict[str, Any] = {
+                    "target_id": target_id,
+                    "target_hash": target.target_hash,
+                    "claim_role": role,
+                }
+                if contract.pilot_policy == "OPTIONAL" and not pilot_groups.get(target_id):
+                    protocol_metadata["pilot_missing"] = True
+                if gate_overridden:
+                    protocol_metadata["pilot_gate_overridden"] = True
+                self.state.update_item(item.id, metadata=protocol_metadata)
+                self.trace.log(
+                    "claim_role_assigned",
+                    iteration=iteration,
+                    item_id=item.id,
+                    target_id=target_id,
+                    claim_role=role,
+                )
 
             request = proposal.get("tool_request")
             tool_request = request if isinstance(request, dict) else None
             tool_result = self._tool(tool_request, f"iter:{iteration}:tool")
-            contract = ResearchContract.load_optional(self.state.root)
-            target_id = str(proposal.get("target_id") or "").strip() or None
             bound_evidence = None
             if tool_result is not None:
                 try:
@@ -763,6 +988,10 @@ class TheoremResearchLab:
                         request=tool_request,
                         contract=contract,
                         target_id=target_id,
+                    )
+                    bound_evidence = replace(
+                        bound_evidence,
+                        metadata={**bound_evidence.metadata, "item_id": item.id},
                     )
                     bound_evidence = validate_evidence_binding(bound_evidence, contract=contract)
                 except (KeyError, ValueError) as exc:
@@ -794,7 +1023,15 @@ class TheoremResearchLab:
             )
             manager_decision = self._call_json(
                 manager,
-                manager_prompt(problem, item.id, claim, tool_result.as_dict() if tool_result else None, verification, critique),
+                manager_prompt(
+                    problem,
+                    item.id,
+                    claim,
+                    tool_result.as_dict() if tool_result else None,
+                    verification,
+                    critique,
+                    contract_block=contract.prompt_block() if contract is not None else "",
+                ),
                 f"iter:{iteration}:manager",
             )
             decision = str(manager_decision.get("decision") or "REVISE").upper()
@@ -814,6 +1051,8 @@ class TheoremResearchLab:
                 contract=contract,
             )
             status = guard.granted
+            if status in {"PROOF_CANDIDATE", "PROVEN"}:
+                self.controller.set_research_phase("PROOF")
             if guard.downgraded:
                 self.trace.log(
                     "status_downgraded_by_guard",
@@ -866,6 +1105,38 @@ class TheoremResearchLab:
                     metadata.update(formal_metadata)
                 self.state.update_item(item.id, status=status, evidence=evidence, metadata=metadata)
 
+            if contract is not None:
+                target_proposal = manager_decision.get("target_proposal")
+                if isinstance(target_proposal, dict) and any(str(value or "").strip() for value in target_proposal.values()):
+                    self.trace.log(
+                        "target_transition_proposed",
+                        iteration=iteration,
+                        item_id=item.id,
+                        proposal=target_proposal,
+                    )
+                    applied, transition_reason, transition_detail = evaluate_manager_target_proposal(
+                        contract,
+                        self.state,
+                        manager_decision,
+                    )
+                    self.trace.log(
+                        "target_transition_applied" if applied else "target_transition_rejected",
+                        iteration=iteration,
+                        item_id=item.id,
+                        reason=transition_reason,
+                        detail=transition_detail,
+                    )
+                    if applied:
+                        contract = ResearchContract.load(self.state.root)
+                        pilot_groups = pilot_evidence_by_target(contract, self.state)
+                        selectable_ids = selectable_target_ids(
+                            contract,
+                            pilot_groups,
+                            allow_discovery_without_pilot=gate_overridden,
+                        )
+                        contract_block = contract.prompt_block(target_ids=selectable_ids)
+                        pilot_block = pilot_prompt_block(contract, pilot_groups)
+
             old_status = item.status
             self.trace.log("state_change", action="status", item_id=item.id, kind="conjecture", old_status=old_status, new_status=status, decision=decision, reason=str(manager_decision.get("reason") or ""))
             next_task = str(manager_decision.get("next_task") or frozen_next_task)
@@ -875,7 +1146,16 @@ class TheoremResearchLab:
 
             if checkpoint_every and iteration % checkpoint_every == 0:
                 ledger = self.state.research_context(recent_limit=50)
-                audit = self._call(auditor, checkpoint_prompt(problem, ledger, iteration), f"iter:{iteration}:checkpoint_audit")
+                audit = self._call(
+                    auditor,
+                    checkpoint_prompt(
+                        problem,
+                        ledger,
+                        iteration,
+                        contract_block=contract.prompt_block() if contract is not None else "",
+                    ),
+                    f"iter:{iteration}:checkpoint_audit",
+                )
                 title = f"Checkpoint audit {iteration}"
                 if not [x for x in self.state.list_items(kind="audit") if x.title == title]:
                     audit_item = self.state.add_item("audit", title, audit, status="KNOWN", metadata={"iteration": iteration, "independent": True})
@@ -883,7 +1163,17 @@ class TheoremResearchLab:
                     self.trace.log("checkpoint", iteration=iteration, audit_item_id=audit_item.id, path=str(checkpoint_path), audit=audit)
 
         final_ledger = self.state.research_context(recent_limit=80)
-        final_audit = self._call(auditor, checkpoint_prompt(problem, final_ledger, int(iterations), final=True), "final:audit")
+        final_audit = self._call(
+            auditor,
+            checkpoint_prompt(
+                problem,
+                final_ledger,
+                int(iterations),
+                final=True,
+                contract_block=contract.prompt_block() if contract is not None else "",
+            ),
+            "final:audit",
+        )
         final_path = self.state.checkpoint("final", note=final_audit[:1500])
         self.trace.log("checkpoint", final=True, path=str(final_path), audit=final_audit)
         lines = ["# Teorem Araştırması Sonucu", "", "## Tur Sonuçları"]

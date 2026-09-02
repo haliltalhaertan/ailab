@@ -23,6 +23,51 @@ def test_script_tool_blocks_path_traversal(tmp_path: Path):
     assert "dışına" in result.error
 
 
+def test_script_tool_runs_from_secondary_trusted_root(tmp_path: Path):
+    primary = tmp_path / "research_tools"
+    secondary = tmp_path / "problem_packs"
+    primary.mkdir()
+    pack = secondary / "toy"
+    pack.mkdir(parents=True)
+    (pack / "check.py").write_text("print('PACK_OK')", encoding="utf-8")
+
+    tool = ScriptTool(primary, trusted_roots=[secondary])
+    result = tool.run("toy/check.py")
+
+    assert result.ok
+    assert result.output == "PACK_OK"
+
+
+def test_script_tool_rejects_parent_segments_across_trusted_roots(tmp_path: Path):
+    primary = tmp_path / "research_tools"
+    secondary = tmp_path / "problem_packs"
+    primary.mkdir()
+    pack = secondary / "toy"
+    pack.mkdir(parents=True)
+    (pack / "check.py").write_text("print('PACK_OK')", encoding="utf-8")
+
+    tool = ScriptTool(primary, trusted_roots=[secondary])
+    result = tool.run("../problem_packs/toy/check.py")
+
+    assert not result.ok
+    assert "dışına" in result.error
+
+
+def test_script_tool_rejects_ambiguous_relative_name(tmp_path: Path):
+    primary = tmp_path / "research_tools"
+    secondary = tmp_path / "problem_packs"
+    primary.mkdir()
+    secondary.mkdir()
+    (primary / "same.py").write_text("print('PRIMARY')", encoding="utf-8")
+    (secondary / "same.py").write_text("print('SECONDARY')", encoding="utf-8")
+
+    tool = ScriptTool(primary, trusted_roots=[secondary])
+    result = tool.run("same.py")
+
+    assert not result.ok
+    assert "birden fazla" in result.error
+
+
 def test_z3_tool_returns_unsat():
     result = Z3Tool().check(
         """

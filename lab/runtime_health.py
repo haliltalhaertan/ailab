@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from lab.integrity import atomic_write_json, process_alive, project_lock_owner, read_json_tolerant
+from lab.run_controller import DEFAULT_RESEARCH_PHASE
 
 
 STALE_HEARTBEAT_S = 120.0
@@ -110,6 +111,8 @@ def normalize_runtime(
     run or a new worker safely takes ownership. This makes stale detection a
     diagnostic/UI state rather than an implicit destructive recovery step.
     ``persist`` is retained for API compatibility and intentionally ignored.
+    Research phase is orthogonal to execution health and is preserved verbatim;
+    legacy runtime files expose LITERATURE in-memory without being rewritten.
     """
 
     del persist
@@ -118,6 +121,7 @@ def normalize_runtime(
     if not current:
         raw = read_json_tolerant(root / "runtime.json", {})
         current = dict(raw) if isinstance(raw, dict) else {}
+    current.setdefault("research_phase", DEFAULT_RESEARCH_PHASE)
     reason = stale_running_reason(root, current, heartbeat_timeout_s=heartbeat_timeout_s)
     if not reason:
         return current
@@ -147,6 +151,7 @@ def cleanup_stale_run(project_root: str | Path) -> dict[str, Any]:
     (root / "run.lock").unlink(missing_ok=True)
     now = _now()
     cleaned = dict(current)
+    cleaned.setdefault("research_phase", DEFAULT_RESEARCH_PHASE)
     cleaned.update(
         {
             "status": "INTERRUPTED",
