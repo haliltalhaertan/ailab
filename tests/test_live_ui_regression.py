@@ -180,6 +180,6 @@ def test_main_page_shows_research_loop_stage_progress_and_timeline(tmp_path, mon
         assert any("Araştırma Döngüsü · live-loop" in value for value in subheader_values)
         assert any("Tur 1/1 · Sceptik · eleştiri" in value for value in markdown_values)
         assert any("İlk çözüm · Teorisyen" in value for value in caption_values)
-        assert len(at.progress) >= 1
+        assert len(at.get("progress")) >= 1
     finally:
         lock.release()
