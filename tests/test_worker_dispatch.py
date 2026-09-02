@@ -133,11 +133,13 @@ def test_non_theorem_worker_dispatch_completes_without_touching_research_ledger(
     }
     (root / "worker_request.json").write_text(json.dumps(request), encoding="utf-8")
 
-    assert worker.run_project(info.project_id, agent_factory=fake_agent_factory) == 0
+    exit_code = worker.run_project(info.project_id, agent_factory=fake_agent_factory)
+    worker_result = (root / "worker_result.md").read_text(encoding="utf-8")
+    assert exit_code == 0, worker_result
     assert before == state_path.read_bytes()
     runtime = json.loads((root / "runtime.json").read_text(encoding="utf-8"))
     assert runtime["status"] == "COMPLETED"
-    assert (root / "worker_result.md").read_text(encoding="utf-8").strip()
+    assert worker_result.strip()
     assert not (root / "run.lock").exists()
     run_dirs = [path for path in (tmp_path / "runs").iterdir() if path.is_dir()]
     assert len(run_dirs) == 1
