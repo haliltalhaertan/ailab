@@ -833,11 +833,17 @@ class TheoremResearchLab:
             )
             if status == "FAIL" and (deterministic_tool_counterexample or counterexample):
                 existing = [x for x in self.state.list_items(kind="counterexample") if x.metadata.get("target_id") == item.id]
-                if not existing:
+                if existing:
+                    counter = existing[-1]
+                else:
                     desc = "Deterministically verified tool counterexample" if deterministic_tool_counterexample else counterexample
                     payload = bound_evidence.witness if deterministic_tool_counterexample and bound_evidence else None
                     counter = self.state.add_counterexample(item.id, desc, payload=payload)
                     self.trace.log("state_change", action="counterexample", item_id=counter.id, target_id=item.id, kind="counterexample", status="KNOWN", detail=desc)
+                if bound_evidence is not None:
+                    evidence_metadata = bound_evidence.as_dict()
+                    self.state.update_item(counter.id, metadata={"evidence": evidence_metadata})
+                    self.state.update_item(item.id, metadata={"evidence": evidence_metadata})
             else:
                 evidence = [
                     "Verifier: " + json.dumps(verification, ensure_ascii=False),
