@@ -308,12 +308,15 @@ class ResearchContract:
         for index, prior in enumerate(existing.known_results):
             if self.known_results[index] != prior:
                 raise ValueError("known_results existing entries cannot change")
-        current = {target.id: target for target in self.open_targets}
-        for prior in existing.open_targets:
-            target = current.get(prior.id)
-            if target is None:
+        current_targets = {entry.id: entry for entry in self.open_targets}
+        for prior_target in existing.open_targets:
+            matched_target = current_targets.get(prior_target.id)
+            if matched_target is None:
                 raise ValueError("open_targets is append-only")
-            if target.statement != prior.statement or target.target_type != prior.target_type:
+            if (
+                matched_target.statement != prior_target.statement
+                or matched_target.target_type != prior_target.target_type
+            ):
                 raise ValueError("target statement and target_type are immutable")
 
     def save(self, root: str | Path) -> Path:

@@ -702,7 +702,10 @@ class TheoremResearchLab:
         literature_query: str | None,
         checkpoint_every: int,
     ) -> str:
-        self.state.freeze_problem(problem)
+        try:
+            self.state.freeze_problem(problem)
+        except ValueError as exc:
+            raise ResearchPaused(f"Research contract integrity error: {exc}") from exc
         self.trace.log("problem_frozen", problem=problem)
         runtime = self._runtime()
         completed = int(runtime.get("completed_iterations", 0) or 0)
