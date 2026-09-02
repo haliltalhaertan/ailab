@@ -30,9 +30,8 @@ class ToolRegistry:
             raise ValueError("tool name invalid")
         self._handlers[key] = handler
 
-    def names(self, *, include_none: bool = True) -> tuple[str, ...]:
-        names = tuple(sorted(self._handlers))
-        return (("none",) + names) if include_none else names
+    def names(self) -> tuple[str, ...]:
+        return ("none",) + tuple(sorted(self._handlers))
 
     def schema_string(self) -> str:
         return "|".join(self.names())

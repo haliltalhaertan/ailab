@@ -1,5 +1,5 @@
 from lab.client import LLMResponse
-from lab.partial_resume_theorem_lab import TheoremResearchLab
+from lab.integrity_theorem_lab import TheoremResearchLab
 from lab.research_state import ResearchState
 from lab.trace import Trace
 

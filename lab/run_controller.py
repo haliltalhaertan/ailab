@@ -112,8 +112,3 @@ class RunController:
 
     def clear_stale_stop(self) -> None:
         self.stop_path.unlink(missing_ok=True)
-
-    def backoff(self, attempt: int) -> int:
-        wait_s = min(2 ** max(0, attempt - 1), 8)
-        time.sleep(wait_s)
-        return wait_s

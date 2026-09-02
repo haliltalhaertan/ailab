@@ -1,8 +1,8 @@
 from pathlib import Path
 
 from lab.client import LLMResponse
+from lab.integrity_theorem_lab import TheoremResearchLab
 from lab.research_state import ResearchState
-from lab.theorem_lab import TheoremResearchLab
 from lab.tools import ResearchToolbox
 from lab.trace import Trace
 

@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from lab.integrity import EvidenceSigner
 
@@ -167,19 +166,6 @@ class StepStore:
                 (_now(),),
             )
 
-    @contextmanager
-    def transaction(self) -> Iterator[sqlite3.Connection]:
-        con = self._connect()
-        try:
-            con.execute("BEGIN IMMEDIATE")
-            yield con
-            con.commit()
-        except Exception:
-            con.rollback()
-            raise
-        finally:
-            con.close()
-
     @staticmethod
     def _decode(row: sqlite3.Row | None) -> dict[str, Any] | None:
         if row is None:
@@ -282,7 +268,10 @@ class StepStore:
             ).fetchone()
         if row is None:
             return None
-        payload = json.loads(row["payload_json"])
+        try:
+            payload = json.loads(row["payload_json"])
+        except Exception:
+            payload = {}
         return {
             "iteration": int(iteration),
             "ledger_revision": row["ledger_revision"],
