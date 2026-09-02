@@ -5,10 +5,11 @@ from pathlib import Path
 
 import streamlit as st
 
+from lab.openrouter_catalog import fetch_openrouter_models
 from lab.project_manager import ProjectManager
 from lab.runtime_health import cleanup_stale_run
 from lab.step_store import StepStore
-from lab.ui_model import load_run_events, runs_for_project
+from lab.ui_model import filter_models, load_run_events, runs_for_project
 from lab.worker_launcher import launch_theorem_worker, write_worker_request
 
 ROOT = Path("research_state")
@@ -18,6 +19,15 @@ st.set_page_config(page_title="Araştırma Kontrolü", layout="wide")
 st.title("Araştırma Kontrolü")
 st.caption("Teorem araştırması Streamlit'ten bağımsız worker process'te çalışır. Bu sayfadan izle, durdur veya devam ettir.")
 
+FALLBACK_MODELS = [
+    "openai/gpt-4o-mini",
+    "openai/gpt-4o",
+    "deepseek/deepseek-r1",
+    "z-ai/glm-5.3-flash",
+    "google/gemini-2.5-pro",
+    "meta-llama/llama-3.3-70b-instruct",
+]
+
 
 def read_json(path: Path, default):
     if not path.exists():
@@ -26,6 +36,25 @@ def read_json(path: Path, default):
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return default
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_openrouter_catalog() -> list[dict]:
+    return [model.as_dict() | {"label": model.label} for model in fetch_openrouter_models()]
+
+
+def model_catalog() -> tuple[list[str], dict[str, str], str | None]:
+    try:
+        data = load_openrouter_catalog()
+        ids = [str(m["id"]) for m in data]
+        labels = {str(m["id"]): str(m["label"]) for m in data}
+        if ids:
+            return ids, labels, None
+    except Exception as exc:
+        error = str(exc)
+    else:
+        error = "OpenRouter model kataloğu boş döndü."
+    return FALLBACK_MODELS.copy(), {m: m for m in FALLBACK_MODELS}, error
 
 
 projects = pm.list_projects(include_archived=False)
@@ -133,17 +162,46 @@ else:
         "Model değiştirirsen yalnız henüz tamamlanmamış adımlar yeni modeli kullanır. Tamamlanmış step cache'i model değişikliği yüzünden yeniden ücretlendirilmez. "
         "System prompt / temperature / reasoning effort değişirse ilgili step fingerprint'i bilinçli olarak değişir."
     )
+    model_ids, model_labels, model_error = model_catalog()
+    if model_error:
+        st.warning(f"OpenRouter katalog uyarısı: {model_error}")
     edited_agents: dict[str, dict] = {}
     changed_models: list[str] = []
     for role, raw in config.get("agents", {}).items():
-        col1, col2 = st.columns([1, 2])
-        col1.write(f"**{role}**")
-        col1.caption(f"reasoning: `{raw.get('reasoning_effort') or 'provider-default'}`")
-        value = col2.text_input(f"{role} model", value=str(raw.get("model") or ""), key=f"model_{selected_id}_{role}", label_visibility="collapsed")
+        st.write(f"**{role}**")
+        st.caption(f"reasoning: `{raw.get('reasoning_effort') or 'provider-default'}`")
+        wanted_default = str(raw.get("model") or "")
+        query = st.text_input(
+            f"{role} model ara",
+            placeholder="örn. glm, kimi, 5.3, flash",
+            key=f"resume_search_{selected_id}_{role}",
+        )
+        choices = filter_models(model_ids, model_labels, query)
+        if not query and wanted_default and wanted_default not in choices:
+            choices.insert(0, wanted_default)
+            model_labels.setdefault(wanted_default, wanted_default)
+        if choices:
+            preferred = wanted_default if wanted_default in choices else choices[0]
+            selected_model = st.selectbox(
+                f"{role} OpenRouter modeli",
+                choices,
+                index=choices.index(preferred),
+                format_func=lambda mid: model_labels.get(mid, mid),
+                key=f"resume_model_{selected_id}_{role}_{query.casefold()}",
+            )
+        else:
+            st.warning("Eşleşen model yok. Manuel model ID girebilirsin.")
+            selected_model = wanted_default
+        manual = st.text_input(
+            f"{role} manuel model ID (opsiyonel)",
+            key=f"resume_manual_{selected_id}_{role}",
+        ).strip()
+        value = manual or selected_model
+        st.caption(f"Kullanılacak model: `{value}`")
         edited = dict(raw)
         edited["model"] = value
         edited_agents[role] = edited
-        if value != str(raw.get("model") or ""):
+        if value != wanted_default:
             changed_models.append(role)
     if changed_models:
         st.info("Model override: " + ", ".join(changed_models) + ". Tamamlanmış adımlar korunacak; override yalnız incomplete/partial adımlarda etkili.")
