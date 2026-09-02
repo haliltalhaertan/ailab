@@ -80,6 +80,7 @@ def verifier_prompt(problem: str, item_id: str, proposal: dict, tool_result: dic
         f"{json.dumps(proposal, ensure_ascii=False, indent=2)}\n\n"
         f"Deterministic tool result:\n{json.dumps(tool_result, ensure_ascii=False, indent=2)}\n\n"
         "Review as a verification engineer. LLM opinion is not proof. Distinguish tool failure from a mathematical counterexample. "
+        "A tropical_grid GRID_PASS establishes only finite-grid functional equality on the tested nonnegative weights; it does NOT establish formal monomial-level provenance polynomial equality. "
         "If a formal tool result is present, verify that theorem_type is a faithful formalization of the candidate claim; a compiled unrelated tautology is not evidence for this claim. "
         "Return ONLY JSON: "
         '{"verdict":"PASS|FAIL|INCONCLUSIVE","reason":"...","formal_proof_required":true,"counterexample":""}'

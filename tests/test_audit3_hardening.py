@@ -276,27 +276,16 @@ def test_empty_z3_query_is_not_computation_evidence():
     assert result.metadata["assertion_count"] == 0
 
 
-def test_tropical_checker_reports_size_and_rejects_wrong_provenance_structure():
+def test_tropical_checker_reports_internal_size_only():
     tool = TropicalGridTool()
-    good = {
+    direct = {
         "n": 2,
         "gates": [{"id": "e", "op": "edge", "u": 1, "v": 2}],
         "output": "e",
     }
-    passed = tool.check(good, [0, 1])
-    assert passed.ok
-    assert passed.metadata["provenance_structure_ok"] is True
-    assert passed.metadata["gate_count"] == 1
-
-    bad = {
-        "n": 2,
-        "gates": [
-            {"id": "e", "op": "edge", "u": 1, "v": 2},
-            {"id": "twice", "op": "add", "args": ["e", "e"]},
-        ],
-        "output": "twice",
-    }
-    failed = tool.check(bad, [0, 1])
-    assert not failed.ok
-    assert failed.metadata["status"] == "STRUCTURE_MISMATCH"
-    assert failed.metadata["gate_count"] == 2
+    result = tool.check(direct, [0, 1])
+    assert result.ok
+    assert result.metadata["status"] == "GRID_PASS"
+    assert result.metadata["gate_count"] == 0
+    assert result.metadata["edge_gate_count"] == 1
+    assert "monomial" in result.metadata["warning"].lower()

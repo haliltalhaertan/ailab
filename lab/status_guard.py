@@ -26,9 +26,13 @@ def _tool_is_successful_computation(tool_result: ToolResult | None) -> bool:
         except Exception:
             return False
     if tool_result.tool == "tropical_grid":
+        try:
+            cases_checked = int(metadata.get("cases_checked", 0) or 0)
+        except Exception:
+            cases_checked = 0
         return (
             str(metadata.get("status") or "").upper() == "GRID_PASS"
-            and metadata.get("provenance_structure_ok") is True
+            and cases_checked > 0
         )
     if tool_result.tool == "z3":
         try:

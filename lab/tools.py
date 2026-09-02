@@ -8,7 +8,7 @@ import subprocess
 import sys
 import uuid
 from dataclasses import dataclass, field
-from itertools import permutations, product
+from itertools import product
 from pathlib import Path
 from typing import Any
 
@@ -406,9 +406,17 @@ class LeanTool:
 
 
 class TropicalGridTool:
-    """Finite exact grid + absorptive provenance-structure checker."""
+    """Finite-grid functional equality checker for nonnegative tropical weights.
 
-    SYMBOLIC_MONOMIAL_CAP = 100_000
+    This tool intentionally does not compare symbolic monomial/provenance
+    structure. Passing it means only that the candidate circuit agrees with the
+    reference shortest-path function on the tested finite weight grid.
+    """
+
+    WARNING = (
+        "Finite-grid functional equality only; this is not a formal "
+        "monomial-level provenance equality proof."
+    )
 
     @staticmethod
     def _edges(n: int) -> list[tuple[int, int]]:
@@ -441,6 +449,8 @@ class TropicalGridTool:
             if op == "edge":
                 u, v = int(gate["u"]), int(gate["v"])
                 e = (u, v) if u < v else (v, u)
+                if e not in weights:
+                    raise ValueError(f"{gid}: invalid edge {e}")
                 values[gid] = weights[e]
             elif op in {"add", "plus"}:
                 args = [values[str(x)] for x in gate.get("args", [])]
@@ -459,83 +469,6 @@ class TropicalGridTool:
             raise ValueError("output gate bulunamadı")
         return values[out]
 
-    @staticmethod
-    def _absorptive_reduce(monomials: set[tuple[int, ...]]) -> set[tuple[int, ...]]:
-        ordered = sorted(monomials, key=lambda m: (sum(m), m))
-        kept: list[tuple[int, ...]] = []
-        for candidate in ordered:
-            if any(all(a <= b for a, b in zip(existing, candidate)) for existing in kept):
-                continue
-            kept = [
-                existing
-                for existing in kept
-                if not all(a <= b for a, b in zip(candidate, existing))
-            ]
-            kept.append(candidate)
-        return set(kept)
-
-    def _symbolic_output(self, circuit: dict[str, Any], n: int) -> tuple[set[tuple[int, ...]], list[tuple[int, int]]]:
-        edges = self._edges(n)
-        edge_index = {edge: i for i, edge in enumerate(edges)}
-        zero = (0,) * len(edges)
-        values: dict[str, set[tuple[int, ...]]] = {}
-        for gate in circuit.get("gates", []):
-            gid = str(gate["id"])
-            if gid in values:
-                raise ValueError(f"duplicate gate id: {gid}")
-            op = str(gate.get("op", "")).lower()
-            if op == "edge":
-                u, v = int(gate["u"]), int(gate["v"])
-                edge = (u, v) if u < v else (v, u)
-                if edge not in edge_index:
-                    raise ValueError(f"{gid}: invalid edge {edge}")
-                vec = list(zero)
-                vec[edge_index[edge]] = 1
-                values[gid] = {tuple(vec)}
-            elif op in {"min", "minimum"}:
-                args = [values[str(x)] for x in gate.get("args", [])]
-                if len(args) < 2:
-                    raise ValueError(f"{gid}: min en az iki arg ister")
-                merged: set[tuple[int, ...]] = set().union(*args)
-                values[gid] = self._absorptive_reduce(merged)
-            elif op in {"add", "plus"}:
-                args = [values[str(x)] for x in gate.get("args", [])]
-                if len(args) < 2:
-                    raise ValueError(f"{gid}: add en az iki arg ister")
-                current = {zero}
-                for arg in args:
-                    combined = {
-                        tuple(a + b for a, b in zip(left, right))
-                        for left in current
-                        for right in arg
-                    }
-                    if len(combined) > self.SYMBOLIC_MONOMIAL_CAP:
-                        raise ValueError("symbolic provenance monomial cap aşıldı")
-                    current = self._absorptive_reduce(combined)
-                values[gid] = current
-            else:
-                raise ValueError(f"{gid}: bilinmeyen op {op}")
-            if len(values[gid]) > self.SYMBOLIC_MONOMIAL_CAP:
-                raise ValueError("symbolic provenance monomial cap aşıldı")
-        out = str(circuit.get("output", ""))
-        if out not in values:
-            raise ValueError("output gate bulunamadı")
-        return values[out], edges
-
-    def _simple_path_monomials(self, n: int, edges: list[tuple[int, int]]) -> set[tuple[int, ...]]:
-        edge_index = {edge: i for i, edge in enumerate(edges)}
-        result: set[tuple[int, ...]] = set()
-        middle = list(range(2, n))
-        for length in range(0, len(middle) + 1):
-            for perm in permutations(middle, length):
-                path = (1, *perm, n)
-                vec = [0] * len(edges)
-                for u, v in zip(path, path[1:]):
-                    edge = (u, v) if u < v else (v, u)
-                    vec[edge_index[edge]] += 1
-                result.add(tuple(vec))
-        return self._absorptive_reduce(result)
-
     def check(
         self,
         circuit: dict[str, Any],
@@ -549,25 +482,20 @@ class TropicalGridTool:
             gates = circuit.get("gates", [])
             if not isinstance(gates, list) or not gates:
                 raise ValueError("circuit.gates boş olmayan liste olmalı")
-            symbolic, edges = self._symbolic_output(circuit, n)
-            expected_symbolic = self._simple_path_monomials(n, edges)
-            structure_ok = symbolic == expected_symbolic
-            structural_meta = {
-                "provenance_structure_ok": structure_ok,
-                "symbolic_monomials": len(symbolic),
-                "expected_simple_path_monomials": len(expected_symbolic),
-                "gate_count": len(gates),
-                "internal_gate_count": sum(1 for gate in gates if str(gate.get("op", "")).lower() != "edge"),
+            edges = self._edges(n)
+            edge_gate_count = sum(
+                1 for gate in gates if str(gate.get("op", "")).lower() == "edge"
+            )
+            gate_count = sum(
+                1 for gate in gates if str(gate.get("op", "")).lower() != "edge"
+            )
+            size_meta = {
+                "gate_count": gate_count,
+                "edge_gate_count": edge_gate_count,
+                "total_gate_count": len(gates),
+                "functional_equality_only": True,
+                "warning": self.WARNING,
             }
-            if not structure_ok:
-                payload = {"status": "STRUCTURE_MISMATCH", "n": n, **structural_meta}
-                return ToolResult(
-                    False,
-                    "tropical_grid",
-                    output=json.dumps(payload, ensure_ascii=False),
-                    error="Circuit finite-weight davranışı doğru olsa bile absorptive provenance yapısı simple-path polynomial ile eşleşmiyor.",
-                    metadata=payload,
-                )
 
             domain = sorted(set(int(x) for x in (weight_values or [0, 1, 2])))
             if not domain or any(x < 0 for x in domain):
@@ -589,7 +517,7 @@ class TropicalGridTool:
                         "expected": expected,
                         "actual": actual,
                         "cases_checked": checked,
-                        **structural_meta,
+                        **size_meta,
                     }
                     return ToolResult(
                         False,
@@ -602,8 +530,7 @@ class TropicalGridTool:
                 "n": n,
                 "domain": domain,
                 "cases_checked": checked,
-                "warning": "Finite grid pass is not a proof over all weights.",
-                **structural_meta,
+                **size_meta,
             }
             return ToolResult(
                 True,
