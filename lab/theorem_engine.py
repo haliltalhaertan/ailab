@@ -572,6 +572,13 @@ class TheoremResearchLab:
 
     @staticmethod
     def _normalize_structural_counterexample(result: ToolResult | None) -> ToolResult | None:
+        """Keep the legacy tropical mismatch bridge until the reviewed pack wires it.
+
+        ``STRUCTURE_MISMATCH`` is not emitted by a reviewed problem-pack checker
+        yet; the Tropical pack will connect this normalization when that formal
+        checker exists.
+        """
+
         if result is None or result.tool != "tropical_grid":
             return result
         metadata = dict(result.metadata or {})
@@ -926,6 +933,7 @@ class TheoremResearchLab:
         self._set_runtime(status="RUNNING", last_error="")
 
         if contract is not None and not selectable_ids and not contract.open_target_ids():
+            self.controller.set_research_phase("PUBLICATION")
             self.trace.log(
                 "run_completed_all_targets_closed",
                 completed_iterations=completed,
@@ -957,6 +965,7 @@ class TheoremResearchLab:
         outcomes: list[IterationOutcome] = []
         for iteration in range(completed + 1, int(iterations) + 1):
             if contract is not None and not selectable_ids:
+                self.controller.set_research_phase("PUBLICATION")
                 self.trace.log(
                     "run_completed_all_targets_closed",
                     completed_iterations=int(self._runtime().get("completed_iterations", 0) or 0),
