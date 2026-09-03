@@ -8,35 +8,49 @@ import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
+from lab.integrity import project_lock_is_live
 from lab.openrouter_catalog import fetch_openrouter_models
 from lab.project_manager import ProjectInfo, ProjectManager
 from lab.prompts import ROLE_LIBRARY as THEOREM_ROLE_LIBRARY
-from lab.reasoning_settings import API_TO_UI, UI_LEVELS, UI_TO_API, get_reasoning_effort
-from lab.ui_live import render_now_and_timeline
+from lab.reasoning_settings import (
+    API_TO_UI,
+    UI_LEVELS,
+    UI_TO_API,
+    get_reasoning_effort,
+    load_settings,
+    save_settings,
+    settings_path,
+)
+from lab.ui_live import CardState, build_cards, merge_cards, render_now_and_timeline
 from lab.ui_model import (
     cost_text,
     event_summary,
     filter_models,
+    live_log_offsets,
+    load_default_agent_profile,
+    load_live_run_delta,
     load_live_run_events,
     load_run_events,
+    profile_model_ids,
     runs_for_project,
     tool_status,
     usage_rows,
+)
+from lab.ui_project_settings import (
+    configured_effort,
+    configured_model,
+    force_stop_worker,
+    local_storage_summary,
 )
 from lab.worker_launcher import build_request_from_ui, launch_worker, write_worker_request
 
 load_dotenv()
 RUNS_DIR = Path("runs")
 PROJECTS = ProjectManager()
-
-FALLBACK_MODELS = [
-    "openai/gpt-4o-mini",
-    "openai/gpt-4o",
-    "deepseek/deepseek-r1",
-    "z-ai/glm-5.3-flash",
-    "google/gemini-2.5-pro",
-    "meta-llama/llama-3.3-70b-instruct",
-]
+DEFAULT_AGENT_PROFILE = load_default_agent_profile()
+THEOREM_DEFAULTS = dict(DEFAULT_AGENT_PROFILE.get("agents") or {})
+ORCHESTRATOR_DEFAULT = dict(DEFAULT_AGENT_PROFILE.get("orchestrator_default") or {})
+FALLBACK_MODELS = profile_model_ids(DEFAULT_AGENT_PROFILE)
 
 ROLE_LIBRARY = {
     "Teorisyen": "Yaratıcı matematik/CS teorisyenisin. Test edilebilir fikir üret, varsayımları açıkça etiketle.",
@@ -68,18 +82,6 @@ ROLE_TEMPS = {
     "VerificationEngineer": 0.1,
     "LiteratureScout": 0.1,
     "IndependentAuditor": 0.1,
-}
-
-ROLE_MODELS = {
-    "Teorisyen": "deepseek/deepseek-r1",
-    "Sceptik": "z-ai/glm-5.3-flash",
-    "Taraftar A": "deepseek/deepseek-r1",
-    "ResearchManager": "openai/gpt-4o",
-    "Theorist": "deepseek/deepseek-r1",
-    "AdversarialCritic": "z-ai/glm-5.3-flash",
-    "VerificationEngineer": "openai/gpt-4o",
-    "LiteratureScout": "openai/gpt-4o-mini",
-    "IndependentAuditor": "google/gemini-2.5-pro",
 }
 
 ROLE_MODEL_ENV = {
@@ -163,6 +165,34 @@ EXPERIMENTS = {
 }
 
 
+def _profile_model(role: str) -> str:
+    raw = THEOREM_DEFAULTS.get(role)
+    if isinstance(raw, dict) and raw.get("model"):
+        return str(raw["model"])
+    return str(ORCHESTRATOR_DEFAULT.get("model") or "z-ai/glm-5.3-flash")
+
+
+def _profile_effort(role: str) -> str | None:
+    raw = THEOREM_DEFAULTS.get(role)
+    if isinstance(raw, dict) and raw.get("reasoning_effort") is not None:
+        return str(raw["reasoning_effort"])
+    value = ORCHESTRATOR_DEFAULT.get("reasoning_effort")
+    return str(value) if value is not None else None
+
+
+def _new_reasoning_settings() -> dict:
+    return {"agents": {role: _profile_effort(role) for role in ROLE_LIBRARY if _profile_effort(role) is not None}}
+
+
+def _ensure_reasoning_settings_defaults() -> None:
+    path = settings_path()
+    if not path.exists():
+        save_settings(_new_reasoning_settings(), path)
+
+
+_ensure_reasoning_settings_defaults()
+
+
 @st.cache_data(ttl=600, show_spinner=False)
 def load_openrouter_catalog() -> list[dict]:
     return [model.as_dict() | {"label": model.label} for model in fetch_openrouter_models()]
@@ -182,11 +212,27 @@ def model_catalog() -> tuple[list[str], dict[str, str], str | None]:
     return FALLBACK_MODELS.copy(), {m: m for m in FALLBACK_MODELS}, error
 
 
-def default_model(role: str) -> str:
+def default_model(role: str, active: ProjectInfo) -> str:
+    project_value = configured_model(PROJECTS.project_root(active.project_id), role)
+    if project_value:
+        return project_value
     env_name = ROLE_MODEL_ENV.get(role)
     if env_name and os.environ.get(env_name):
         return os.environ[env_name]
-    return ROLE_MODELS.get(role, os.environ.get("LAB_MODEL", "openai/gpt-4o-mini"))
+    if role not in THEOREM_DEFAULTS and os.environ.get("LAB_MODEL"):
+        return os.environ["LAB_MODEL"]
+    return _profile_model(role)
+
+
+def default_reasoning_effort(role: str, display_role: str, active: ProjectInfo) -> str | None:
+    project_value = configured_effort(PROJECTS.project_root(active.project_id), role)
+    if project_value:
+        return project_value
+    data = load_settings()
+    agents = data.get("agents", {}) if isinstance(data, dict) else {}
+    if isinstance(agents, dict) and (display_role in agents or role in agents):
+        return get_reasoning_effort(display_role)
+    return _profile_effort(role)
 
 
 def build_sidebar(exp_name: str, model_ids: list[str], model_labels: dict[str, str], active: ProjectInfo):
@@ -230,7 +276,7 @@ def build_sidebar(exp_name: str, model_ids: list[str], model_labels: dict[str, s
                 key=f"p_{key}",
                 height=110,
             )
-            wanted_default = default_model(role)
+            wanted_default = default_model(role, active)
             query = st.text_input(
                 "Model ara",
                 placeholder="örn. 5.3, glm, kimi, flash",
@@ -265,7 +311,7 @@ def build_sidebar(exp_name: str, model_ids: list[str], model_labels: dict[str, s
                 0.05,
                 key=f"t_{key}",
             )
-            default_effort = get_reasoning_effort(display_role)
+            default_effort = default_reasoning_effort(role, display_role, active)
             default_effort_label = API_TO_UI.get(default_effort, "Provider default")
             effort_label = st.selectbox(
                 "Reasoning effort",
@@ -355,122 +401,50 @@ def render_timeline_event(target, event: dict) -> None:
         target.caption(f"{stamp}{event_summary(event)}")
 
 
-class LiveTimelineRenderer:
-    """OpenCode-style readable agent cards; raw events stay in the log files."""
+def _card_header(card: CardState) -> str:
+    if card.status == "error":
+        return f"❌ {card.agent} · {card.model} — hata"
+    if card.status == "done":
+        cost_label = f"${card.cost_usd:.6f}" if card.cost_usd is not None else "ücret N/A"
+        return f"✅ {card.agent} · {card.model} — {card.total_tokens:,} token · {cost_label} · {card.latency_s:.1f} sn"
+    return f"⏳ {card.agent} · {card.model} — çalışıyor · reasoning {card.effort or 'provider-default'}"
 
-    REASONING_HEIGHT = 360
-    ANSWER_HEIGHT = 360
-    TASK_HEIGHT = 260
 
-    def __init__(self, target):
-        self.target = target
-        self.cards: dict[str, dict] = {}
-        self.latest_by_agent: dict[str, str] = {}
-
-    def _key(self, event: dict) -> str:
-        explicit = str(event.get("step_key") or "").strip()
-        if explicit:
-            return explicit
-        agent = str(event.get("agent") or "Agent")
-        return self.latest_by_agent.get(agent, f"{agent}:{len(self.cards) + 1}")
-
-    def _card(self, event: dict) -> dict:
-        key = self._key(event)
-        if key in self.cards:
-            return self.cards[key]
-        agent = str(event.get("agent") or "Agent")
-        model = str(event.get("model") or "")
-        card = self.target.container(border=True)
-        header = card.empty()
-        header.markdown(f"⏳ **{agent}** · `{model}` — çalışıyor")
-        rtab, atab, ttab = card.tabs(["🧠 Reasoning", "✍️ Cevap", "📋 Görev"])
+def render_agent_card(target, card: CardState, *, expanded: bool | None = None) -> None:
+    if expanded is None:
+        expanded = card.status == "running"
+    with target.expander(_card_header(card), expanded=expanded):
+        rtab, atab, ttab = st.tabs(["🧠 Reasoning", "✍️ Cevap", "📋 Görev"])
         with rtab:
-            with st.container(height=self.REASONING_HEIGHT, border=False):
-                rslot = st.empty()
-                rslot.caption("Provider reasoning gönderirse burada canlı görünecek.")
+            if card.reasoning:
+                st.markdown(card.reasoning)
+            elif card.reasoning_tokens > 0:
+                st.caption(f"Sağlayıcı reasoning metnini göstermedi ({card.reasoning_tokens:,} token).")
+            else:
+                st.caption("Provider reasoning gönderirse burada görünecek.")
         with atab:
-            with st.container(height=self.ANSWER_HEIGHT, border=False):
-                aslot = st.empty()
-                aslot.caption("Yanıt bekleniyor…")
+            if card.content:
+                st.markdown(card.content)
+            else:
+                st.caption("Yanıt bekleniyor…")
         with ttab:
-            with st.container(height=self.TASK_HEIGHT, border=False):
-                if event.get("system_prompt"):
-                    st.markdown("**System prompt**")
-                    st.code(str(event.get("system_prompt") or ""), language=None)
-                if event.get("prompt"):
-                    st.markdown("**User/task prompt**")
-                    st.code(str(event.get("prompt") or ""), language=None)
-                if not event.get("system_prompt") and not event.get("prompt"):
-                    st.caption("Görev ayrıntısı bu event içinde yok.")
-        footer = card.empty()
-        footer.caption(f"Adım: `{key}`")
-        state = {
-            "key": key,
-            "agent": agent,
-            "model": model,
-            "header": header,
-            "rslot": rslot,
-            "aslot": aslot,
-            "footer": footer,
-            "reasoning": "",
-            "content": "",
-        }
-        self.cards[key] = state
-        self.latest_by_agent[agent] = key
-        return state
-
-    def handle(self, event: dict) -> None:
-        kind = str(event.get("type") or "")
-        if kind == "agent_start":
-            state = self._card(event)
-            effort = event.get("reasoning_effort") or "provider-default"
-            state["header"].markdown(
-                f"⏳ **{event.get('agent')}** · `{event.get('model', '')}` — çalışıyor · reasoning `{effort}`"
+            if card.system_prompt:
+                st.markdown("**System prompt**")
+                st.code(card.system_prompt, language=None)
+            if card.prompt:
+                st.markdown("**User/task prompt**")
+                st.code(card.prompt, language=None)
+            if not card.system_prompt and not card.prompt:
+                st.caption("Görev ayrıntısı bu event içinde yok.")
+        if card.error:
+            st.error(card.error)
+        if card.status == "done":
+            st.caption(
+                f"input={card.prompt_tokens:,} · output={card.completion_tokens:,} · "
+                f"reasoning={card.reasoning_tokens:,} · cached={card.cached_tokens:,} · adım `{card.step_key}`"
             )
-            return
-        if kind == "agent_stream":
-            state = self._card(event)
-            delta = event.get("delta")
-            if event.get("channel") == "reasoning" and isinstance(delta, str):
-                state["reasoning"] += delta
-                state["rslot"].markdown(state["reasoning"])
-            elif event.get("channel") == "content" and isinstance(delta, str):
-                state["content"] += delta
-                state["aslot"].markdown(state["content"])
-            return
-        if kind == "llm_call":
-            state = self._card(event)
-            if event.get("provider_reasoning"):
-                state["reasoning"] = str(event["provider_reasoning"])
-                state["rslot"].markdown(state["reasoning"])
-            if event.get("output"):
-                state["content"] = str(event["output"])
-                state["aslot"].markdown(state["content"])
-            reasoning_tokens = int(event.get("reasoning_tokens", 0) or 0)
-            if not state["reasoning"] and reasoning_tokens:
-                state["rslot"].caption(
-                    f"Sağlayıcı reasoning metnini göstermedi ({reasoning_tokens:,} token)."
-                )
-            cost = event.get("cost_usd")
-            cost_label = f"${float(cost):.6f}" if cost is not None else "ücret N/A"
-            state["header"].markdown(
-                f"✅ **{event.get('agent')}** · `{event.get('model', '')}` — "
-                f"{int(event.get('total_tokens', 0) or 0):,} token · {cost_label} · "
-                f"{float(event.get('latency_s', 0) or 0):.1f} sn"
-            )
-            state["footer"].caption(
-                f"input={int(event.get('prompt_tokens', 0) or 0):,} · "
-                f"output={int(event.get('completion_tokens', 0) or 0):,} · "
-                f"reasoning={reasoning_tokens:,} · cached={int(event.get('cached_tokens', 0) or 0):,} · "
-                f"adım `{state['key']}`"
-            )
-            return
-        if kind == "agent_error":
-            state = self._card(event)
-            state["header"].markdown(f"❌ **{event.get('agent')}** · `{event.get('model', '')}` — hata")
-            state["footer"].error(str(event.get("error") or "Bilinmeyen hata"))
-            return
-        render_timeline_event(self.target, event)
+        else:
+            st.caption(f"Adım: `{card.step_key}`")
 
 
 def summary_metrics(summary: dict) -> None:
@@ -496,9 +470,11 @@ def render_history(active: ProjectInfo) -> None:
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     events = load_run_events(selected, include_stream=True)
     st.subheader("Araştırma Timeline'ı")
-    renderer = LiveTimelineRenderer(st.container(border=True))
+    target = st.container(border=True)
+    for card in reversed(build_cards(events)):
+        render_agent_card(target, card, expanded=False)
     for event in events:
-        renderer.handle(event)
+        render_timeline_event(target, event)
 
 
 def _read_json(path: Path, default):
@@ -510,34 +486,54 @@ def _read_json(path: Path, default):
         return default
 
 
-def _live_card_groups(events: list[dict], current_step: str) -> tuple[list[str], dict[str, list[dict]]]:
-    groups: dict[str, list[dict]] = {}
-    order: list[str] = []
-    latest_by_agent: dict[str, str] = {}
-    allowed = {"agent_start", "agent_stream", "llm_call", "agent_error"}
-    for event in events:
-        if event.get("type") not in allowed:
-            continue
-        copy = dict(event)
-        agent = str(copy.get("agent") or "Agent")
-        step_key = str(copy.get("step_key") or "")
-        if step_key:
-            latest_by_agent[agent] = step_key
-        else:
-            step_key = latest_by_agent.get(agent, "")
-            if step_key:
-                copy["step_key"] = step_key
-        if not step_key:
-            continue
-        if step_key not in groups:
-            groups[step_key] = []
-            order.append(step_key)
-        groups[step_key].append(copy)
-    ordered = list(reversed(order))
-    if current_step in ordered:
-        ordered.remove(current_step)
-        ordered.insert(0, current_step)
-    return ordered, groups
+def _request_stop(project_root: Path) -> None:
+    (project_root / "stop.flag").write_text("stop requested\n", encoding="utf-8")
+
+
+def _reset_live_cache(run_id: str) -> None:
+    if st.session_state.get("live_cards_run_id") == run_id:
+        return
+    st.session_state["live_cards_run_id"] = run_id
+    st.session_state["live_cards"] = {run_id: {}}
+    st.session_state["live_event_offsets"] = {}
+    st.session_state["live_trace_events"] = {}
+
+
+def _load_cached_live_state(run_dir: Path) -> tuple[list[CardState], list[dict]]:
+    run_id = run_dir.name
+    _reset_live_cache(run_id)
+    cards_root = st.session_state.setdefault("live_cards", {run_id: {}})
+    offsets_root = st.session_state.setdefault("live_event_offsets", {})
+    trace_root = st.session_state.setdefault("live_trace_events", {})
+    run_cards = cards_root.setdefault(run_id, {})
+
+    if run_id not in offsets_root:
+        initial_events = load_live_run_events(run_dir)
+        cards = build_cards(initial_events)
+        run_cards.clear()
+        run_cards.update({card.step_key: card for card in cards})
+        trace_root[run_id] = [event for event in initial_events if event.get("type") != "agent_stream"]
+        offsets_root[run_id] = live_log_offsets(run_dir)
+        return cards, list(trace_root[run_id])
+
+    delta_events, new_offsets = load_live_run_delta(run_dir, dict(offsets_root[run_id]))
+    offsets_root[run_id] = new_offsets
+    cards = merge_cards(list(run_cards.values()), delta_events)
+    run_cards.clear()
+    run_cards.update({card.step_key: card for card in cards})
+    trace_events = trace_root.setdefault(run_id, [])
+    trace_events.extend(event for event in delta_events if event.get("type") != "agent_stream")
+    return cards, list(trace_events)
+
+
+def _ordered_live_cards(cards: list[CardState], current_step: str) -> list[CardState]:
+    return sorted(
+        cards,
+        key=lambda card: (
+            0 if card.step_key == current_step and card.status == "running" else 1 if card.status == "running" else 2,
+            -card.order,
+        ),
+    )
 
 
 @st.fragment(run_every=1.0)
@@ -555,28 +551,24 @@ def render_live_run(active: ProjectInfo) -> None:
 
     run_dirs = runs_for_project(RUNS_DIR, active.project_id, active.project_uuid)
     events: list[dict] = []
+    cards: list[CardState] = []
     latest: Path | None = None
     if run_dirs:
         latest = run_dirs[0]
-        events = load_live_run_events(latest)
+        cards, events = _load_cached_live_state(latest)
     elif status == "RUNNING":
         st.info("Worker başladı. İlk trace event'i bekleniyor…")
 
-    snapshot = render_now_and_timeline(runtime, events, status=status)
+    snapshot = render_now_and_timeline(runtime, events, status=status, cards=cards)
 
-    if events:
+    if cards:
         st.markdown("#### Agent kartları")
-        order, groups = _live_card_groups(events, str(snapshot.get("step_key") or ""))
-        renderer = LiveTimelineRenderer(st.container(border=True))
-        for step_key in order:
-            for event in groups[step_key]:
-                renderer.handle(event)
+        target = st.container(border=True)
+        current_step = str(snapshot.get("step_key") or "")
+        for card in _ordered_live_cards(cards, current_step):
+            render_agent_card(target, card, expanded=card.status == "running")
 
-    c1, c2 = st.columns(2)
-    if c1.button("DURDUR", type="primary", use_container_width=True, disabled=status != "RUNNING", key="live_stop"):
-        (project_root / "stop.flag").write_text("stop requested\n", encoding="utf-8")
-        st.warning("Durdurma isteği worker'a iletildi.")
-    if c2.button("Research Control", use_container_width=True, key="live_control"):
+    if st.button("Research Control", use_container_width=True, key="live_control"):
         st.switch_page("pages/3_Research_Control.py")
 
     result_path = project_root / "worker_result.md"
@@ -633,17 +625,27 @@ def launch_experiment(
 
 
 def active_project_header(active: ProjectInfo) -> None:
+    project_root = PROJECTS.project_root(active.project_id)
+    storage = local_storage_summary(project_root, RUNS_DIR)
     with st.container(border=True):
         c1, c2 = st.columns([4, 1])
         c1.markdown(f"### Aktif Proje · {active.title}")
         c1.caption(
             f"`{active.project_id}` · durum **{active.status}** · {active.run_count} run · ${active.total_cost_usd:.4f}"
         )
+        c1.caption(f"💾 Bu proje bu bilgisayara otomatik kaydediliyor · `{storage['project_root']}`")
         if c2.button("Projeyi Değiştir", use_container_width=True):
             st.switch_page("pages/1_Projeler.py")
         if active.status in {"RUNNING", "PAUSED_ERROR", "STOPPED", "PAUSED", "STALE_RUNNING"}:
             if st.button("Araştırma Kontrolü", type="primary"):
                 st.switch_page("pages/3_Research_Control.py")
+        with st.expander("💾 Yerel kayıt ve dosyalar", expanded=False):
+            st.success("Araştırma verileri yerel diske yazılıyor. GitHub'a veya başka bir buluta otomatik yüklenmiyor.")
+            st.markdown("**Proje state / checkpoint / son sonuç**")
+            st.code(storage["project_root"], language=None)
+            st.markdown("**Tüm run logları / stream / summary**")
+            st.code(storage["runs_root"], language=None)
+            st.caption("`worker_result.md` son worker sonucudur; her run'ın ayrıntılı geçmişi `runs/` altında ayrı klasörde kalır.")
 
 
 def main() -> None:
@@ -686,13 +688,42 @@ def main() -> None:
             "Tüm deney türleri ayrı worker process'te çalışır. Canlı akışı burada izleyebilir, "
             "sayfayı kapatıp daha sonra geri dönebilirsin."
         )
-        running = active.status == "RUNNING"
-        button_label = "Deney çalışıyor…" if running else "Deneyi Çalıştır"
-        if st.button(
-            button_label,
+        project_root = PROJECTS.project_root(active.project_id)
+        running = project_lock_is_live(project_root)
+        stop_requested = running and (project_root / "stop.flag").exists()
+        if running:
+            c1, c2 = st.columns([2, 1])
+            stop_label = "Durdurma isteği gönderildi…" if stop_requested else "DURDUR"
+            if c1.button(
+                stop_label,
+                type="primary",
+                disabled=stop_requested,
+                use_container_width=True,
+                key="run_stop",
+            ):
+                _request_stop(project_root)
+                st.warning(
+                    "Durdurma isteği worker'a iletildi. Aktif çağrı güvenli kesme noktasına geldiğinde run duracak."
+                )
+                st.rerun()
+            if c2.button(
+                "ZORLA DURDUR · HEMEN",
+                use_container_width=True,
+                key="run_force_stop",
+                help="Worker process'ini hemen sonlandırır. Son agent çağrısının partial çıktısı eksik kalabilir.",
+            ):
+                stopped = force_stop_worker(project_root)
+                if stopped:
+                    st.warning("Worker zorla sonlandırıldı. Proje dosyaları ve daha önce kaydedilmiş çalışma korunuyor.")
+                else:
+                    st.info("Canlı worker process'i bulunamadı.")
+                st.rerun()
+        elif st.button(
+            "Deneyi Çalıştır",
             type="primary",
-            disabled=not api_ok or running,
+            disabled=not api_ok,
             use_container_width=True,
+            key="run_start",
         ):
             if not prompt.strip():
                 st.warning("Lütfen bir problem/konu gir.")
@@ -706,7 +737,11 @@ def main() -> None:
                 except Exception as exc:
                     st.exception(exc)
 
-        show_live = active.status == "RUNNING" or st.session_state.get("live_run_project") == active.project_id
+        show_live = (
+            running
+            or active.status in {"RUNNING", "STALE_RUNNING"}
+            or st.session_state.get("live_run_project") == active.project_id
+        )
         if show_live:
             render_live_run(active)
 

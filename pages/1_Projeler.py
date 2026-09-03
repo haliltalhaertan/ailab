@@ -3,20 +3,52 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
 from lab.agent import Agent
+from lab.integrity import project_lock_is_live
+from lab.openrouter_catalog import fetch_openrouter_models
 from lab.project_manager import ProjectManager
 from lab.project_planner import PROJECT_PLANNER_SYSTEM_PROMPT, generate_project_draft
 from lab.trace import Trace
+from lab.ui_model import load_default_agent_profile, profile_model_ids
+from lab.ui_project_settings import (
+    delete_run_history,
+    force_stop_worker,
+    local_storage_summary,
+    save_project_ui_settings,
+)
 
 
 load_dotenv()
 st.set_page_config(page_title="Projeler", layout="wide")
-pm = ProjectManager()
+PROJECT_ROOT = Path("research_state")
+RUNS_ROOT = Path("runs")
+pm = ProjectManager(PROJECT_ROOT, RUNS_ROOT)
+DEFAULT_AGENT_PROFILE = load_default_agent_profile()
+THEOREM_DEFAULTS = dict(DEFAULT_AGENT_PROFILE.get("agents") or {})
+ORCHESTRATOR_DEFAULT = dict(DEFAULT_AGENT_PROFILE.get("orchestrator_default") or {})
+FALLBACK_MODELS = profile_model_ids(DEFAULT_AGENT_PROFILE)
+THEOREM_ROLES = [
+    "ResearchManager",
+    "Theorist",
+    "AdversarialCritic",
+    "VerificationEngineer",
+    "LiteratureScout",
+    "IndependentAuditor",
+]
+ROLE_LABELS = {
+    "ResearchManager": "Baş Araştırmacı / Manager",
+    "Theorist": "Teorisyen",
+    "AdversarialCritic": "Sceptik / Critic",
+    "VerificationEngineer": "Doğrulayıcı / Verifier",
+    "LiteratureScout": "Literatür Araştırmacısı",
+    "IndependentAuditor": "Bağımsız Denetçi",
+}
 
 PROJECT_FORM_KEYS = [
     "new_title",
@@ -44,7 +76,7 @@ def status_icon(status: str) -> str:
     status = status.upper()
     if status == "RUNNING":
         return "🟢"
-    if status in {"PAUSED_ERROR", "STOPPED", "PAUSED"}:
+    if status in {"PAUSED_ERROR", "STOPPED", "PAUSED", "STALE_RUNNING", "INTERRUPTED"}:
         return "🟠"
     if status in {"COMPLETED", "DONE"}:
         return "✅"
@@ -52,8 +84,11 @@ def status_icon(status: str) -> str:
 
 
 def reset_new_project_state() -> None:
-    for key in PROJECT_FORM_KEYS + ["project_prompt", "project_draft_usage"]:
+    for key in PROJECT_FORM_KEYS + ["project_prompt", "project_draft_usage", "project_draft_source"]:
         st.session_state.pop(key, None)
+    for key in list(st.session_state):
+        if str(key).startswith("new_agent_model_") or str(key).startswith("new_generic_model"):
+            st.session_state.pop(key, None)
 
 
 def apply_draft(draft) -> None:
@@ -66,6 +101,20 @@ def apply_draft(draft) -> None:
     st.session_state["new_problem"] = data["problem"]
     st.session_state["new_literature_query"] = data["literature_query"]
     st.session_state["new_tags"] = ", ".join(data["tags"])
+
+
+def start_manual_project(user_prompt: str) -> None:
+    seed = user_prompt.strip()
+    st.session_state["new_title"] = "Yeni Araştırma"
+    st.session_state["new_project_id"] = ""
+    st.session_state["new_description"] = ""
+    st.session_state["new_experiment"] = "Teorem Araştırması"
+    st.session_state["new_experiment_widget"] = "Teorem Araştırması"
+    st.session_state["new_problem"] = seed
+    st.session_state["new_literature_query"] = ""
+    st.session_state["new_tags"] = ""
+    st.session_state["project_draft_usage"] = {}
+    st.session_state["project_draft_source"] = "manual"
 
 
 def generate_with_llm(user_prompt: str, model: str) -> None:
@@ -93,14 +142,78 @@ def generate_with_llm(user_prompt: str, model: str) -> None:
             trace.close()
         raise
     apply_draft(draft)
+    st.session_state["project_draft_source"] = "llm"
     try:
         st.session_state["project_draft_usage"] = json.loads(summary_path.read_text(encoding="utf-8"))
     except Exception:
         st.session_state["project_draft_usage"] = {}
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def load_openrouter_catalog() -> list[dict]:
+    return [model.as_dict() | {"label": model.label} for model in fetch_openrouter_models()]
+
+
+def model_catalog() -> tuple[list[str], dict[str, str], str | None]:
+    try:
+        data = load_openrouter_catalog()
+        ids = [str(m["id"]) for m in data]
+        labels = {str(m["id"]): str(m["label"]) for m in data}
+        if ids:
+            return ids, labels, None
+    except Exception as exc:
+        error = str(exc)
+    else:
+        error = "OpenRouter model kataloğu boş döndü."
+    return FALLBACK_MODELS.copy(), {m: m for m in FALLBACK_MODELS}, error
+
+
+def _model_select(label: str, role: str, model_ids: list[str], model_labels: dict[str, str]) -> str:
+    raw = THEOREM_DEFAULTS.get(role) or ORCHESTRATOR_DEFAULT
+    wanted = str(raw.get("model") or ORCHESTRATOR_DEFAULT.get("model") or "z-ai/glm-5.3-flash")
+    choices = list(model_ids)
+    if wanted not in choices:
+        choices.insert(0, wanted)
+        model_labels.setdefault(wanted, wanted)
+    return st.selectbox(
+        label,
+        choices,
+        index=choices.index(wanted),
+        format_func=lambda mid: model_labels.get(mid, mid),
+        key=f"new_agent_model_{role}",
+    )
+
+
+def _selected_agent_defaults(model_ids: list[str], model_labels: dict[str, str]) -> tuple[dict[str, dict], dict]:
+    agents: dict[str, dict] = {}
+    for role in THEOREM_ROLES:
+        model = _model_select(ROLE_LABELS[role], role, model_ids, model_labels)
+        raw = dict(THEOREM_DEFAULTS.get(role) or {})
+        agents[role] = {
+            "model": model,
+            "reasoning_effort": raw.get("reasoning_effort") or "medium",
+        }
+    generic_wanted = str(ORCHESTRATOR_DEFAULT.get("model") or "z-ai/glm-5.3-flash")
+    generic_choices = list(model_ids)
+    if generic_wanted not in generic_choices:
+        generic_choices.insert(0, generic_wanted)
+        model_labels.setdefault(generic_wanted, generic_wanted)
+    generic_model = st.selectbox(
+        "Araştırma Döngüsü / Tartışma / Zincir / Panel için genel model",
+        generic_choices,
+        index=generic_choices.index(generic_wanted),
+        format_func=lambda mid: model_labels.get(mid, mid),
+        key="new_generic_model",
+    )
+    generic = {
+        "model": generic_model,
+        "reasoning_effort": ORCHESTRATOR_DEFAULT.get("reasoning_effort") or "medium",
+    }
+    return agents, generic
+
+
 st.title("Projeler")
-st.caption("Araştırmaları run değil proje olarak yönet: oluştur, aç, durdurulan projeye devam et, geçmişini incele.")
+st.caption("Önce projeyi ve araştırma ekibini kur; sonra deneyi başlat. Tüm kayıtlar bu bilgisayarda tutulur.")
 
 active_id = pm.active_project_id()
 if active_id:
@@ -116,14 +229,14 @@ if st.button("＋ Yeni Proje Oluştur", type="primary"):
 if st.session_state.get("show_create_project", False):
     with st.container(border=True):
         st.subheader("Yeni Proje")
-        st.markdown("**Sadece ne araştırmak istediğini yaz. ProjectPlanner geri kalan proje alanlarını hazırlasın.**")
+        st.markdown("**1 · Ne araştırmak istediğini yaz. İstersen LLM taslağı hazırlasın, istersen doğrudan elle kur.**")
         project_prompt = st.text_area(
-            "Proje promptu",
+            "Proje promptu / başlangıç problemi",
             key="project_prompt",
             height=160,
             placeholder=(
                 "Örn. Complete graph üzerinde tropical reachability provenance circuit lower bound problemini "
-                "LLM + exact computation ile araştırmak istiyorum. Literatürde gerçekten açık olan dar bir theorem hedefi seç."
+                "LLM + exact computation ile araştırmak istiyorum."
             ),
         )
         api_ok = bool(os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY"))
@@ -131,14 +244,15 @@ if st.session_state.get("show_create_project", False):
             planner_model = st.text_input(
                 "Planner modeli",
                 value=os.environ.get("LAB_PROJECT_PLANNER_MODEL", "openai/gpt-4o-mini"),
-                help="OpenRouter model slug. Reasoning seviyesi Reasoning Ayarları sayfasındaki ProjectPlanner satırından gelir.",
+                help="Bu model yalnız yeni proje taslağını doldurur; araştırmayı yapacak modelleri aşağıda ayrıca seçersin.",
             ).strip()
-            st.caption("Bu ayar opsiyoneldir; normal kullanımda sadece yukarıdaki proje promptunu yazman yeterli.")
+            st.caption("ProjectPlanner araştırma ekibinin modeli değildir.")
         generate_disabled = not project_prompt.strip() or not api_ok or not planner_model
         if not api_ok:
-            st.warning("ProjectPlanner için `.env` içinde OPENROUTER_API_KEY gerekli.")
-        if st.button(
-            "✨ LLM ile Projeyi Hazırla",
+            st.info("API anahtarı yoksa da 'LLM kullanmadan elle kur' ile proje oluşturabilirsin.")
+        setup_left, setup_right = st.columns(2)
+        if setup_left.button(
+            "✨ LLM ile Taslak Hazırla",
             type="primary",
             use_container_width=True,
             disabled=generate_disabled,
@@ -150,23 +264,35 @@ if st.session_state.get("show_create_project", False):
                     st.error(f"ProjectPlanner başarısız: {exc}")
                 else:
                     st.rerun()
+        if setup_right.button("LLM kullanmadan elle kur", use_container_width=True):
+            start_manual_project(project_prompt)
+            st.rerun()
 
         if all(key in st.session_state for key in ("new_title", "new_project_id", "new_problem")):
+            source = str(st.session_state.get("project_draft_source") or "manual")
             usage = st.session_state.get("project_draft_usage") or {}
-            cost = usage.get("total_cost_usd")
-            token_count = int(usage.get("total_tokens", 0) or 0)
-            wall = float(usage.get("wall_time_s", 0) or 0)
-            metrics = []
-            if token_count:
-                metrics.append(f"{token_count:,} token")
-            if cost is not None:
-                metrics.append(f"${float(cost):.6f}")
-            if wall:
-                metrics.append(f"{wall:.1f} sn")
-            st.success("ProjectPlanner taslağı hazırladı" + (" · " + " · ".join(metrics) if metrics else ""))
+            if source == "llm":
+                cost = usage.get("total_cost_usd")
+                token_count = int(usage.get("total_tokens", 0) or 0)
+                wall = float(usage.get("wall_time_s", 0) or 0)
+                metrics = []
+                if token_count:
+                    metrics.append(f"{token_count:,} token")
+                if cost is not None:
+                    metrics.append(f"${float(cost):.6f}")
+                if wall:
+                    metrics.append(f"{wall:.1f} sn")
+                st.success("ProjectPlanner taslağı hazırladı" + (" · " + " · ".join(metrics) if metrics else ""))
+            else:
+                st.info("Elle kurulum: proje alanlarını ve araştırma modellerini kendin seçiyorsun.")
 
-            with st.expander("LLM'nin doldurduğu proje alanları", expanded=True):
+            model_ids, model_labels, model_error = model_catalog()
+            if model_error:
+                st.warning(f"Canlı OpenRouter listesi alınamadı; production varsayılanları gösteriliyor. {model_error}")
+
+            with st.expander("Proje ve araştırma ekibi", expanded=True):
                 with st.form("create_project_form", clear_on_submit=False):
+                    st.markdown("### 2 · Projeyi kontrol et")
                     title = st.text_input("Proje adı", key="new_title")
                     project_id = st.text_input("Project ID", key="new_project_id")
                     description = st.text_area("Kısa açıklama", key="new_description", height=90)
@@ -182,10 +308,26 @@ if st.session_state.get("show_create_project", False):
                         key="new_experiment_widget",
                     )
                     problem = st.text_area("Başlangıç problemi", key="new_problem", height=220)
-                    literature_query = st.text_input(
-                        "Literatür arama sorgusu", key="new_literature_query"
-                    )
+                    literature_query = st.text_input("Literatür arama sorgusu", key="new_literature_query")
                     tags_raw = st.text_input("Etiketler", key="new_tags")
+
+                    st.markdown("### 3 · Araştırmayı yapacak LLM'leri seç")
+                    st.caption(
+                        "Bunlar proje oluşturulurken kaydedilir ve ilk deney ekranında varsayılan olarak gelir. "
+                        "Daha sonra istediğin zaman değiştirebilirsin."
+                    )
+                    selected_agents, selected_generic = _selected_agent_defaults(model_ids, model_labels)
+
+                    st.markdown("### 4 · Yerel kayıt")
+                    st.info(
+                        "Proje oluşturulduğu andan itibaren state/checkpoint/sonuçlar `research_state/<project_id>/`, "
+                        "her run'ın trace/stream/summary dosyaları `runs/<run_id>/` altında bu bilgisayara kaydedilir."
+                    )
+                    st.caption(
+                        "Kaydedilen başlıca dosyalar: `worker_result.md`, `state.json`, `checkpoints/`, `trace.jsonl`, "
+                        "`stream.jsonl`, `summary.json`. PDF/DOCX otomatik oluşturulmaz. LLM çağrılarındaki prompt/yanıtlar "
+                        "seçtiğin API sağlayıcısı üzerinden işlenir; proje klasörleri GitHub/Drive'a otomatik senkronlanmaz."
+                    )
                     c1, c2 = st.columns(2)
                     create = c1.form_submit_button(
                         "Projeyi Oluştur ve Aç", type="primary", use_container_width=True
@@ -207,12 +349,17 @@ if st.session_state.get("show_create_project", False):
                             tags=[x.strip() for x in tags_raw.split(",") if x.strip()],
                             activate=True,
                         )
+                        save_project_ui_settings(
+                            pm.project_root(info.project_id),
+                            agents=selected_agents,
+                            orchestrator_default=selected_generic,
+                        )
                     except Exception as exc:
                         st.error(str(exc))
                     else:
                         reset_new_project_state()
                         st.session_state["show_create_project"] = False
-                        st.success(f"{info.title} oluşturuldu.")
+                        st.success(f"{info.title} oluşturuldu; araştırma ekibi kaydedildi.")
                         st.switch_page("app.py")
         else:
             if st.button("İptal", use_container_width=True):
@@ -227,24 +374,31 @@ projects = pm.list_projects(include_archived=show_archived)
 needle = search.strip().casefold()
 if needle:
     projects = [
-        p for p in projects
-        if needle in " ".join([
-            p.project_id,
-            p.title,
-            p.description,
-            p.problem,
-            " ".join(p.tags or []),
-        ]).casefold()
+        p
+        for p in projects
+        if needle
+        in " ".join(
+            [
+                p.project_id,
+                p.title,
+                p.description,
+                p.problem,
+                " ".join(p.tags or []),
+            ]
+        ).casefold()
     ]
 
 if not projects:
     st.info("Henüz proje yok. Yukarıdaki Yeni Proje Oluştur düğmesiyle başlayabilirsin.")
 
 for project in projects:
+    root = pm.project_root(project.project_id)
+    storage = local_storage_summary(root, pm.runs_dir)
     with st.container(border=True):
         left, right = st.columns([4, 1])
         left.markdown(f"### {status_icon(project.status)} {project.title}")
         left.caption(f"`{project.project_id}` · son güncelleme {fmt_time(project.updated_at)}")
+        left.caption(f"💾 Yerel kayıt: `{storage['project_root']}`")
         right.markdown(f"**{project.status}**")
         if project.description:
             st.write(project.description)
@@ -258,13 +412,13 @@ for project in projects:
         c3.metric("Maliyet", f"${project.total_cost_usd:.4f}")
         c4.metric("OPEN / FAIL / PROVEN", f"{counts.get('OPEN',0)} / {counts.get('FAIL',0)} / {counts.get('PROVEN',0)}")
 
-        b1, b2, b3, b4 = st.columns(4)
+        b1, b2, b3, b4, b5 = st.columns(5)
         if b1.button("Aç", key=f"open_{project.project_id}", use_container_width=True):
             pm.set_active(project.project_id)
             st.switch_page("app.py")
         if b2.button("Devam Et", key=f"resume_{project.project_id}", use_container_width=True):
             pm.set_active(project.project_id)
-            if project.status in {"PAUSED_ERROR", "STOPPED", "PAUSED"}:
+            if project.status in {"PAUSED_ERROR", "STOPPED", "PAUSED", "INTERRUPTED", "STALE_RUNNING"}:
                 st.switch_page("pages/3_Research_Control.py")
             else:
                 st.switch_page("app.py")
@@ -274,6 +428,10 @@ for project in projects:
         if b4.button(archive_label, key=f"archive_{project.project_id}", use_container_width=True):
             pm.archive(project.project_id, not project.archived)
             st.rerun()
+        if b5.button("Sil", key=f"delete_toggle_{project.project_id}", use_container_width=True):
+            st.session_state[f"delete_{project.project_id}"] = not st.session_state.get(
+                f"delete_{project.project_id}", False
+            )
 
         if st.session_state.get(f"clone_{project.project_id}"):
             with st.form(f"clone_form_{project.project_id}"):
@@ -295,35 +453,71 @@ for project in projects:
                     st.success(f"Kopya oluşturuldu: {new_project.project_id}")
                     st.rerun()
 
+        if st.session_state.get(f"delete_{project.project_id}"):
+            st.error("Yerel silme işlemi")
+            if project_lock_is_live(root):
+                st.warning(
+                    "Bu projenin worker'ı şu anda çalışıyor. Aşağıdaki silme düğmelerinden biri seçilirse worker önce ZORLA DURDURULACAK."
+                )
+            st.caption(f"Proje state: `{storage['project_root']}`")
+            st.caption(f"Run geçmişi: `{storage['runs_root']}`")
+            confirm = st.text_input(
+                f"Silmek için `{project.project_id}` yaz",
+                key=f"delete_confirm_{project.project_id}",
+            )
+            d1, d2, d3 = st.columns(3)
+            if d1.button(
+                "Sadece proje state'ini sil",
+                key=f"delete_state_{project.project_id}",
+                disabled=confirm != project.project_id,
+                use_container_width=True,
+            ):
+                can_delete = True
+                if project_lock_is_live(root):
+                    can_delete = force_stop_worker(root)
+                if not can_delete:
+                    st.error("Worker zorla durdurulamadı; proje dosyaları silinmedi.")
+                else:
+                    pm.delete(project.project_id)
+                    st.rerun()
+            if d2.button(
+                "HER ŞEYİ SİL · run logları dahil",
+                key=f"delete_all_{project.project_id}",
+                disabled=confirm != project.project_id,
+                use_container_width=True,
+                type="primary",
+            ):
+                can_delete = True
+                if project_lock_is_live(root):
+                    can_delete = force_stop_worker(root)
+                if not can_delete:
+                    st.error("Worker zorla durdurulamadı; proje ve run geçmişi silinmedi.")
+                else:
+                    summaries = pm.run_summaries(project.project_id)
+                    deleted_runs = delete_run_history(summaries, pm.runs_dir)
+                    pm.delete(project.project_id)
+                    st.session_state[f"deleted_runs_{project.project_id}"] = deleted_runs
+                    st.rerun()
+            if d3.button("Vazgeç", key=f"delete_cancel_{project.project_id}", use_container_width=True):
+                st.session_state[f"delete_{project.project_id}"] = False
+                st.rerun()
+
         with st.expander("Geçmiş / ayrıntılar", expanded=False):
-            st.json({
-                "project_id": project.project_id,
-                "project_uuid": project.project_uuid,
-                "status": project.status,
-                "experiment": project.experiment,
-                "tags": project.tags,
-                "runtime": project.runtime,
-                "counts": project.counts,
-            })
+            st.json(
+                {
+                    "project_id": project.project_id,
+                    "project_uuid": project.project_uuid,
+                    "status": project.status,
+                    "experiment": project.experiment,
+                    "tags": project.tags,
+                    "runtime": project.runtime,
+                    "counts": project.counts,
+                    "local_project_root": storage["project_root"],
+                    "local_runs_root": storage["runs_root"],
+                }
+            )
             runs = pm.run_summaries(project.project_id)[:20]
             if runs:
                 st.dataframe(pd.DataFrame(runs), use_container_width=True, hide_index=True)
             else:
                 st.caption("Bu projeye bağlı kayıtlı run bulunamadı.")
-
-        with st.expander("Tehlikeli işlemler", expanded=False):
-            st.warning(
-                "Silme işlemi araştırma state klasörünü kalıcı olarak siler. Runs klasöründeki eski loglar silinmez; "
-                "ancak immutable project UUID nedeniyle aynı project_id ile yeni proje oluşturulsa bile eski geçmiş yeni projeye bağlanmaz."
-            )
-            confirm = st.text_input(
-                f"Silmek için `{project.project_id}` yaz",
-                key=f"delete_confirm_{project.project_id}",
-            )
-            if st.button(
-                "Projeyi Kalıcı Sil",
-                key=f"delete_{project.project_id}",
-                disabled=confirm != project.project_id,
-            ):
-                pm.delete(project.project_id)
-                st.rerun()

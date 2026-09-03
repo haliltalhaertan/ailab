@@ -1,5 +1,6 @@
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -34,8 +35,9 @@ def test_theorem_research_is_available_in_ui(app):
 
 
 def test_theorem_roles_have_independent_default_models(app):
+    missing_project = SimpleNamespace(project_id="no-project-settings")
     for role in app.EXPERIMENTS["Teorem Araştırması"]["roles"]:
-        assert app.default_model(role)
+        assert app.default_model(role, missing_project)
         assert role in app.ROLE_LIBRARY
 
 
@@ -77,5 +79,6 @@ def test_real_counterexample_is_labeled_counterexample(app):
     assert tone == "error"
 
 
-def test_compact_live_renderer_is_available(app):
-    assert hasattr(app, "LiveTimelineRenderer")
+def test_reduced_live_card_renderer_is_available(app):
+    assert hasattr(app, "render_agent_card")
+    assert hasattr(app, "build_cards")

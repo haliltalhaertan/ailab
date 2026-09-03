@@ -5,12 +5,20 @@ from pathlib import Path
 
 import streamlit as st
 
+from lab.integrity import project_lock_is_live
 from lab.openrouter_catalog import fetch_openrouter_models
 from lab.project_manager import ProjectManager
 from lab.runtime_health import cleanup_stale_run
 from lab.step_store import StepStore
 from lab.ui_live import render_now_and_timeline
-from lab.ui_model import filter_models, load_live_run_events, runs_for_project
+from lab.ui_model import (
+    filter_models,
+    load_default_agent_profile,
+    load_live_run_events,
+    profile_model_ids,
+    runs_for_project,
+)
+from lab.ui_project_settings import force_stop_worker, local_storage_summary
 from lab.worker_launcher import launch_worker, write_worker_request
 
 ROOT = Path("research_state")
@@ -18,16 +26,10 @@ RUNS = Path("runs")
 pm = ProjectManager(ROOT)
 st.set_page_config(page_title="Araştırma Kontrolü", layout="wide")
 st.title("Araştırma Kontrolü")
-st.caption("Tüm deneyler Streamlit'ten bağımsız worker process'te çalışır. Buradan canlı izle, durdur veya yeniden başlat.")
+st.caption("Canlı worker'ı izle, normal durdur, gerekirse zorla sonlandır veya devam et.")
 
-FALLBACK_MODELS = [
-    "openai/gpt-4o-mini",
-    "openai/gpt-4o",
-    "deepseek/deepseek-r1",
-    "z-ai/glm-5.3-flash",
-    "google/gemini-2.5-pro",
-    "meta-llama/llama-3.3-70b-instruct",
-]
+DEFAULT_AGENT_PROFILE = load_default_agent_profile()
+FALLBACK_MODELS = profile_model_ids(DEFAULT_AGENT_PROFILE)
 
 
 def read_json(path: Path, default):
@@ -87,8 +89,15 @@ store = StepStore(project)
 request = read_json(request_path, {})
 experiment_method = str(request.get("experiment_method") or "theorem_lab")
 experiment_name = str(request.get("experiment_name") or project_info.experiment or "Deney")
+storage = local_storage_summary(project, RUNS)
 
 st.caption(f"**{experiment_name}** · `{selected_id}` · method `{experiment_method}`")
+st.success(f"💾 Yerel kayıt açık · `{storage['project_root']}`")
+with st.expander("Yerel dosya konumları", expanded=False):
+    st.markdown("**Proje state / checkpoint / son worker sonucu**")
+    st.code(storage["project_root"], language=None)
+    st.markdown("**Tüm run trace / stream / summary klasörleri**")
+    st.code(storage["runs_root"], language=None)
 
 
 @st.fragment(run_every=1.0)
@@ -124,23 +133,38 @@ def live_status() -> None:
 live_status()
 
 current_info = pm.get(selected_id)
-left, right = st.columns(2)
+running = project_lock_is_live(project)
+left, middle, right = st.columns(3)
 with left:
     if st.button(
         "DURDUR",
         type="primary",
         use_container_width=True,
-        disabled=current_info.status != "RUNNING",
+        disabled=not running or stop_path.exists(),
     ):
         stop_path.write_text("stop requested\n", encoding="utf-8")
-        st.warning("Durdurma isteği yazıldı. Worker mümkün olan ilk güvenli noktada duracak.")
+        st.warning("Durdurma isteği yazıldı. Worker ilk güvenli kesme noktasında duracak.")
+        st.rerun()
+with middle:
+    if st.button(
+        "ZORLA DURDUR · HEMEN",
+        use_container_width=True,
+        disabled=not running,
+        help="Worker process'ini hemen sonlandırır; son çağrının partial çıktısı eksik kalabilir.",
+    ):
+        if force_stop_worker(project):
+            st.warning("Worker zorla sonlandırıldı. Kaydedilmiş proje dosyaları korunuyor.")
+        else:
+            st.info("Canlı worker process'i bulunamadı.")
+        st.rerun()
 with right:
-    if st.button("Durdurma isteğini iptal et", use_container_width=True):
+    if st.button("Durdurma isteğini iptal et", use_container_width=True, disabled=not stop_path.exists()):
         stop_path.unlink(missing_ok=True)
         st.success("Stop flag kaldırıldı.")
+        st.rerun()
 
 current_info = pm.get(selected_id)
-if current_info.status == "STALE_RUNNING":
+if current_info.status == "STALE_RUNNING" and not running:
     st.warning(
         "Stale worker kaydı bulundu. Temizlemek yalnız stale run.lock/runtime işaretini kaldırır; "
         "theorem step cache ve partial içerikler varsa korunur."
@@ -162,7 +186,7 @@ if experiment_method != "theorem_lab":
     st.caption(
         "Theorem dışı deneylerde step-level resume yoktur. Aynı worker isteğini yeni bir run olarak yeniden başlatabilirsin."
     )
-    running = pm.get(selected_id).status == "RUNNING"
+    running = project_lock_is_live(project)
     if not request:
         st.warning("Yeniden çalıştırılacak worker_request.json bulunamadı.")
     elif st.button("YENİDEN ÇALIŞTIR", type="primary", use_container_width=True, disabled=running):
@@ -236,7 +260,7 @@ else:
                 + ". Tamamlanmış adımlar korunacak; override yalnız incomplete/partial adımlarda etkili."
             )
 
-        running = pm.get(selected_id).status == "RUNNING"
+        running = project_lock_is_live(project)
         if st.button("ŞİMDİ DEVAM ET", type="primary", use_container_width=True, disabled=running):
             stop_path.unlink(missing_ok=True)
             frozen = read_json(project / "problem_frozen.json", {})
