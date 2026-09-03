@@ -224,13 +224,15 @@ class LLMClient:
                 reasoning_parts.append(text)
                 stream_callback("reasoning", text)
 
+            # Keep structured reasoning details for the final LLMResponse (and
+            # therefore trace.jsonl / provider-resume), but do not duplicate
+            # every detail delta into the high-volume live stream channel.
             detail_delta = _jsonable(_extra(delta, "reasoning_details"))
             if detail_delta:
                 if isinstance(detail_delta, list):
                     reasoning_details.extend(detail_delta)
                 else:
                     reasoning_details.append(detail_delta)
-                stream_callback("reasoning_details", detail_delta)
 
         latency = time.perf_counter() - start
         prompt_tokens, completion_tokens, reasoning_tokens, cached_tokens, cost_usd = _usage_values(final_usage)
