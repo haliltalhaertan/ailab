@@ -51,14 +51,15 @@ def tail_file(path: Path, state_key: str) -> tuple[str, list[dict]]:
         return state["raw"], state["events"]
 
     if actual.suffix == ".gz":
+        # Completed stream archives are immutable. Decompress once per selected
+        # run and keep the decoded events in session_state rather than inflating
+        # a multi-megabyte gzip file on every one-second fragment refresh.
+        if int(state.get("offset", 0)) > 0:
+            return state["raw"], state["events"]
         with gzip.open(actual, "rb") as handle:
             payload = handle.read()
         size = len(payload)
-        offset = int(state.get("offset", 0))
-        if offset > size:
-            state.update({"offset": 0, "raw": "", "events": []})
-            offset = 0
-        chunk = payload[offset:]
+        chunk = payload
         state["offset"] = size
     else:
         size = actual.stat().st_size
