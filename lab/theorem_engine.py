@@ -432,9 +432,48 @@ class TheoremResearchLab:
         fingerprint = content_fingerprint("code_experiment_action:v3", action)
         cached = self._cache_get(cache_key)
         if isinstance(cached, dict) and cached.get("status") == "COMPLETE" and cached.get("fingerprint") == fingerprint:
-            raw = cached.get("result") or {}
-            self.trace.log("step_reused", step_key=cache_key, tool="code_experiment_action")
-            return WorkspaceActionResult(bool(raw.get("ok")), str(raw.get("action") or "unknown"), str(raw.get("output") or ""), str(raw.get("error") or ""), dict(raw.get("metadata") or {}))
+            raw_value = cached.get("result")
+            raw = dict(raw_value) if isinstance(raw_value, dict) else {}
+            metadata = dict(raw.get("metadata") or {})
+            action_name = str(action.get("action") or "").strip().lower()
+            hash_field = {"run_python": "script_sha256", "read_file": "sha256"}.get(action_name)
+            if hash_field is not None:
+                relative_path = str(action.get("path") or "")
+                expected_sha = str(metadata.get(hash_field) or "")
+                current_sha = ""
+                try:
+                    target = self.code_workspace._resolve(relative_path, must_exist=True)
+                    current_sha = sha256_file(target)
+                except (FileNotFoundError, OSError, ValueError):
+                    current_sha = ""
+                if not expected_sha or current_sha != expected_sha:
+                    self.trace.log(
+                        "cache_sha_miss",
+                        step_key=cache_key,
+                        action=action_name,
+                        path=relative_path,
+                        expected_sha256=expected_sha or None,
+                        current_sha256=current_sha or None,
+                    )
+                    self._cache_delete(cache_key)
+                else:
+                    self.trace.log("step_reused", step_key=cache_key, tool="code_experiment_action")
+                    return WorkspaceActionResult(
+                        bool(raw.get("ok")),
+                        str(raw.get("action") or "unknown"),
+                        str(raw.get("output") or ""),
+                        str(raw.get("error") or ""),
+                        metadata,
+                    )
+            else:
+                self.trace.log("step_reused", step_key=cache_key, tool="code_experiment_action")
+                return WorkspaceActionResult(
+                    bool(raw.get("ok")),
+                    str(raw.get("action") or "unknown"),
+                    str(raw.get("output") or ""),
+                    str(raw.get("error") or ""),
+                    metadata,
+                )
         result = self.code_workspace.execute(action)
         self._cache_put(cache_key, {"status": "COMPLETE", "fingerprint": fingerprint, "result": result.as_dict(), "completed_at": now_iso()})
         return result

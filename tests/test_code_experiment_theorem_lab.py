@@ -1,3 +1,5 @@
+import json
+
 from lab.client import LLMResponse
 from lab.code_experiment import CODE_EXPERIMENT_SYSTEM_PROMPT
 from lab.research_state import ResearchState
@@ -39,6 +41,10 @@ class FakeCodeAgent:
             cost_usd=0.001,
             request_messages=[{"role": "system", "content": self.system_prompt}] + messages,
         )
+
+
+def _container_run_count(commands):
+    return sum(1 for command in commands if len(command) > 1 and command[1] == "run")
 
 
 def test_code_experiment_tool_writes_runs_and_finishes(tmp_path, fake_container_runtime):
@@ -85,3 +91,32 @@ def test_completed_code_experiment_is_reused(tmp_path, fake_container_runtime):
     assert result is not None and result.ok
     assert second_agent.calls == 0
     assert len(fake_container_runtime) == first_command_count
+
+
+def test_cached_run_python_revalidates_workspace_script_sha(tmp_path, fake_container_runtime):
+    state = ResearchState(tmp_path / "state")
+    trace = Trace("workspace-cache-sha", out_dir=tmp_path / "runs")
+    lab = TheoremResearchLab(trace, state, literature=EmptyLiterature(), code_experiment_steps=5)
+    script = state.root / "workspace" / "exp_001.py"
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text("print('first')\n", encoding="utf-8")
+    action = {"action": "run_python", "path": "exp_001.py", "args": []}
+    cache_key = "iter:1:tool:action:1"
+
+    first = lab._cached_workspace_action(cache_key, action)
+    first_run_count = _container_run_count(fake_container_runtime)
+    assert first.ok
+    assert first.output.strip() == "first"
+
+    script.write_text("print('second')\n", encoding="utf-8")
+    second = lab._cached_workspace_action(cache_key, action)
+    trace.close()
+
+    assert second.ok
+    assert second.output.strip() == "second"
+    assert _container_run_count(fake_container_runtime) == first_run_count + 1
+    events = [json.loads(line) for line in trace.path.read_text(encoding="utf-8").splitlines()]
+    misses = [event for event in events if event.get("type") == "cache_sha_miss"]
+    assert misses
+    assert misses[-1]["step_key"] == cache_key
+    assert misses[-1]["action"] == "run_python"
