@@ -198,7 +198,7 @@ def test_theorem_worker_background_heartbeat_survives_blocking_step_and_stops_at
 
         def run(self, _problem, **_kwargs):
             first = self.controller.set_runtime(status="RUNNING")["heartbeat_at"]
-            time.sleep(0.35)
+            time.sleep(6.0)
             middle = self.controller.runtime()["heartbeat_at"]
             seen["first"] = first
             seen["middle"] = middle
@@ -206,15 +206,15 @@ def test_theorem_worker_background_heartbeat_survives_blocking_step_and_stops_at
             return "slow theorem result"
 
     monkeypatch.setattr(worker, "TheoremResearchLab", SlowTheoremLab)
-    monkeypatch.setattr(worker.WorkerRuntimeBridge, "HEARTBEAT_POLL_S", 0.03)
-    monkeypatch.setattr(worker.WorkerRuntimeBridge, "HEARTBEAT_MIN_INTERVAL_S", 0.08)
+    monkeypatch.setattr(worker.WorkerRuntimeBridge, "HEARTBEAT_POLL_S", 1.0)
+    monkeypatch.setattr(worker.WorkerRuntimeBridge, "HEARTBEAT_MIN_INTERVAL_S", 1.0)
 
     assert worker.run_project(info.project_id, agent_factory=fake_agent_factory) == 0
     assert seen["middle"] != seen["first"]
     runtime = json.loads((root / "runtime.json").read_text(encoding="utf-8"))
     assert runtime["status"] == "COMPLETED"
     final_heartbeat = runtime["heartbeat_at"]
-    time.sleep(0.12)
+    time.sleep(1.2)
     after = json.loads((root / "runtime.json").read_text(encoding="utf-8"))
     assert after["heartbeat_at"] == final_heartbeat
 
