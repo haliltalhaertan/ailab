@@ -254,7 +254,7 @@ if st.session_state.get("show_create_project", False):
         if setup_left.button(
             "✨ LLM ile Taslak Hazırla",
             type="primary",
-            use_container_width=True,
+            width="stretch",
             disabled=generate_disabled,
         ):
             with st.spinner("ProjectPlanner proje taslağını hazırlıyor..."):
@@ -264,7 +264,7 @@ if st.session_state.get("show_create_project", False):
                     st.error(f"ProjectPlanner başarısız: {exc}")
                 else:
                     st.rerun()
-        if setup_right.button("LLM kullanmadan elle kur", use_container_width=True):
+        if setup_right.button("LLM kullanmadan elle kur", width="stretch"):
             start_manual_project(project_prompt)
             st.rerun()
 
@@ -329,10 +329,8 @@ if st.session_state.get("show_create_project", False):
                         "seçtiğin API sağlayıcısı üzerinden işlenir; proje klasörleri GitHub/Drive'a otomatik senkronlanmaz."
                     )
                     c1, c2 = st.columns(2)
-                    create = c1.form_submit_button(
-                        "Projeyi Oluştur ve Aç", type="primary", use_container_width=True
-                    )
-                    cancel = c2.form_submit_button("İptal", use_container_width=True)
+                    create = c1.form_submit_button("Projeyi Oluştur ve Aç", type="primary", width="stretch")
+                    cancel = c2.form_submit_button("İptal", width="stretch")
                 if cancel:
                     reset_new_project_state()
                     st.session_state["show_create_project"] = False
@@ -362,7 +360,7 @@ if st.session_state.get("show_create_project", False):
                         st.success(f"{info.title} oluşturuldu; araştırma ekibi kaydedildi.")
                         st.switch_page("app.py")
         else:
-            if st.button("İptal", use_container_width=True):
+            if st.button("İptal", width="stretch"):
                 reset_new_project_state()
                 st.session_state["show_create_project"] = False
                 st.rerun()
@@ -377,15 +375,7 @@ if needle:
         p
         for p in projects
         if needle
-        in " ".join(
-            [
-                p.project_id,
-                p.title,
-                p.description,
-                p.problem,
-                " ".join(p.tags or []),
-            ]
-        ).casefold()
+        in " ".join([p.project_id, p.title, p.description, p.problem, " ".join(p.tags or [])]).casefold()
     ]
 
 if not projects:
@@ -413,33 +403,31 @@ for project in projects:
         c4.metric("OPEN / FAIL / PROVEN", f"{counts.get('OPEN',0)} / {counts.get('FAIL',0)} / {counts.get('PROVEN',0)}")
 
         b1, b2, b3, b4, b5 = st.columns(5)
-        if b1.button("Aç", key=f"open_{project.project_id}", use_container_width=True):
+        if b1.button("Aç", key=f"open_{project.project_id}", width="stretch"):
             pm.set_active(project.project_id)
             st.switch_page("app.py")
-        if b2.button("Devam Et", key=f"resume_{project.project_id}", use_container_width=True):
+        if b2.button("Devam Et", key=f"resume_{project.project_id}", width="stretch"):
             pm.set_active(project.project_id)
             if project.status in {"PAUSED_ERROR", "STOPPED", "PAUSED", "INTERRUPTED", "STALE_RUNNING"}:
                 st.switch_page("pages/3_Research_Control.py")
             else:
                 st.switch_page("app.py")
-        if b3.button("Kopyala", key=f"clone_toggle_{project.project_id}", use_container_width=True):
+        if b3.button("Kopyala", key=f"clone_toggle_{project.project_id}", width="stretch"):
             st.session_state[f"clone_{project.project_id}"] = True
         archive_label = "Arşivden Çıkar" if project.archived else "Arşivle"
-        if b4.button(archive_label, key=f"archive_{project.project_id}", use_container_width=True):
+        if b4.button(archive_label, key=f"archive_{project.project_id}", width="stretch"):
             pm.archive(project.project_id, not project.archived)
             st.rerun()
-        if b5.button("Sil", key=f"delete_toggle_{project.project_id}", use_container_width=True):
-            st.session_state[f"delete_{project.project_id}"] = not st.session_state.get(
-                f"delete_{project.project_id}", False
-            )
+        if b5.button("Sil", key=f"delete_toggle_{project.project_id}", width="stretch"):
+            st.session_state[f"delete_{project.project_id}"] = not st.session_state.get(f"delete_{project.project_id}", False)
 
         if st.session_state.get(f"clone_{project.project_id}"):
             with st.form(f"clone_form_{project.project_id}"):
                 clone_title = st.text_input("Yeni proje adı", value=f"{project.title} Kopya")
                 clone_id = st.text_input("Yeni project ID", value="")
                 cc1, cc2 = st.columns(2)
-                do_clone = cc1.form_submit_button("Kopyayı Oluştur", type="primary", use_container_width=True)
-                close_clone = cc2.form_submit_button("Vazgeç", use_container_width=True)
+                do_clone = cc1.form_submit_button("Kopyayı Oluştur", type="primary", width="stretch")
+                close_clone = cc2.form_submit_button("Vazgeç", width="stretch")
             if close_clone:
                 st.session_state[f"clone_{project.project_id}"] = False
                 st.rerun()
@@ -461,16 +449,13 @@ for project in projects:
                 )
             st.caption(f"Proje state: `{storage['project_root']}`")
             st.caption(f"Run geçmişi: `{storage['runs_root']}`")
-            confirm = st.text_input(
-                f"Silmek için `{project.project_id}` yaz",
-                key=f"delete_confirm_{project.project_id}",
-            )
+            confirm = st.text_input(f"Silmek için `{project.project_id}` yaz", key=f"delete_confirm_{project.project_id}")
             d1, d2, d3 = st.columns(3)
             if d1.button(
                 "Sadece proje state'ini sil",
                 key=f"delete_state_{project.project_id}",
                 disabled=confirm != project.project_id,
-                use_container_width=True,
+                width="stretch",
             ):
                 can_delete = True
                 if project_lock_is_live(root):
@@ -484,7 +469,7 @@ for project in projects:
                 "HER ŞEYİ SİL · run logları dahil",
                 key=f"delete_all_{project.project_id}",
                 disabled=confirm != project.project_id,
-                use_container_width=True,
+                width="stretch",
                 type="primary",
             ):
                 can_delete = True
@@ -498,7 +483,7 @@ for project in projects:
                     pm.delete(project.project_id)
                     st.session_state[f"deleted_runs_{project.project_id}"] = deleted_runs
                     st.rerun()
-            if d3.button("Vazgeç", key=f"delete_cancel_{project.project_id}", use_container_width=True):
+            if d3.button("Vazgeç", key=f"delete_cancel_{project.project_id}", width="stretch"):
                 st.session_state[f"delete_{project.project_id}"] = False
                 st.rerun()
 
@@ -518,6 +503,6 @@ for project in projects:
             )
             runs = pm.run_summaries(project.project_id)[:20]
             if runs:
-                st.dataframe(pd.DataFrame(runs), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(runs), width="stretch", hide_index=True)
             else:
                 st.caption("Bu projeye bağlı kayıtlı run bulunamadı.")

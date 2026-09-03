@@ -139,7 +139,7 @@ with left:
     if st.button(
         "DURDUR",
         type="primary",
-        use_container_width=True,
+        width="stretch",
         disabled=not running or stop_path.exists(),
     ):
         stop_path.write_text("stop requested\n", encoding="utf-8")
@@ -148,7 +148,7 @@ with left:
 with middle:
     if st.button(
         "ZORLA DURDUR · HEMEN",
-        use_container_width=True,
+        width="stretch",
         disabled=not running,
         help="Worker process'ini hemen sonlandırır; son çağrının partial çıktısı eksik kalabilir.",
     ):
@@ -158,7 +158,7 @@ with middle:
             st.info("Canlı worker process'i bulunamadı.")
         st.rerun()
 with right:
-    if st.button("Durdurma isteğini iptal et", use_container_width=True, disabled=not stop_path.exists()):
+    if st.button("Durdurma isteğini iptal et", width="stretch", disabled=not stop_path.exists()):
         stop_path.unlink(missing_ok=True)
         st.success("Stop flag kaldırıldı.")
         st.rerun()
@@ -169,7 +169,7 @@ if current_info.status == "STALE_RUNNING" and not running:
         "Stale worker kaydı bulundu. Temizlemek yalnız stale run.lock/runtime işaretini kaldırır; "
         "theorem step cache ve partial içerikler varsa korunur."
     )
-    if st.button("Stale run'ı temizle", use_container_width=True):
+    if st.button("Stale run'ı temizle", width="stretch"):
         try:
             cleanup_stale_run(project)
         except Exception as exc:
@@ -189,7 +189,7 @@ if experiment_method != "theorem_lab":
     running = project_lock_is_live(project)
     if not request:
         st.warning("Yeniden çalıştırılacak worker_request.json bulunamadı.")
-    elif st.button("YENİDEN ÇALIŞTIR", type="primary", use_container_width=True, disabled=running):
+    elif st.button("YENİDEN ÇALIŞTIR", type="primary", width="stretch", disabled=running):
         stop_path.unlink(missing_ok=True)
         retry_request = dict(request)
         retry_request["project_id"] = selected_id
@@ -255,13 +255,11 @@ else:
                 changed_models.append(role)
         if changed_models:
             st.info(
-                "Model override: "
-                + ", ".join(changed_models)
-                + ". Tamamlanmış adımlar korunacak; override yalnız incomplete/partial adımlarda etkili."
+                "Model override: " + ", ".join(changed_models) + ". Tamamlanmış adımlar korunacak; override yalnız incomplete/partial adımlarda etkili."
             )
 
         running = project_lock_is_live(project)
-        if st.button("ŞİMDİ DEVAM ET", type="primary", use_container_width=True, disabled=running):
+        if st.button("ŞİMDİ DEVAM ET", type="primary", width="stretch", disabled=running):
             stop_path.unlink(missing_ok=True)
             frozen = read_json(project / "problem_frozen.json", {})
             resume_request = {
@@ -295,7 +293,7 @@ if experiment_method == "theorem_lab":
     with st.expander("Partial/soft-resume adımları", expanded=False):
         st.json(store.list_partials())
     with st.expander("Step cache", expanded=False):
-        st.dataframe(store.list_steps(), use_container_width=True, hide_index=True)
+        st.dataframe(store.list_steps(), width="stretch", hide_index=True)
 with st.expander("Runtime cursor", expanded=False):
     st.json(read_json(runtime_path, {}))
 with st.expander("Worker isteği", expanded=False):

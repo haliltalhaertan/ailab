@@ -27,7 +27,6 @@ def indexed_runs() -> list[Path]:
             result.append(path)
     if result:
         return result
-    # Compatibility fallback for runs created before index.jsonl.
     return sorted(
         [p.parent for p in RUNS_DIR.glob("*/trace.jsonl")],
         key=lambda p: p.stat().st_mtime,
@@ -44,10 +43,7 @@ def _resolved_log_path(path: Path) -> Path:
 
 def tail_file(path: Path, state_key: str) -> tuple[str, list[dict]]:
     actual = _resolved_log_path(path)
-    state = st.session_state.setdefault(
-        state_key,
-        {"path": "", "offset": 0, "raw": "", "events": []},
-    )
+    state = st.session_state.setdefault(state_key, {"path": "", "offset": 0, "raw": "", "events": []})
     if state.get("path") != str(actual):
         state.clear()
         state.update({"path": str(actual), "offset": 0, "raw": "", "events": []})
@@ -118,42 +114,26 @@ def live_view() -> None:
     t1, t2 = st.tabs(["Core trace", "Stream"])
     with t1:
         visible = trace_events if show_all else trace_events[-last_n:]
-        visible_raw = trace_raw if show_all else "\n".join(
-            json.dumps(ev, ensure_ascii=False) for ev in visible
-        )
-        st.text_area(
-            "trace.jsonl",
-            value=visible_raw,
-            height=620,
-            disabled=True,
-            key=f"trace_view_{run.name}_{len(trace_events)}_{show_all}",
-        )
+        visible_raw = trace_raw if show_all else "\n".join(json.dumps(ev, ensure_ascii=False) for ev in visible)
+        st.text_area("trace.jsonl", value=visible_raw, height=620, disabled=True, key=f"trace_view_{run.name}_{len(trace_events)}_{show_all}")
         st.download_button(
             "trace.jsonl indir",
             data=trace_raw.encode("utf-8"),
             file_name=f"{run.name}_trace.jsonl",
             mime="application/x-ndjson",
-            use_container_width=True,
+            width="stretch",
         )
     with t2:
         visible = stream_events if show_all else stream_events[-last_n:]
-        visible_raw = stream_raw if show_all else "\n".join(
-            json.dumps(ev, ensure_ascii=False) for ev in visible
-        )
+        visible_raw = stream_raw if show_all else "\n".join(json.dumps(ev, ensure_ascii=False) for ev in visible)
         st.caption(f"Kaynak: `{stream_path.name}`")
-        st.text_area(
-            "stream.jsonl",
-            value=visible_raw,
-            height=620,
-            disabled=True,
-            key=f"stream_view_{run.name}_{len(stream_events)}_{show_all}",
-        )
+        st.text_area("stream.jsonl", value=visible_raw, height=620, disabled=True, key=f"stream_view_{run.name}_{len(stream_events)}_{show_all}")
         st.download_button(
             "stream.jsonl indir",
             data=stream_raw.encode("utf-8"),
             file_name=f"{run.name}_stream.jsonl",
             mime="application/x-ndjson",
-            use_container_width=True,
+            width="stretch",
         )
 
 

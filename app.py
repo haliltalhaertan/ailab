@@ -512,7 +512,7 @@ def render_history(active: ProjectInfo) -> None:
         summary_metrics(summary)
         rows = usage_rows(summary)
         if rows:
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
     events = load_run_events(selected, include_stream=False)
     st.subheader("Araştırma Timeline'ı")
     target = st.container(border=True)
@@ -671,7 +671,7 @@ def render_live_run(active: ProjectInfo) -> None:
                 state_prefix=f"{prefix}:done",
             )
 
-    if st.button("Research Control", use_container_width=True, key="live_control"):
+    if st.button("Research Control", width="stretch", key="live_control"):
         st.switch_page("pages/3_Research_Control.py")
 
     result_path = project_root / "worker_result.md"
@@ -737,7 +737,7 @@ def active_project_header(active: ProjectInfo) -> None:
             f"`{active.project_id}` · durum **{active.status}** · {active.run_count} run · ${active.total_cost_usd:.4f}"
         )
         c1.caption(f"💾 Bu proje bu bilgisayara otomatik kaydediliyor · `{storage['project_root']}`")
-        if c2.button("Projeyi Değiştir", use_container_width=True):
+        if c2.button("Projeyi Değiştir", width="stretch"):
             st.switch_page("pages/1_Projeler.py")
         if active.status in {"RUNNING", "PAUSED_ERROR", "STOPPED", "PAUSED", "STALE_RUNNING"}:
             if st.button("Araştırma Kontrolü", type="primary"):
@@ -757,17 +757,17 @@ def main() -> None:
     if active is None:
         st.info("Araştırma başlatmak için önce bir proje oluştur veya mevcut projeyi aç.")
         c1, c2 = st.columns(2)
-        if c1.button("＋ Yeni Proje Oluştur", type="primary", use_container_width=True):
+        if c1.button("＋ Yeni Proje Oluştur", type="primary", width="stretch"):
             st.session_state["show_create_project"] = True
             st.switch_page("pages/1_Projeler.py")
-        if c2.button("Projeleri Aç", use_container_width=True):
+        if c2.button("Projeleri Aç", width="stretch"):
             st.switch_page("pages/1_Projeler.py")
         st.stop()
 
     active_project_header(active)
     st.sidebar.header("Deney Ayarları")
     st.sidebar.caption(f"Aktif proje: **{active.title}** · `{active.project_id}`")
-    if st.sidebar.button("Projeleri Aç", use_container_width=True):
+    if st.sidebar.button("Projeleri Aç", width="stretch"):
         st.switch_page("pages/1_Projeler.py")
 
     api_ok = bool(os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY"))
@@ -801,7 +801,7 @@ def main() -> None:
                 stop_label,
                 type="primary",
                 disabled=stop_requested,
-                use_container_width=True,
+                width="stretch",
                 key="run_stop",
             ):
                 _request_stop(project_root)
@@ -811,7 +811,7 @@ def main() -> None:
                 st.rerun()
             if c2.button(
                 "ZORLA DURDUR · HEMEN",
-                use_container_width=True,
+                width="stretch",
                 key="run_force_stop",
                 help="Worker process'ini hemen sonlandırır. Son agent çağrısının partial çıktısı eksik kalabilir.",
             ):
@@ -825,7 +825,7 @@ def main() -> None:
             "Deneyi Çalıştır",
             type="primary",
             disabled=not api_ok,
-            use_container_width=True,
+            width="stretch",
             key="run_start",
         ):
             if not prompt.strip():

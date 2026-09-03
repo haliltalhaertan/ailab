@@ -66,7 +66,7 @@ st.info(
     "AST filtresi yalnız defense-in-depth'tir; güvenlik sınırı container'dır."
 )
 
-if st.button("Code deney ayarlarını kaydet", type="primary", use_container_width=True):
+if st.button("Code deney ayarlarını kaydet", type="primary", width="stretch"):
     path = save_code_experiment_settings(
         {
             "model": model,
