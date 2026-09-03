@@ -36,22 +36,25 @@ OPENROUTER_API_KEY=...
 ```text
 Streamlit UI / Research Control
             |
+            | worker_request.json (`experiment_method`)
             v
      Detached Worker
-            |
-            v
-   TheoremResearchLab
-      /    |     \
-StepStore RunController ToolRegistry
-   |          |          |
- SQLite    lock/stop   Python/Z3/Lean
-            |
-      ResearchState
-            |
-       Trace / Audit
+        /       \
+       v         v
+Orchestrator   TheoremResearchLab
+                  /    |     \
+             StepStore RunController ToolRegistry
+                |          |          |
+              SQLite    lock/stop   Python/Z3/Lean
+                           |
+                     ResearchState
+                           |
+                      Trace / Audit
 ```
 
-Theorem workflow'unun ana yürütme mantığı `lab/theorem_engine.py` içindedir. Evidence/integrity katmanı `lab/integrity_theorem_lab.py` üzerinden birleşik `TheoremResearchLab` sınıfını sağlar; eski theorem-lab compatibility shim dosyaları kaldırılmıştır.
+Beş deney türünün tamamı (`theorem_lab`, `research_loop`, `debate`, `pipeline`, `panel`) `experiment_method` ile aynı detached worker yürütme yoluna girer. Streamlit içinde doğrudan `Orchestrator` çalıştıran `execute_inline` yolu yoktur. Ana sayfa ve Research Control ortak canlı panelden aktif aşamayı, agent/model/effort bilgisini, reasoning/cevap akışını, token ve ücret metriklerini ve zaman çizelgesini gösterir; `DURDUR` isteği `stop.flag` üzerinden worker'a iletilir.
+
+Theorem workflow'unun ana yürütme mantığı `lab/theorem_engine.py` içindedir; `TheoremResearchLab` sınıfı `lab/__init__.py` üzerinden de export edilir.
 
 Başlıca runtime dosyaları:
 
@@ -141,7 +144,7 @@ Dolayısıyla yalnız `returncode == 0` olması `[PROVEN]` için yeterli değild
 
 ## Durdur / devam bütünlüğü
 
-Theorem run'ı Streamlit render thread'inde değil ayrı worker process'te çalışır. Tarayıcı kapansa bile worker yaşamaya devam edebilir. Research Control sayfasındaki STOP isteği `stop.flag` üzerinden worker'a iletilir.
+Tüm deney türleri Streamlit render thread'inde değil ayrı worker process'te çalışır. Tarayıcı kapansa bile worker yaşamaya devam edebilir. Ana sayfa ve Research Control'daki STOP isteği `stop.flag` üzerinden worker'a iletilir. Step-level kaldığı yerden devam semantiği theorem workflow'una aittir; theorem dışı workflow'lar aynı isteği yeni bir run olarak yeniden çalıştırır.
 
 Proje `run.lock` kilidi mutable run işlemlerinden önce alınır. Worker kilidi almadan `run_config.json`, stale stop flag, worker identity veya runtime çalışma durumunu değiştirmez. Aynı projede ikinci worker lock alamazsa aktif worker'ın dosyalarını overwrite etmez; yalnız ayrı bir busy tanısı yazabilir.
 
@@ -157,7 +160,7 @@ Bu gerçek provider KV-cache resume değildir. Provider'ın gizli inference stat
 
 ## Araştırma state'i bütünlük sınırı
 
-`PROVEN` evidence kayıtları HMAC proof seal taşır ve bağlı Lean dosyasının canlı SHA-256 değeri yeniden kontrol edilir. Tamamlanmış StepStore cache kayıtları da HMAC ile doğrulanır. `LAB_EVIDENCE_HMAC_KEY` dışarıdan verildiğinde anahtar proje verisinin dışında tutulabilir; varsayılan proje-local key modu daha çok kazara veya basit manuel değişiklikleri tespit etmeye yöneliktir.
+`PROVEN` evidence kayıtları HMAC proof seal taşır ve bağlı Lean dosyasının canlı SHA-256 değeri yeniden kontrol edilir. Tamamlanmış StepStore cache kayıtları da HMAC ile doğrulanır. `LAB_EVIDENCE_HMAC_KEY` dışarıdan verildiğinde anahtar proje verisinin dışında tutulabilir. Bu değişken verilmezse StepStore HMAC anahtarı proje klasöründe tutulur; bu mod kazara/basit manuel düzenlemeleri saptamak için bir bütünlük kontrolüdür, proje dosyalarına erişebilen düşman bir modele karşı güvenlik imzası değildir.
 
 Buna karşılık **bütün `state.json` dosyasının canonical items+events içeriği için global read-time seal uygulanmaz**. Audit'teki opsiyonel tam-state integrity maddesi bilinçli olarak kapsam dışında bırakılmıştır; proje dosya sistemini ve yerel HMAC anahtarını değiştirebilen bir yöneticiye karşı genel tamper-proof ledger garantisi verilmez. Güvenlik/evidence iddiaları yukarıdaki daha dar PROVEN ve cache kontrolleriyle sınırlıdır.
 
@@ -222,7 +225,7 @@ Theorem pipeline'daki yapılandırılmış LLM çıktıları fail-closed parse e
 
 `ToolRegistry` theorem promptuna sunulan tool şemalarıyla gerçek dispatch'in tek kaynağıdır.
 
-- **ScriptTool:** yalnız review edilmiş `research_tools/` scriptlerini çalıştırır.
+- **ScriptTool:** yalnız review edilmiş `research_tools/` ve `problem_packs/` altındaki güvenilir script yollarını çalıştırır. Contract'sız legacy projede structured evidence trailer'ı olmayan, başarılı (exit-0) checked-in script `NUMERICAL_PASS` sayılabilir; frozen contract'a bağlı projeler trailer/binding eksikliğinde fail-closed kalır.
 - **Z3Tool:** assertionsız SMT-LIB girdisini `inconclusive / no assertions` sayar; sat/unsat computation evidence için gerçek assertion gerekir.
 - **TropicalGridTool:** nonnegative ağırlıkların seçilen sonlu gridinde min-plus shortest-path **fonksiyon eşitliğini** test eder. `GRID_PASS`, simple-path provenance polynomial ile formal/monomial-level eşitlik ispatı değildir. `gate_count` yalnız internal non-edge gate sayısıdır; `edge_gate_count` ayrıca raporlanır.
 - **LeanTool:** claim-bound formal checker.
@@ -265,7 +268,7 @@ kaydedilir. `summary.json` run toplamlarını tutar.
 .venv\Scripts\streamlit run app.py
 ```
 
-Yeni projeler `Projeler` sayfasından tek prompt ile ProjectPlanner kullanılarak oluşturulabilir. Theorem Research başlatıldığında UI worker request'i yazar ve detached worker'ı başlatır. Araştırma ilerlemesi Research Control ve Ham Loglar sayfalarından izlenir.
+Yeni projeler `Projeler` sayfasından tek prompt ile ProjectPlanner kullanılarak oluşturulabilir. Deney başlatıldığında UI `experiment_method` içeren worker request'i yazar ve detached worker'ı başlatır. Beş deney türünün tamamı aynı canlı panelde izlenebilir ve `DURDUR` ile kesilebilir; `execute_inline` yürütme yolu yoktur. Theorem araştırmasında step-level resume Research Control'dan yapılır, diğer deneylerde yeniden çalıştırma yeni bir run açar.
 
 CodeExperimentAgent kullanacaksan Windows'ta Docker Desktop veya uyumlu bir Podman kurulumu gerekir. Container runtime yoksa metinsel theorem araştırması çalışabilir; generated-code experiment adımı güvenlik gereği başarısız olur.
 
