@@ -308,6 +308,7 @@ def test_run_finishes_cleanly_when_only_target_closes_before_iteration_budget(tm
     assert agents["proposer"].calls == 1
     runtime = json.loads((state.root / "runtime.json").read_text(encoding="utf-8"))
     assert runtime["completed_iterations"] == 1
+    assert runtime["research_phase"] == "PUBLICATION"
 
 
 def test_full_scope_compute_pilot_closes_without_llm_manager(tmp_path: Path):

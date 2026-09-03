@@ -244,6 +244,13 @@ def run_project(project_id: str, *, agent_factory: AgentFactory = _agent) -> int
 
         if method == "theorem_lab":
             agents = _theorem_agents(request.get("agents") or {}, agent_factory)
+            theorem_iterations = int(request.get("iterations", request.get("param", 5)))
+            theorem_checkpoint_every = int(request.get("checkpoint_every", 2))
+            trace.configure_theorem_stages(
+                iterations=theorem_iterations,
+                checkpoint_every=theorem_checkpoint_every,
+                has_literature_agent="LiteratureScout" in agents,
+            )
             state = ResearchState(root)
             lab = TheoremResearchLab(
                 trace,
@@ -268,24 +275,27 @@ def run_project(project_id: str, *, agent_factory: AgentFactory = _agent) -> int
                 verifier=agents["VerificationEngineer"],
                 literature_agent=agents.get("LiteratureScout"),
                 auditor=agents["IndependentAuditor"],
-                iterations=int(request.get("iterations", request.get("param", 5))),
+                iterations=theorem_iterations,
                 literature_query=request.get("literature_query"),
-                checkpoint_every=int(request.get("checkpoint_every", 2)),
+                checkpoint_every=theorem_checkpoint_every,
             )
         else:
             controller = RunController(root, trace)
             controller.lock = lock
             controller.clear_stale_stop()
-            controller.set_runtime(
+            bridge = WorkerRuntimeBridge(controller, background_heartbeat=True)
+            bridge.set_runtime(
                 status="RUNNING",
                 current_step="Deney başlatılıyor",
                 current_agent="",
                 last_error="",
             )
-            bridge = WorkerRuntimeBridge(controller, background_heartbeat=True)
             controller.check_stop()
             result = _run_orchestrator(method, request, trace, agent_factory, bridge)
-            controller.set_runtime(
+            # Join the heartbeat thread before publishing the final status so a
+            # stale read-modify-write heartbeat cannot overwrite COMPLETED.
+            bridge.close()
+            bridge.set_runtime(
                 status="COMPLETED",
                 current_step="Tamamlandı",
                 current_agent="",
@@ -296,9 +306,16 @@ def run_project(project_id: str, *, agent_factory: AgentFactory = _agent) -> int
         exit_code = 0
         result = f"Worker stopped: {exc}"
         final_status = "STOPPED"
-        active_controller = controller or (bridge.controller if bridge is not None else None)
-        if active_controller is not None:
-            active_controller.set_runtime(
+        if bridge is not None:
+            bridge.close()
+            bridge.set_runtime(
+                status="STOPPED",
+                current_step="Durduruldu",
+                current_agent="",
+                last_error="",
+            )
+        elif controller is not None:
+            controller.set_runtime(
                 status="STOPPED",
                 current_step="Durduruldu",
                 current_agent="",
@@ -310,6 +327,8 @@ def run_project(project_id: str, *, agent_factory: AgentFactory = _agent) -> int
         exit_code = 2
         result = f"Worker failed: {exc}"
         final_status = "PAUSED_ERROR"
+        if bridge is not None:
+            bridge.close()
         try:
             _mark_runtime_error(root, exc)
         except Exception:

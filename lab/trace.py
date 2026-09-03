@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
 from collections import defaultdict
@@ -58,11 +59,68 @@ class Trace:
         self._stage_index = 0
         self._active_stages: dict[str, dict[str, Any]] = {}
         self._auto_stage_by_agent: dict[str, str] = {}
+        self._theorem_stage_total: int | None = None
+        self._theorem_stage_total_is_minimum = False
         self._index("run_started", experiment=experiment, started_at=self.started_at)
         _ACTIVE_TRACE.set(self)
 
     def set_stage_listener(self, listener: StageListener | None) -> None:
         self._stage_listener = listener
+
+    def configure_theorem_stages(
+        self,
+        *,
+        iterations: int,
+        checkpoint_every: int,
+        has_literature_agent: bool,
+    ) -> int:
+        """Configure the predictable minimum number of theorem LLM calls.
+
+        Code-experiment planning calls and JSON-repair calls are data dependent,
+        so they are intentionally excluded and the published total is a minimum.
+        """
+
+        count = max(0, int(iterations)) * 4
+        if has_literature_agent:
+            count += 1
+        every = int(checkpoint_every)
+        if every > 0:
+            count += max(0, int(iterations)) // every
+        count += 1  # final independent audit
+        self._theorem_stage_total = count
+        self._theorem_stage_total_is_minimum = True
+        return count
+
+    @staticmethod
+    def _theorem_stage_label(step_key: str, agent: str) -> str:
+        key = str(step_key or "").strip()
+        if key.endswith(":json_repair"):
+            base = key[: -len(":json_repair")]
+            base_label = Trace._theorem_stage_label(base, agent)
+            return f"{base_label} · JSON onarımı"
+        if key == "literature:agent":
+            return "Literatür · LiteratureScout"
+        match = re.fullmatch(r"iter:(\d+):proposer", key)
+        if match:
+            return f"Tur {match.group(1)} · Theorist · öneri"
+        match = re.fullmatch(r"iter:(\d+):verifier", key)
+        if match:
+            return f"Tur {match.group(1)} · VerificationEngineer · doğrulama"
+        match = re.fullmatch(r"iter:(\d+):critic", key)
+        if match:
+            return f"Tur {match.group(1)} · AdversarialCritic · eleştiri"
+        match = re.fullmatch(r"iter:(\d+):manager", key)
+        if match:
+            return f"Tur {match.group(1)} · ResearchManager · karar"
+        match = re.fullmatch(r"iter:(\d+):tool:plan:(\d+)", key)
+        if match:
+            return f"Tur {match.group(1)} · CodeExperimentAgent · adım {match.group(2)}"
+        match = re.fullmatch(r"iter:(\d+):checkpoint_audit", key)
+        if match:
+            return f"Tur {match.group(1)} · Denetim"
+        if key == "final:audit":
+            return "Final denetim"
+        return f"{agent} · {key}"
 
     def _index(self, event: str, **data: Any) -> None:
         self.out_dir.mkdir(parents=True, exist_ok=True)
@@ -100,11 +158,13 @@ class Trace:
         self._stage_index += 1
         agent = str(data.get("agent") or "Agent")
         method = str(self.experiment_method or "theorem_lab")
+        theorem_auto = method == "theorem_lab"
         stage = {
             "method": method,
-            "label": f"{agent} · {step_key}",
+            "label": self._theorem_stage_label(step_key, agent) if theorem_auto else f"{agent} · {step_key}",
             "index": self._stage_index,
-            "total": None,
+            "total": self._theorem_stage_total if theorem_auto else None,
+            "total_is_minimum": self._theorem_stage_total_is_minimum if theorem_auto else False,
             "agent": agent,
             "model": data.get("model"),
             "reasoning_effort": data.get("reasoning_effort"),
@@ -128,6 +188,7 @@ class Trace:
             "label": start.get("label"),
             "index": start.get("index"),
             "total": start.get("total"),
+            "total_is_minimum": bool(start.get("total_is_minimum")),
             "agent": agent,
             "step_key": step_key,
             "total_tokens": int(data.get("total_tokens", 0) or 0),
@@ -243,6 +304,12 @@ class Trace:
             self.project_uuid = str(data.get("project_uuid") or "") or None
             if data.get("experiment_method"):
                 self.experiment_method = str(data["experiment_method"])
+            if self.experiment_method == "theorem_lab" and data.get("iterations") is not None:
+                self.configure_theorem_stages(
+                    iterations=int(data.get("iterations") or 0),
+                    checkpoint_every=int(data.get("checkpoint_every") or 0),
+                    has_literature_agent=bool(data.get("has_literature_agent")),
+                )
             self._index(
                 "run_context",
                 project_id=self.project_id,

@@ -432,9 +432,48 @@ class TheoremResearchLab:
         fingerprint = content_fingerprint("code_experiment_action:v3", action)
         cached = self._cache_get(cache_key)
         if isinstance(cached, dict) and cached.get("status") == "COMPLETE" and cached.get("fingerprint") == fingerprint:
-            raw = cached.get("result") or {}
-            self.trace.log("step_reused", step_key=cache_key, tool="code_experiment_action")
-            return WorkspaceActionResult(bool(raw.get("ok")), str(raw.get("action") or "unknown"), str(raw.get("output") or ""), str(raw.get("error") or ""), dict(raw.get("metadata") or {}))
+            raw_value = cached.get("result")
+            raw = dict(raw_value) if isinstance(raw_value, dict) else {}
+            metadata = dict(raw.get("metadata") or {})
+            action_name = str(action.get("action") or "").strip().lower()
+            hash_field = {"run_python": "script_sha256", "read_file": "sha256"}.get(action_name)
+            if hash_field is not None:
+                relative_path = str(action.get("path") or "")
+                expected_sha = str(metadata.get(hash_field) or "")
+                current_sha = ""
+                try:
+                    target = self.code_workspace._resolve(relative_path, must_exist=True)
+                    current_sha = sha256_file(target)
+                except (FileNotFoundError, OSError, ValueError):
+                    current_sha = ""
+                if not expected_sha or current_sha != expected_sha:
+                    self.trace.log(
+                        "cache_sha_miss",
+                        step_key=cache_key,
+                        action=action_name,
+                        path=relative_path,
+                        expected_sha256=expected_sha or None,
+                        current_sha256=current_sha or None,
+                    )
+                    self._cache_delete(cache_key)
+                else:
+                    self.trace.log("step_reused", step_key=cache_key, tool="code_experiment_action")
+                    return WorkspaceActionResult(
+                        bool(raw.get("ok")),
+                        str(raw.get("action") or "unknown"),
+                        str(raw.get("output") or ""),
+                        str(raw.get("error") or ""),
+                        metadata,
+                    )
+            else:
+                self.trace.log("step_reused", step_key=cache_key, tool="code_experiment_action")
+                return WorkspaceActionResult(
+                    bool(raw.get("ok")),
+                    str(raw.get("action") or "unknown"),
+                    str(raw.get("output") or ""),
+                    str(raw.get("error") or ""),
+                    metadata,
+                )
         result = self.code_workspace.execute(action)
         self._cache_put(cache_key, {"status": "COMPLETE", "fingerprint": fingerprint, "result": result.as_dict(), "completed_at": now_iso()})
         return result
@@ -533,6 +572,13 @@ class TheoremResearchLab:
 
     @staticmethod
     def _normalize_structural_counterexample(result: ToolResult | None) -> ToolResult | None:
+        """Keep the legacy tropical mismatch bridge until the reviewed pack wires it.
+
+        ``STRUCTURE_MISMATCH`` is not emitted by a reviewed problem-pack checker
+        yet; the Tropical pack will connect this normalization when that formal
+        checker exists.
+        """
+
         if result is None or result.tool != "tropical_grid":
             return result
         metadata = dict(result.metadata or {})
@@ -887,6 +933,7 @@ class TheoremResearchLab:
         self._set_runtime(status="RUNNING", last_error="")
 
         if contract is not None and not selectable_ids and not contract.open_target_ids():
+            self.controller.set_research_phase("PUBLICATION")
             self.trace.log(
                 "run_completed_all_targets_closed",
                 completed_iterations=completed,
@@ -918,6 +965,7 @@ class TheoremResearchLab:
         outcomes: list[IterationOutcome] = []
         for iteration in range(completed + 1, int(iterations) + 1):
             if contract is not None and not selectable_ids:
+                self.controller.set_research_phase("PUBLICATION")
                 self.trace.log(
                     "run_completed_all_targets_closed",
                     completed_iterations=int(self._runtime().get("completed_iterations", 0) or 0),

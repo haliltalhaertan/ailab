@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -87,6 +88,74 @@ def _read_events(trace_path: Path) -> list[dict[str, Any]]:
     return events
 
 
+def _preview(value: Any, limit: int = 600) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+def _iteration_from_step(step_key: str) -> int | None:
+    parts = str(step_key or "").split(":")
+    if len(parts) < 2 or parts[0] != "iter":
+        return None
+    try:
+        return int(parts[1])
+    except ValueError:
+        return None
+
+
+def _agent_dict(agent_config: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    if not isinstance(agent_config, dict):
+        return {}
+    raw_agents = agent_config.get("agents", agent_config)
+    if isinstance(raw_agents, dict):
+        return {
+            str(role): dict(raw)
+            for role, raw in raw_agents.items()
+            if isinstance(raw, dict)
+        }
+    if isinstance(raw_agents, list):
+        result: dict[str, dict[str, Any]] = {}
+        for raw in raw_agents:
+            if not isinstance(raw, dict):
+                continue
+            role = str(raw.get("role") or raw.get("display_role") or "").strip()
+            if role:
+                result[role] = dict(raw)
+        return result
+    raise ValueError("agent_config must be a worker-request agent object/list or contain an 'agents' field")
+
+
+def resolve_agent_config(
+    *,
+    model: str,
+    reasoning_effort: str | None,
+    max_tokens: int,
+    agent_config: dict[str, Any] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Resolve a worker_request-style agent dictionary into probe role settings."""
+
+    supplied = _agent_dict(agent_config)
+    resolved: dict[str, dict[str, Any]] = {}
+    for role in ROLE_TEMPERATURES:
+        raw = supplied.get(role, {})
+        role_model = str(raw.get("model") or model).strip()
+        role_effort_value = raw.get("reasoning_effort", reasoning_effort)
+        role_effort = None if role_effort_value in {None, "", "none"} else str(role_effort_value)
+        role_max_tokens = int(raw.get("max_tokens") or max_tokens)
+        if not role_model:
+            raise ValueError(f"Missing model for baseline role {role}")
+        if role_max_tokens < 128:
+            raise ValueError(f"max_tokens for {role} must be >= 128")
+        resolved[role] = {
+            "model": role_model,
+            "reasoning_effort": role_effort,
+            "max_tokens": role_max_tokens,
+        }
+    return resolved
+
+
 def summarize_probe(trace_path: Path, summary_path: Path) -> dict[str, Any]:
     events = _read_events(trace_path)
     run_summary = _read_json(summary_path)
@@ -94,12 +163,29 @@ def summarize_probe(trace_path: Path, summary_path: Path) -> dict[str, Any]:
     iterations: list[dict[str, Any]] = []
     tool_results: list[dict[str, Any]] = []
     llm_calls: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    role_outputs: dict[str, list[dict[str, Any]]] = {}
+    iteration_usage: dict[int, dict[str, Any]] = {}
+    active_step_by_agent: dict[str, str] = {}
+    probe_config: dict[str, Any] = {}
 
     for event in events:
         event_type = str(event.get("type") or "")
         if event_type in counts:
             counts[event_type] += 1
-        if event_type == "iteration_end":
+        if event_type == "baseline_probe_config":
+            probe_config = dict(event)
+        elif event_type == "stage":
+            agent = str(event.get("agent") or "")
+            step_key = str(event.get("step_key") or "")
+            if agent and step_key:
+                active_step_by_agent[agent] = step_key
+        elif event_type == "stage_end":
+            agent = str(event.get("agent") or "")
+            step_key = str(event.get("step_key") or "")
+            if agent and active_step_by_agent.get(agent) == step_key:
+                active_step_by_agent.pop(agent, None)
+        elif event_type == "iteration_end":
             iterations.append(
                 {
                     "iteration": event.get("iteration"),
@@ -110,35 +196,95 @@ def summarize_probe(trace_path: Path, summary_path: Path) -> dict[str, Any]:
                 }
             )
         elif event_type == "tool_result":
-            tool_results.append(
-                {
-                    "step_key": event.get("step_key"),
-                    "tool": event.get("tool"),
-                    "ok": event.get("ok"),
-                    "error": event.get("error"),
-                    "metadata": event.get("metadata"),
-                }
-            )
+            item = {
+                "step_key": event.get("step_key"),
+                "tool": event.get("tool"),
+                "ok": event.get("ok"),
+                "error": event.get("error"),
+                "metadata": event.get("metadata"),
+            }
+            tool_results.append(item)
+            if event.get("ok") is False:
+                errors.append(
+                    {
+                        "type": "tool_result",
+                        "step_key": event.get("step_key"),
+                        "role": "",
+                        "error": str(event.get("error") or "tool returned ok=false"),
+                    }
+                )
         elif event_type == "llm_call":
-            llm_calls.append(
+            agent = str(event.get("agent") or "Agent")
+            step_key = active_step_by_agent.get(agent, "")
+            call = {
+                "agent": agent,
+                "step_key": step_key,
+                "model": event.get("model"),
+                "prompt_tokens": event.get("prompt_tokens", 0),
+                "completion_tokens": event.get("completion_tokens", 0),
+                "reasoning_tokens": event.get("reasoning_tokens", 0),
+                "cached_tokens": event.get("cached_tokens", 0),
+                "total_tokens": event.get("total_tokens", 0),
+                "cost_usd": event.get("cost_usd"),
+                "latency_s": event.get("latency_s", 0.0),
+                "output_preview": _preview(event.get("output")),
+            }
+            llm_calls.append(call)
+            role_outputs.setdefault(agent, []).append(
                 {
-                    "agent": event.get("agent"),
+                    "step_key": step_key,
                     "model": event.get("model"),
-                    "prompt_tokens": event.get("prompt_tokens", 0),
-                    "completion_tokens": event.get("completion_tokens", 0),
-                    "reasoning_tokens": event.get("reasoning_tokens", 0),
-                    "cached_tokens": event.get("cached_tokens", 0),
-                    "total_tokens": event.get("total_tokens", 0),
-                    "cost_usd": event.get("cost_usd"),
-                    "latency_s": event.get("latency_s", 0.0),
+                    "output_preview": call["output_preview"],
                 }
             )
+            iteration = _iteration_from_step(step_key)
+            if iteration is not None:
+                usage = iteration_usage.setdefault(
+                    iteration,
+                    {
+                        "iteration": iteration,
+                        "calls": 0,
+                        "total_tokens": 0,
+                        "cost_usd": 0.0,
+                        "cost_available_calls": 0,
+                        "llm_latency_s": 0.0,
+                        "roles": [],
+                    },
+                )
+                usage["calls"] += 1
+                usage["total_tokens"] += int(event.get("total_tokens", 0) or 0)
+                usage["llm_latency_s"] += float(event.get("latency_s", 0.0) or 0.0)
+                if event.get("cost_usd") is not None:
+                    usage["cost_usd"] += float(event["cost_usd"])
+                    usage["cost_available_calls"] += 1
+                if agent not in usage["roles"]:
+                    usage["roles"].append(agent)
+        elif event_type in {"agent_error", "structured_output_repair_failed", "baseline_probe_exception"}:
+            errors.append(
+                {
+                    "type": event_type,
+                    "step_key": event.get("step_key"),
+                    "role": event.get("agent"),
+                    "error": str(event.get("error") or "unknown error"),
+                }
+            )
+
+    per_iteration = []
+    for iteration in sorted(iteration_usage):
+        usage = iteration_usage[iteration]
+        usage["cost_usd"] = round(float(usage["cost_usd"]), 8)
+        usage["llm_latency_s"] = round(float(usage["llm_latency_s"]), 3)
+        usage["cost_complete"] = usage["cost_available_calls"] == usage["calls"]
+        per_iteration.append(usage)
 
     return {
         "run_id": run_summary.get("run_id"),
         "git_sha": _git_sha(),
         "finished_at": run_summary.get("finished_at"),
         "wall_time_s": run_summary.get("wall_time_s"),
+        "requested_iterations": int(probe_config.get("iterations", 0) or 0),
+        "completed_iterations": len(iterations),
+        "agent_config": probe_config.get("agent_config", {}),
         "total_calls": run_summary.get("total_calls", 0),
         "total_prompt_tokens": run_summary.get("total_prompt_tokens", 0),
         "total_completion_tokens": run_summary.get("total_completion_tokens", 0),
@@ -149,30 +295,63 @@ def summarize_probe(trace_path: Path, summary_path: Path) -> dict[str, Any]:
         "cost_complete": run_summary.get("cost_complete", False),
         "event_counts": counts,
         "iterations": iterations,
+        "per_iteration": per_iteration,
         "tool_results": tool_results,
         "llm_calls": llm_calls,
+        "role_outputs": role_outputs,
+        "errors": errors,
         "agent_totals": run_summary.get("agents", {}),
     }
 
 
 def _markdown_report(report: dict[str, Any]) -> str:
     counts = report["event_counts"]
+    requested = int(report.get("requested_iterations", 0) or 0)
+    completed = int(report.get("completed_iterations", len(report.get("iterations", []))) or 0)
     lines = [
         "# ailab two-iteration baseline probe",
         "",
         f"- git SHA: `{report['git_sha']}`",
         f"- run ID: `{report['run_id']}`",
+        f"- requested/completed iterations: **{requested}/{completed}**",
         f"- LLM calls: **{report['total_calls']}**",
         f"- total tokens: **{report['total_tokens']}**",
         f"- reported cost: **${float(report['total_cost_usd'] or 0.0):.6f}**",
         f"- wall time: **{report['wall_time_s']} s**",
         f"- JSON parse failures: **{counts['structured_output_parse_failed']}**",
         f"- JSON repairs completed: **{counts['structured_output_repaired']}**",
+        f"- JSON repair failures: **{counts['structured_output_repair_failed']}**",
         f"- guard downgrades: **{counts['status_downgraded_by_guard']}**",
         f"- agent retries: **{counts['agent_retry']}**",
         "",
-        "## Iterations",
+        "## Agent configuration",
     ]
+    agent_config = report.get("agent_config") or {}
+    if agent_config:
+        for role, spec in agent_config.items():
+            if not isinstance(spec, dict):
+                continue
+            lines.append(
+                f"- `{role}`: `{spec.get('model')}` / effort=`{spec.get('reasoning_effort') or 'provider-default'}` / "
+                f"max_tokens={spec.get('max_tokens')}"
+            )
+    else:
+        lines.append("- configuration was not recorded")
+
+    lines += ["", "## Per-iteration usage"]
+    if report.get("per_iteration"):
+        for usage in report["per_iteration"]:
+            cost = float(usage.get("cost_usd", 0.0) or 0.0)
+            cost_suffix = "" if usage.get("cost_complete") else " (partial provider cost data)"
+            lines.append(
+                f"- iteration {usage['iteration']}: **{usage['total_tokens']} tokens**, "
+                f"**${cost:.6f}**, **{usage['llm_latency_s']} s LLM latency**, "
+                f"calls={usage['calls']}{cost_suffix}"
+            )
+    else:
+        lines.append("- no iteration-attributed LLM calls recorded")
+
+    lines += ["", "## Iterations"]
     if report["iterations"]:
         for item in report["iterations"]:
             lines.append(
@@ -181,6 +360,18 @@ def _markdown_report(report: dict[str, Any]) -> str:
             )
     else:
         lines.append("- no iteration_end event recorded")
+
+    lines += ["", "## Role outputs"]
+    if report.get("role_outputs"):
+        for role, outputs in report["role_outputs"].items():
+            lines.append(f"- **{role}**")
+            for output in outputs:
+                step = output.get("step_key") or "unattributed"
+                preview = output.get("output_preview") or "(empty output)"
+                lines.append(f"  - `{step}`: {preview}")
+    else:
+        lines.append("- no LLM output recorded")
+
     lines += ["", "## Tool results"]
     if report["tool_results"]:
         for item in report["tool_results"]:
@@ -189,11 +380,22 @@ def _markdown_report(report: dict[str, Any]) -> str:
             )
     else:
         lines.append("- no deterministic tool result recorded")
+
+    lines += ["", "## Errors"]
+    if report.get("errors"):
+        for error in report["errors"]:
+            lines.append(
+                f"- `{error.get('type')}` / `{error.get('role') or '-'}` / "
+                f"`{error.get('step_key') or '-'}`: {error.get('error') or '-'}"
+            )
+    else:
+        lines.append("- none recorded")
+
     lines += ["", "## Per-call usage"]
     for index, call in enumerate(report["llm_calls"], 1):
         lines.append(
-            f"- {index}. `{call['agent']}` / `{call['model']}`: {call['total_tokens']} tokens, "
-            f"cost={call['cost_usd']}, latency={call['latency_s']}s"
+            f"- {index}. `{call['agent']}` / `{call['model']}` / `{call.get('step_key') or '-'}`: "
+            f"{call['total_tokens']} tokens, cost={call['cost_usd']}, latency={call['latency_s']}s"
         )
     return "\n".join(lines) + "\n"
 
@@ -217,11 +419,18 @@ def run_probe(
     reasoning_effort: str | None,
     out_dir: Path,
     problem: str,
+    agent_config: dict[str, Any] | None = None,
 ) -> Path:
     load_dotenv()
     if not os.environ.get("OPENROUTER_API_KEY") and not os.environ.get("OPENAI_API_KEY"):
         raise RuntimeError("OPENROUTER_API_KEY veya OPENAI_API_KEY gerekli.")
 
+    resolved_config = resolve_agent_config(
+        model=model,
+        reasoning_effort=reasoning_effort,
+        max_tokens=max_tokens,
+        agent_config=agent_config,
+    )
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
     probe_root = out_dir / f"probe_{stamp}"
     state_root = probe_root / "research_state"
@@ -229,6 +438,11 @@ def run_probe(
     probe_root.mkdir(parents=True, exist_ok=False)
 
     trace = Trace("baseline-probe", out_dir=runs_root)
+    trace.configure_theorem_stages(
+        iterations=iterations,
+        checkpoint_every=0,
+        has_literature_agent=True,
+    )
     state = ResearchState(state_root)
     trace.log(
         "baseline_probe_config",
@@ -237,10 +451,19 @@ def run_probe(
         iterations=iterations,
         max_tokens=max_tokens,
         reasoning_effort=reasoning_effort,
+        agent_config=resolved_config,
         problem=problem,
     )
     lab = TheoremResearchLab(trace, state, literature=_InconclusiveLiterature(), max_retries=2)
-    agents = {role: _agent(role, model, max_tokens, reasoning_effort) for role in ROLE_TEMPERATURES}
+    agents = {
+        role: _agent(
+            role,
+            str(spec["model"]),
+            int(spec["max_tokens"]),
+            spec.get("reasoning_effort"),
+        )
+        for role, spec in resolved_config.items()
+    }
 
     run_error = ""
     try:
@@ -273,16 +496,42 @@ def run_probe(
     return report_path
 
 
+def _load_agent_config(value: str | None) -> dict[str, Any] | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    path = Path(raw)
+    if path.is_file():
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    else:
+        parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise ValueError("--agent-config must resolve to a JSON object")
+    return parsed
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run a two-iteration real-LLM baseline through TheoremResearchLab.run()."
+        description="Run a real-LLM baseline through TheoremResearchLab.run()."
     )
     parser.add_argument("--model", default=os.environ.get("LAB_BASELINE_MODEL", "openai/gpt-4o-mini"))
     parser.add_argument("--iterations", type=int, default=2)
     parser.add_argument("--max-tokens", type=int, default=1200)
     parser.add_argument("--reasoning-effort", default=os.environ.get("LAB_BASELINE_REASONING_EFFORT", "low"))
+    parser.add_argument(
+        "--agent-config",
+        help=(
+            "Worker-request-style agent JSON object, full worker_request JSON, or path to either. "
+            "Per-role model/reasoning_effort/max_tokens override the global defaults."
+        ),
+    )
     parser.add_argument("--out-dir", type=Path, default=Path("baseline_runs"))
     parser.add_argument("--problem", default=TOY_PROBLEM)
+    parser.add_argument(
+        "--report-copy",
+        type=Path,
+        help="Optional checked-in destination for a copy of baseline_report.md (for example docs/baselines/run.md).",
+    )
     return parser.parse_args()
 
 
@@ -292,6 +541,7 @@ def main() -> None:
         raise SystemExit("--iterations must be >= 1")
     if args.max_tokens < 128:
         raise SystemExit("--max-tokens must be >= 128")
+    agent_config = _load_agent_config(args.agent_config)
     report_path = run_probe(
         model=args.model,
         iterations=args.iterations,
@@ -299,5 +549,10 @@ def main() -> None:
         reasoning_effort=args.reasoning_effort,
         out_dir=args.out_dir,
         problem=args.problem,
+        agent_config=agent_config,
     )
+    if args.report_copy is not None:
+        args.report_copy.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(report_path.with_name("baseline_report.md"), args.report_copy)
+        print(args.report_copy)
     print(report_path)
