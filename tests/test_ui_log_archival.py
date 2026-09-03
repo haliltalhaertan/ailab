@@ -1,6 +1,5 @@
 import gzip
 import json
-from types import SimpleNamespace
 
 from lab.trace import Trace
 from lab.ui_live import build_cards
