@@ -9,6 +9,7 @@ import pytest
 import lab.worker as worker
 from lab.integrity import ProjectBusyError, ProjectRunLock
 from lab.project_manager import ProjectManager
+from lab.run_controller import RunController
 from lab.worker_launcher import launch_worker, write_worker_request
 
 
@@ -145,6 +146,54 @@ def test_non_theorem_worker_dispatch_completes_without_touching_research_ledger(
     assert len(run_dirs) == 1
     assert (run_dirs[0] / "summary.json").is_file()
     assert pm.get(info.project_id).status == "COMPLETED"
+
+
+def test_worker_heartbeat_thread_stops_before_final_completed_status(tmp_path, monkeypatch):
+    _pm, info, root = _project(tmp_path, monkeypatch, experiment="Zincir")
+    request = {
+        "request_version": 2,
+        "project_id": info.project_id,
+        "project_uuid": info.project_uuid,
+        "experiment_method": "pipeline",
+        "experiment_name": "Zincir",
+        "agents": [_agent("Araştırmacı")],
+        "optional_agents": {},
+        "param": 0,
+        "prompt": "Test",
+    }
+    (root / "worker_request.json").write_text(json.dumps(request), encoding="utf-8")
+
+    ordering: list[str] = []
+    bridges = []
+    original_heartbeat = RunController.heartbeat
+    original_set_runtime = RunController.set_runtime
+    real_bridge = worker.WorkerRuntimeBridge
+
+    def recording_heartbeat(self, *args, **kwargs):
+        ordering.append("heartbeat")
+        return original_heartbeat(self, *args, **kwargs)
+
+    def recording_set_runtime(self, **updates):
+        result = original_set_runtime(self, **updates)
+        if updates.get("status") == "COMPLETED":
+            ordering.append("final_completed")
+        return result
+
+    class CapturingBridge(real_bridge):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            bridges.append(self)
+
+    monkeypatch.setattr(RunController, "heartbeat", recording_heartbeat)
+    monkeypatch.setattr(RunController, "set_runtime", recording_set_runtime)
+    monkeypatch.setattr(worker, "WorkerRuntimeBridge", CapturingBridge)
+
+    assert worker.run_project(info.project_id, agent_factory=fake_agent_factory) == 0
+    final_index = ordering.index("final_completed")
+    assert "heartbeat" not in ordering[final_index + 1 :]
+    assert bridges
+    assert bridges[-1]._thread is not None
+    assert bridges[-1]._thread.is_alive() is False
 
 
 def test_missing_experiment_method_defaults_to_theorem_lab(tmp_path, monkeypatch):

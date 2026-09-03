@@ -32,20 +32,25 @@ class WorkerRuntimeBridge:
         if self._thread is not None:
             self._thread.join(timeout=1.0)
 
+    def set_runtime(self, **updates: Any) -> dict[str, Any]:
+        """Serialize runtime writes with heartbeat read-modify-write cycles."""
+
+        with self._lock:
+            return self.controller.set_runtime(**updates)
+
     def cancel_check(self) -> bool:
         with self._lock:
             self.controller.heartbeat(min_interval_s=15.0)
             return self.controller.stop_path.exists()
 
     def on_stage(self, event: dict[str, Any]) -> None:
-        with self._lock:
-            if event.get("type") == "stage":
-                self.controller.set_runtime(
-                    current_step=str(event.get("label") or event.get("step_key") or ""),
-                    current_agent=str(event.get("agent") or ""),
-                )
-            elif event.get("type") == "stage_end":
-                self.controller.set_runtime(
-                    current_step=str(event.get("label") or event.get("step_key") or ""),
-                    current_agent="",
-                )
+        if event.get("type") == "stage":
+            self.set_runtime(
+                current_step=str(event.get("label") or event.get("step_key") or ""),
+                current_agent=str(event.get("agent") or ""),
+            )
+        elif event.get("type") == "stage_end":
+            self.set_runtime(
+                current_step=str(event.get("label") or event.get("step_key") or ""),
+                current_agent="",
+            )
