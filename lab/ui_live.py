@@ -122,6 +122,16 @@ def merge_cards(cards: list[CardState], events: list[dict[str, Any]]) -> list[Ca
     return _apply_card_events(cards, events)
 
 
+def live_text_preview(text: str, *, limit: int = 4_000) -> tuple[str, bool]:
+    """Return the bounded text sent on every live fragment refresh."""
+
+    value = str(text or "")
+    cap = max(1, int(limit))
+    if len(value) <= cap:
+        return value, False
+    return value[-cap:], True
+
+
 def parse_ts(value: Any) -> datetime | None:
     raw = str(value or "").strip()
     if not raw:
@@ -308,12 +318,36 @@ def _clock(value: Any) -> str:
     return parsed.astimezone().strftime("%H:%M:%S") if parsed else "--:--:--"
 
 
+def render_stage_timeline(events: list[dict[str, Any]]) -> None:
+    """Render only the chronological stage list, without live-card content."""
+
+    import streamlit as st
+
+    rows = stage_timeline(events)
+    st.markdown("#### Zaman çizelgesi")
+    if not rows:
+        st.caption("Tamamlanan aşama henüz yok.")
+        return
+    for row in rows[-30:]:
+        if row.get("cache"):
+            st.caption(f"{_clock(row.get('started_at'))} · ♻️ `{row.get('step_key')}` · cache")
+            continue
+        cost = row.get("cost_usd")
+        cost_label = f"${float(cost):.4f}" if cost is not None else "ücret N/A"
+        st.caption(
+            f"{_clock(row.get('started_at'))} → {_clock(row.get('finished_at'))} · "
+            f"{row.get('label') or row.get('agent')} · {float(row.get('duration_s', 0.0)):.1f} sn · "
+            f"{int(row.get('total_tokens', 0) or 0):,} token · {cost_label}"
+        )
+
+
 def render_now_and_timeline(
     runtime: dict[str, Any],
     events: list[dict[str, Any]],
     *,
     status: str,
     cards: list[CardState] | None = None,
+    include_timeline: bool = True,
 ) -> dict[str, Any]:
     """Shared Streamlit component used by the home page and Research Control."""
 
@@ -357,20 +391,6 @@ def render_now_and_timeline(
     elif status == "RUNNING":
         st.caption("İlerleme · toplam çağrı sayısı bu workflow için önceden kesin değil.")
 
-    rows = stage_timeline(events)
-    st.markdown("#### Zaman çizelgesi")
-    if not rows:
-        st.caption("Tamamlanan aşama henüz yok.")
-    else:
-        for row in rows[-30:]:
-            if row.get("cache"):
-                st.caption(f"{_clock(row.get('started_at'))} · ♻️ `{row.get('step_key')}` · cache")
-                continue
-            cost = row.get("cost_usd")
-            cost_label = f"${float(cost):.4f}" if cost is not None else "ücret N/A"
-            st.caption(
-                f"{_clock(row.get('started_at'))} → {_clock(row.get('finished_at'))} · "
-                f"{row.get('label') or row.get('agent')} · {float(row.get('duration_s', 0.0)):.1f} sn · "
-                f"{int(row.get('total_tokens', 0) or 0):,} token · {cost_label}"
-            )
+    if include_timeline:
+        render_stage_timeline(events)
     return snapshot
