@@ -94,9 +94,57 @@ def read_json_tolerant(path: str | Path, default: Any) -> Any:
         return default
 
 
+def _windows_process_alive(pid: int) -> bool:
+    """Return liveness using the Windows process table, not ``os.kill(pid, 0)``.
+
+    CPython's Windows ``os.kill`` semantics are not a POSIX-style existence
+    probe for detached processes and can misclassify both live and exited
+    workers. Query a fresh process handle and its exit code instead. Access
+    denied is treated as live so lock ownership fails closed.
+    """
+
+    import ctypes
+
+    win_dll = getattr(ctypes, "WinDLL", None)
+    get_last_error = getattr(ctypes, "get_last_error", None)
+    if win_dll is None or get_last_error is None:
+        return False
+
+    kernel32 = win_dll("kernel32", use_last_error=True)
+    process_query_limited_information = 0x1000
+    still_active = 259
+    error_access_denied = 5
+
+    open_process = kernel32.OpenProcess
+    open_process.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+    open_process.restype = ctypes.c_void_p
+    get_exit_code = kernel32.GetExitCodeProcess
+    get_exit_code.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+    get_exit_code.restype = ctypes.c_int
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [ctypes.c_void_p]
+    close_handle.restype = ctypes.c_int
+
+    handle = open_process(process_query_limited_information, 0, int(pid))
+    if not handle:
+        return int(get_last_error()) == error_access_denied
+
+    try:
+        exit_code = ctypes.c_ulong(0)
+        if not get_exit_code(handle, ctypes.byref(exit_code)):
+            # We opened the process but cannot query its state. Conservatively
+            # treat it as live so a project lock is never stolen on uncertainty.
+            return True
+        return int(exit_code.value) == still_active
+    finally:
+        close_handle(handle)
+
+
 def process_alive(pid: int) -> bool:
     if pid <= 0:
         return False
+    if os.name == "nt":
+        return _windows_process_alive(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
