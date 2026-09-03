@@ -53,6 +53,9 @@ def stage_timeline(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "cost_usd": event.get("cost_usd"),
                     "index": start.get("index", event.get("index")),
                     "total": start.get("total", event.get("total")),
+                    "total_is_minimum": bool(
+                        start.get("total_is_minimum", event.get("total_is_minimum", False))
+                    ),
                 }
             )
     return rows
@@ -78,6 +81,7 @@ def live_stage_snapshot(
             "agent": str(runtime.get("current_agent") or ""),
             "index": None,
             "total": None,
+            "total_is_minimum": False,
             "elapsed_s": 0.0,
             "total_tokens": 0,
             "reasoning_tokens": 0,
@@ -129,6 +133,7 @@ def live_stage_snapshot(
         "agent": str(stage.get("agent") or runtime.get("current_agent") or ""),
         "index": stage.get("index"),
         "total": stage.get("total"),
+        "total_is_minimum": bool(stage.get("total_is_minimum")),
         "elapsed_s": elapsed,
         "total_tokens": tokens,
         "reasoning_tokens": reasoning,
@@ -202,7 +207,11 @@ def render_now_and_timeline(
     total = snapshot.get("total")
     if isinstance(index, int) and isinstance(total, int) and total > 0:
         progress = min(1.0, max(0.0, index / total))
-        st.progress(progress, text=f"İlerleme · {index}/{total}")
+        if snapshot.get("total_is_minimum"):
+            progress_text = f"İlerleme · {index}/en az {total}"
+        else:
+            progress_text = f"İlerleme · {index}/{total}"
+        st.progress(progress, text=progress_text)
     elif status == "RUNNING":
         st.caption("İlerleme · toplam çağrı sayısı bu workflow için önceden kesin değil.")
 

@@ -244,6 +244,13 @@ def run_project(project_id: str, *, agent_factory: AgentFactory = _agent) -> int
 
         if method == "theorem_lab":
             agents = _theorem_agents(request.get("agents") or {}, agent_factory)
+            theorem_iterations = int(request.get("iterations", request.get("param", 5)))
+            theorem_checkpoint_every = int(request.get("checkpoint_every", 2))
+            trace.configure_theorem_stages(
+                iterations=theorem_iterations,
+                checkpoint_every=theorem_checkpoint_every,
+                has_literature_agent="LiteratureScout" in agents,
+            )
             state = ResearchState(root)
             lab = TheoremResearchLab(
                 trace,
@@ -268,9 +275,9 @@ def run_project(project_id: str, *, agent_factory: AgentFactory = _agent) -> int
                 verifier=agents["VerificationEngineer"],
                 literature_agent=agents.get("LiteratureScout"),
                 auditor=agents["IndependentAuditor"],
-                iterations=int(request.get("iterations", request.get("param", 5))),
+                iterations=theorem_iterations,
                 literature_query=request.get("literature_query"),
-                checkpoint_every=int(request.get("checkpoint_every", 2)),
+                checkpoint_every=theorem_checkpoint_every,
             )
         else:
             controller = RunController(root, trace)
