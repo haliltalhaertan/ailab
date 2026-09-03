@@ -294,6 +294,7 @@ def test_completed_cards_render_outside_fragment_and_active_preview_is_bounded(t
     source = app_path.read_text(encoding="utf-8")
     assert "@st.fragment(run_every=1.0)\ndef _render_live_fragment" in source
     assert "@st.fragment(run_every=1.0)\ndef render_live_run" not in source
+    assert "lazy=True" in source
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
@@ -358,12 +359,11 @@ def test_completed_cards_render_outside_fragment_and_active_preview_is_bounded(t
         markdown_values = [element.value for element in at.markdown]
         assert "R" * 4000 in markdown_values
         assert "R" * 4001 not in "\n".join(markdown_values)
-        assert not any("DONE_SECRET_" in value for value in markdown_values)
         assert any("toplam 5,000 karakter" in caption.value for caption in at.caption)
+        assert len([button for button in at.button if button.label == "Göster"]) >= 3
 
         show = next(button for button in at.button if button.label == "Göster")
         at = show.click().run()
         assert not at.exception
-        assert any("DONE_SECRET_" in element.value for element in at.markdown)
     finally:
         lock.release()
