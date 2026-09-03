@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import gzip
 import json
 import re
+import shutil
 import time
 import uuid
 from collections import defaultdict
@@ -442,3 +444,22 @@ class Trace:
         self._trace_handle.close()
         self._stream_handle.close()
         return out
+
+    def compress_stream(self) -> Path | None:
+        """Gzip the completed stream log and remove the raw JSONL atomically."""
+
+        if not self.closed:
+            raise RuntimeError("Trace must be closed before stream compression")
+        raw = self.stream_path
+        gz_path = Path(str(raw) + ".gz")
+        if not raw.exists():
+            return gz_path if gz_path.exists() else None
+        tmp = Path(str(gz_path) + ".tmp")
+        try:
+            with raw.open("rb") as source, gzip.open(tmp, "wb", compresslevel=6) as target:
+                shutil.copyfileobj(source, target)
+            tmp.replace(gz_path)
+            raw.unlink()
+        finally:
+            tmp.unlink(missing_ok=True)
+        return gz_path

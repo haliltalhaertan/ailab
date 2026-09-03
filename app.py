@@ -513,7 +513,7 @@ def render_history(active: ProjectInfo) -> None:
         rows = usage_rows(summary)
         if rows:
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-    events = load_run_events(selected, include_stream=True)
+    events = load_run_events(selected, include_stream=False)
     st.subheader("Araştırma Timeline'ı")
     target = st.container(border=True)
     for card in reversed(build_cards(events)):

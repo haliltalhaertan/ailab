@@ -350,6 +350,11 @@ def run_project(project_id: str, *, agent_factory: AgentFactory = _agent) -> int
                 trace.close()
             except Exception:
                 pass
+        if trace is not None and trace.closed:
+            try:
+                trace.compress_stream()
+            except Exception:
+                pass
         if final_status is not None:
             try:
                 pm.touch(project_id, status=final_status)
