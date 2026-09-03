@@ -110,21 +110,20 @@ class RunController:
         self.max_retries = max(1, int(max_retries))
         self.lock = ProjectRunLock(self.root)
         self._last_heartbeat_monotonic = 0.0
-        # Runtime updates are read-modify-write operations. The background
-        # heartbeat and foreground theorem/orchestrator writes must never race,
-        # otherwise a stale heartbeat snapshot can overwrite a newer cursor or
-        # final status. RLock keeps nested runtime()/set_runtime() calls safe.
-        self._runtime_lock = threading.RLock()
+        # Public only inside the worker/runtime layer: WorkerRuntimeBridge and
+        # foreground controller writes share this exact RLock so heartbeat
+        # read-modify-write cycles cannot overwrite newer theorem cursor state.
+        self.write_lock = threading.RLock()
 
     def runtime(self) -> dict[str, Any]:
-        with self._runtime_lock:
+        with self.write_lock:
             value = read_json(self.runtime_path, default_runtime())
             current = dict(value) if isinstance(value, dict) else default_runtime()
             current.setdefault("research_phase", DEFAULT_RESEARCH_PHASE)
             return current
 
     def set_runtime(self, **updates: Any) -> dict[str, Any]:
-        with self._runtime_lock:
+        with self.write_lock:
             value = self.runtime()
             if "research_phase" in updates:
                 updates["research_phase"] = normalize_research_phase(updates["research_phase"])
@@ -132,8 +131,6 @@ class RunController:
             now = now_iso()
             value["pid"] = os.getpid()
             value["updated_at"] = now
-            # Every runtime mutation is also proof-of-life. This avoids a long-lived
-            # RUNNING state whose latest cursor update is newer than its heartbeat.
             value["heartbeat_at"] = now
             atomic_json(self.runtime_path, value)
             self.trace.log("runtime_state", **value)
@@ -144,7 +141,7 @@ class RunController:
         return self.set_runtime(research_phase=phase)
 
     def heartbeat(self, *, min_interval_s: float = 15.0) -> None:
-        with self._runtime_lock:
+        with self.write_lock:
             now_mono = time.monotonic()
             if now_mono - self._last_heartbeat_monotonic < float(min_interval_s):
                 return

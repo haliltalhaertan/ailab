@@ -26,6 +26,7 @@ from lab.worker_runtime import WorkerRuntimeBridge
 
 AgentFactory = Callable[[str, dict[str, Any]], Agent]
 EXPERIMENT_METHODS = {"theorem_lab", "research_loop", "debate", "pipeline", "panel"}
+TERMINAL_RUNTIME_STATUSES = {"COMPLETED", "STOPPED", "PAUSED_ERROR", "INTERRUPTED"}
 
 
 def _now() -> str:
@@ -190,8 +191,6 @@ def run_project(project_id: str, *, agent_factory: AgentFactory = _agent) -> int
     pm = ProjectManager()
     root = pm.project_root(project_id)
 
-    # Lock first. A losing worker must not read/overwrite the active request,
-    # config, stop flag, worker identity, project metadata or runtime state.
     lock = ProjectRunLock(root)
     try:
         lock.acquire()
@@ -262,10 +261,8 @@ def run_project(project_id: str, *, agent_factory: AgentFactory = _agent) -> int
                     else None
                 ),
             )
-            # Share the already-held lock with the engine. ProjectRunLock is
-            # re-entrant for this object, so nested engine contexts do not race.
             lab.controller.lock = lock
-            bridge = WorkerRuntimeBridge(lab.controller)
+            bridge = WorkerRuntimeBridge(lab.controller, background_heartbeat=True)
             trace.set_stage_listener(bridge.on_stage)
             result = lab.run(
                 str(request.get("problem") or request.get("prompt") or ""),
@@ -280,6 +277,14 @@ def run_project(project_id: str, *, agent_factory: AgentFactory = _agent) -> int
                 literature_query=request.get("literature_query"),
                 checkpoint_every=theorem_checkpoint_every,
             )
+            theorem_runtime = lab.controller.runtime()
+            theorem_status = str(theorem_runtime.get("status") or "COMPLETED").upper()
+            if theorem_status not in TERMINAL_RUNTIME_STATUSES:
+                theorem_status = "COMPLETED"
+            # The heartbeat thread must be joined before the final terminal write.
+            bridge.close()
+            bridge.set_runtime(status=theorem_status, current_agent="")
+            final_status = theorem_status
         else:
             controller = RunController(root, trace)
             controller.lock = lock
@@ -293,8 +298,6 @@ def run_project(project_id: str, *, agent_factory: AgentFactory = _agent) -> int
             )
             controller.check_stop()
             result = _run_orchestrator(method, request, trace, agent_factory, bridge)
-            # Join the heartbeat thread before publishing the final status so a
-            # stale read-modify-write heartbeat cannot overwrite COMPLETED.
             bridge.close()
             bridge.set_runtime(
                 status="COMPLETED",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -72,51 +73,40 @@ def _agent(role: str, display_role: str | None = None) -> dict:
     }
 
 
+def _theorem_request(info) -> dict:
+    return {
+        "request_version": 2,
+        "project_id": info.project_id,
+        "project_uuid": info.project_uuid,
+        "experiment_method": "theorem_lab",
+        "experiment_name": "Teorem Araştırması",
+        "problem": "theorem problem",
+        "iterations": 1,
+        "checkpoint_every": 1,
+        "agents": {
+            role: _agent(role)
+            for role in (
+                "ResearchManager",
+                "Theorist",
+                "AdversarialCritic",
+                "VerificationEngineer",
+                "IndependentAuditor",
+            )
+        },
+    }
+
+
 @pytest.mark.parametrize(
     ("method", "name", "agents", "optional", "param"),
     [
-        (
-            "research_loop",
-            "Araştırma Döngüsü",
-            [_agent("Teorisyen"), _agent("Sceptik")],
-            {"Raporcu": _agent("Raporcu")},
-            1,
-        ),
-        (
-            "debate",
-            "Tartışma",
-            [_agent("Taraftar A"), _agent("Taraftar B")],
-            {"Hakem": _agent("Hakem")},
-            1,
-        ),
-        (
-            "pipeline",
-            "Zincir",
-            [_agent("Araştırmacı"), _agent("Analist"), _agent("Eleştirmen")],
-            {},
-            0,
-        ),
-        (
-            "panel",
-            "Panel",
-            [
-                _agent("Panelist", "Panelist"),
-                _agent("Panelist", "Panelist 2"),
-                _agent("Panelist", "Panelist 3"),
-            ],
-            {"Sentezleyici": _agent("Sentezleyici")},
-            0,
-        ),
+        ("research_loop", "Araştırma Döngüsü", [_agent("Teorisyen"), _agent("Sceptik")], {"Raporcu": _agent("Raporcu")}, 1),
+        ("debate", "Tartışma", [_agent("Taraftar A"), _agent("Taraftar B")], {"Hakem": _agent("Hakem")}, 1),
+        ("pipeline", "Zincir", [_agent("Araştırmacı"), _agent("Analist"), _agent("Eleştirmen")], {}, 0),
+        ("panel", "Panel", [_agent("Panelist", "Panelist"), _agent("Panelist", "Panelist 2"), _agent("Panelist", "Panelist 3")], {"Sentezleyici": _agent("Sentezleyici")}, 0),
     ],
 )
 def test_non_theorem_worker_dispatch_completes_without_touching_research_ledger(
-    tmp_path,
-    monkeypatch,
-    method,
-    name,
-    agents,
-    optional,
-    param,
+    tmp_path, monkeypatch, method, name, agents, optional, param
 ):
     pm, info, root = _project(tmp_path, monkeypatch, experiment=name)
     state_path = root / "state.json"
@@ -145,6 +135,7 @@ def test_non_theorem_worker_dispatch_completes_without_touching_research_ledger(
     run_dirs = [path for path in (tmp_path / "runs").iterdir() if path.is_dir()]
     assert len(run_dirs) == 1
     assert (run_dirs[0] / "summary.json").is_file()
+    assert (run_dirs[0] / "stream.jsonl.gz").is_file()
     assert pm.get(info.project_id).status == "COMPLETED"
 
 
@@ -196,41 +187,55 @@ def test_worker_heartbeat_thread_stops_before_final_completed_status(tmp_path, m
     assert bridges[-1]._thread.is_alive() is False
 
 
+def test_theorem_worker_background_heartbeat_survives_blocking_step_and_stops_at_final(tmp_path, monkeypatch):
+    _pm, info, root = _project(tmp_path, monkeypatch, experiment="Teorem Araştırması")
+    (root / "worker_request.json").write_text(json.dumps(_theorem_request(info)), encoding="utf-8")
+    seen = {}
+
+    class SlowTheoremLab:
+        def __init__(self, trace, state, **_kwargs):
+            self.controller = RunController(state.root, trace)
+
+        def run(self, _problem, **_kwargs):
+            first = self.controller.set_runtime(status="RUNNING")["heartbeat_at"]
+            time.sleep(0.35)
+            middle = self.controller.runtime()["heartbeat_at"]
+            seen["first"] = first
+            seen["middle"] = middle
+            self.controller.set_runtime(status="COMPLETED")
+            return "slow theorem result"
+
+    monkeypatch.setattr(worker, "TheoremResearchLab", SlowTheoremLab)
+    monkeypatch.setattr(worker.WorkerRuntimeBridge, "HEARTBEAT_POLL_S", 0.03)
+    monkeypatch.setattr(worker.WorkerRuntimeBridge, "HEARTBEAT_MIN_INTERVAL_S", 0.08)
+
+    assert worker.run_project(info.project_id, agent_factory=fake_agent_factory) == 0
+    assert seen["middle"] != seen["first"]
+    runtime = json.loads((root / "runtime.json").read_text(encoding="utf-8"))
+    assert runtime["status"] == "COMPLETED"
+    final_heartbeat = runtime["heartbeat_at"]
+    time.sleep(0.12)
+    after = json.loads((root / "runtime.json").read_text(encoding="utf-8"))
+    assert after["heartbeat_at"] == final_heartbeat
+
+
 def test_missing_experiment_method_defaults_to_theorem_lab(tmp_path, monkeypatch):
     _pm, info, root = _project(tmp_path, monkeypatch, experiment="Teorem Araştırması")
-    raw_agents = {
-        role: _agent(role)
-        for role in (
-            "ResearchManager",
-            "Theorist",
-            "AdversarialCritic",
-            "VerificationEngineer",
-            "IndependentAuditor",
-        )
-    }
-    request = {
-        "request_version": 1,
-        "project_id": info.project_id,
-        "project_uuid": info.project_uuid,
-        "problem": "legacy theorem request",
-        "iterations": 1,
-        "checkpoint_every": 1,
-        "agents": raw_agents,
-    }
+    request = _theorem_request(info)
+    request.pop("experiment_method")
+    request["request_version"] = 1
+    request["problem"] = "legacy theorem request"
     (root / "worker_request.json").write_text(json.dumps(request), encoding="utf-8")
     seen: dict[str, object] = {}
 
     class FakeTheoremLab:
         def __init__(self, trace, state, **_kwargs):
-            self.controller = SimpleNamespace(lock=None)
-            self.state = state
+            self.controller = RunController(state.root, trace)
 
         def run(self, problem, **kwargs):
             seen["problem"] = problem
             seen["roles"] = set(kwargs)
-            (self.state.root / "runtime.json").write_text(
-                json.dumps({"status": "COMPLETED"}), encoding="utf-8"
-            )
+            self.controller.set_runtime(status="COMPLETED")
             return "legacy theorem result"
 
     monkeypatch.setattr(worker, "TheoremResearchLab", FakeTheoremLab)

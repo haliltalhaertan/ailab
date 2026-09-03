@@ -9,9 +9,14 @@ from lab.run_controller import RunController
 class WorkerRuntimeBridge:
     """Bridge worker stage/stop events to the common runtime cursor."""
 
+    HEARTBEAT_POLL_S = 5.0
+    HEARTBEAT_MIN_INTERVAL_S = 15.0
+
     def __init__(self, controller: RunController, *, background_heartbeat: bool = False):
         self.controller = controller
-        self._lock = threading.RLock()
+        # Share the controller's write lock. A heartbeat and a foreground
+        # theorem runtime/research-phase update are both read-modify-write cycles.
+        self._lock = controller.write_lock
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         if background_heartbeat:
@@ -23,14 +28,16 @@ class WorkerRuntimeBridge:
             self._thread.start()
 
     def _heartbeat_loop(self) -> None:
-        while not self._stop.wait(5.0):
+        while not self._stop.wait(float(self.HEARTBEAT_POLL_S)):
             with self._lock:
-                self.controller.heartbeat(min_interval_s=15.0)
+                self.controller.heartbeat(
+                    min_interval_s=float(self.HEARTBEAT_MIN_INTERVAL_S)
+                )
 
     def close(self) -> None:
         self._stop.set()
         if self._thread is not None:
-            self._thread.join(timeout=1.0)
+            self._thread.join(timeout=max(1.0, float(self.HEARTBEAT_POLL_S) + 0.5))
 
     def set_runtime(self, **updates: Any) -> dict[str, Any]:
         """Serialize runtime writes with heartbeat read-modify-write cycles."""
@@ -40,7 +47,9 @@ class WorkerRuntimeBridge:
 
     def cancel_check(self) -> bool:
         with self._lock:
-            self.controller.heartbeat(min_interval_s=15.0)
+            self.controller.heartbeat(
+                min_interval_s=float(self.HEARTBEAT_MIN_INTERVAL_S)
+            )
             return self.controller.stop_path.exists()
 
     def on_stage(self, event: dict[str, Any]) -> None:
