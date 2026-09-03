@@ -251,6 +251,7 @@ def run_project(project_id: str, *, agent_factory: AgentFactory = _agent) -> int
                 checkpoint_every=theorem_checkpoint_every,
                 has_literature_agent="LiteratureScout" in agents,
             )
+            trace._stage_index = 4 * int((_read(root / "runtime.json").get("completed_iterations", 0) or 0)) + (int((_read(root / "runtime.json").get("completed_iterations", 0) or 0)) // theorem_checkpoint_every if theorem_checkpoint_every > 0 else 0) + (1 if "LiteratureScout" in agents and int((_read(root / "runtime.json").get("completed_iterations", 0) or 0)) > 0 else 0)
             state = ResearchState(root)
             lab = TheoremResearchLab(
                 trace,

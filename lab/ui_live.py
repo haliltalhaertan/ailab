@@ -1,7 +1,125 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any
+
+
+@dataclass
+class CardState:
+    step_key: str
+    agent: str
+    model: str = ""
+    effort: str | None = None
+    status: str = "running"
+    reasoning: str = ""
+    content: str = ""
+    total_tokens: int = 0
+    reasoning_tokens: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cached_tokens: int = 0
+    cost_usd: float | None = None
+    latency_s: float = 0.0
+    system_prompt: str = ""
+    prompt: str = ""
+    error: str = ""
+    order: int = 0
+
+
+def _copy_cards(cards: list[CardState]) -> dict[str, CardState]:
+    return {card.step_key: replace(card) for card in cards}
+
+
+def _apply_card_events(cards: list[CardState], events: list[dict[str, Any]]) -> list[CardState]:
+    states = _copy_cards(cards)
+    latest_by_agent: dict[str, str] = {}
+    next_order = 0
+    for card in sorted(states.values(), key=lambda item: item.order):
+        latest_by_agent[card.agent] = card.step_key
+        next_order = max(next_order, card.order)
+
+    def get_state(event: dict[str, Any], *, create: bool = True) -> CardState | None:
+        nonlocal next_order
+        agent = str(event.get("agent") or "Agent")
+        step_key = str(event.get("step_key") or "").strip() or latest_by_agent.get(agent, "")
+        if not step_key:
+            if not create:
+                return None
+            next_order += 1
+            step_key = f"{agent}:{next_order}"
+        state = states.get(step_key)
+        if state is None:
+            if not create:
+                return None
+            next_order += 1
+            state = CardState(
+                step_key=step_key,
+                agent=agent,
+                model=str(event.get("model") or ""),
+                effort=event.get("reasoning_effort"),
+                order=next_order,
+            )
+            states[step_key] = state
+        latest_by_agent[agent] = step_key
+        return state
+
+    for event in events:
+        kind = str(event.get("type") or "")
+        if kind not in {"agent_start", "agent_stream", "llm_call", "agent_error"}:
+            continue
+        state = get_state(event)
+        if state is None:
+            continue
+        if event.get("agent"):
+            state.agent = str(event["agent"])
+        if event.get("model"):
+            state.model = str(event["model"])
+        if event.get("reasoning_effort") is not None:
+            state.effort = str(event["reasoning_effort"])
+
+        if kind == "agent_start":
+            state.status = "running"
+            state.system_prompt = str(event.get("system_prompt") or state.system_prompt)
+            state.prompt = str(event.get("prompt") or state.prompt)
+        elif kind == "agent_stream":
+            delta = event.get("delta")
+            if not isinstance(delta, str):
+                continue
+            if event.get("channel") == "reasoning":
+                state.reasoning += delta
+            elif event.get("channel") == "content":
+                state.content += delta
+        elif kind == "llm_call":
+            state.status = "done"
+            if event.get("provider_reasoning"):
+                state.reasoning = str(event["provider_reasoning"])
+            if event.get("output"):
+                state.content = str(event["output"])
+            state.total_tokens = int(event.get("total_tokens", 0) or 0)
+            state.reasoning_tokens = int(event.get("reasoning_tokens", 0) or 0)
+            state.prompt_tokens = int(event.get("prompt_tokens", 0) or 0)
+            state.completion_tokens = int(event.get("completion_tokens", 0) or 0)
+            state.cached_tokens = int(event.get("cached_tokens", 0) or 0)
+            state.cost_usd = float(event["cost_usd"]) if event.get("cost_usd") is not None else None
+            state.latency_s = float(event.get("latency_s", 0.0) or 0.0)
+        elif kind == "agent_error":
+            state.status = "error"
+            state.error = str(event.get("error") or "Bilinmeyen hata")
+
+    return sorted(states.values(), key=lambda item: item.order)
+
+
+def build_cards(events: list[dict[str, Any]]) -> list[CardState]:
+    """Reduce raw agent events to one final render state per step key."""
+
+    return _apply_card_events([], events)
+
+
+def merge_cards(cards: list[CardState], events: list[dict[str, Any]]) -> list[CardState]:
+    """Apply only newly appended events to cached card states."""
+
+    return _apply_card_events(cards, events)
 
 
 def parse_ts(value: Any) -> datetime | None:
@@ -26,7 +144,7 @@ def elapsed_seconds(start: Any, end: Any | None = None) -> float:
 
 
 def stage_timeline(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Pair stage/stage_end records into display-ready chronological rows."""
+    """Pair stage/stage_end records and expose cache reuse rows."""
 
     starts: dict[str, dict[str, Any]] = {}
     rows: list[dict[str, Any]] = []
@@ -44,10 +162,9 @@ def stage_timeline(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "agent": str(start.get("agent") or event.get("agent") or ""),
                     "started_at": start.get("ts"),
                     "finished_at": event.get("ts"),
-                    "duration_s": elapsed_seconds(
-                        start.get("ts"),
-                        event.get("ts"),
-                    ) if start.get("ts") else float(event.get("latency_s", 0.0) or 0.0),
+                    "duration_s": elapsed_seconds(start.get("ts"), event.get("ts"))
+                    if start.get("ts")
+                    else float(event.get("latency_s", 0.0) or 0.0),
                     "total_tokens": int(event.get("total_tokens", 0) or 0),
                     "reasoning_tokens": int(event.get("reasoning_tokens", 0) or 0),
                     "cost_usd": event.get("cost_usd"),
@@ -56,6 +173,25 @@ def stage_timeline(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "total_is_minimum": bool(
                         start.get("total_is_minimum", event.get("total_is_minimum", False))
                     ),
+                    "cache": False,
+                }
+            )
+        elif kind == "step_reused" and step_key:
+            rows.append(
+                {
+                    "step_key": step_key,
+                    "label": step_key,
+                    "agent": str(event.get("agent") or ""),
+                    "started_at": event.get("ts"),
+                    "finished_at": event.get("ts"),
+                    "duration_s": 0.0,
+                    "total_tokens": 0,
+                    "reasoning_tokens": 0,
+                    "cost_usd": None,
+                    "index": None,
+                    "total": None,
+                    "total_is_minimum": False,
+                    "cache": True,
                 }
             )
     return rows
@@ -66,6 +202,7 @@ def live_stage_snapshot(
     events: list[dict[str, Any]],
     *,
     now: datetime | None = None,
+    cards: list[CardState] | None = None,
 ) -> dict[str, Any]:
     """Return the current/last stage, progress and live token estimate.
 
@@ -98,8 +235,7 @@ def live_stage_snapshot(
         (
             event
             for event in reversed(events)
-            if event.get("type") == "stage_end"
-            and str(event.get("step_key") or "") == step_key
+            if event.get("type") == "stage_end" and str(event.get("step_key") or "") == step_key
         ),
         None,
     )
@@ -109,21 +245,26 @@ def live_stage_snapshot(
         elapsed = elapsed_seconds(stage.get("ts"), end.get("ts"))
         estimated = False
     else:
-        visible_chars = 0
-        reasoning_chars = 0
-        for event in events:
-            if event.get("type") != "agent_stream":
-                continue
-            if str(event.get("step_key") or "") != step_key:
-                continue
-            delta = event.get("delta")
-            if not isinstance(delta, str):
-                continue
-            visible_chars += len(delta)
-            if event.get("channel") == "reasoning":
-                reasoning_chars += len(delta)
-        tokens = int(round(visible_chars / 4.0))
-        reasoning = int(round(reasoning_chars / 4.0))
+        current_card = next((card for card in cards or [] if card.step_key == step_key), None)
+        if current_card is not None:
+            tokens = int(round((len(current_card.reasoning) + len(current_card.content)) / 4.0))
+            reasoning = int(round(len(current_card.reasoning) / 4.0))
+        else:
+            visible_chars = 0
+            reasoning_chars = 0
+            for event in events:
+                if event.get("type") != "agent_stream":
+                    continue
+                if str(event.get("step_key") or "") != step_key:
+                    continue
+                delta = event.get("delta")
+                if not isinstance(delta, str):
+                    continue
+                visible_chars += len(delta)
+                if event.get("channel") == "reasoning":
+                    reasoning_chars += len(delta)
+            tokens = int(round(visible_chars / 4.0))
+            reasoning = int(round(reasoning_chars / 4.0))
         started = parse_ts(stage.get("ts"))
         elapsed = max(0.0, (now - started).total_seconds()) if started else 0.0
         estimated = True
@@ -172,12 +313,13 @@ def render_now_and_timeline(
     events: list[dict[str, Any]],
     *,
     status: str,
+    cards: list[CardState] | None = None,
 ) -> dict[str, Any]:
     """Shared Streamlit component used by the home page and Research Control."""
 
     import streamlit as st
 
-    snapshot = live_stage_snapshot(runtime, events)
+    snapshot = live_stage_snapshot(runtime, events, cards=cards)
     st.markdown("#### Şimdi")
     label = snapshot.get("label") or "Worker hazırlanıyor"
     token_prefix = "~" if snapshot.get("token_estimated") else ""
@@ -221,11 +363,14 @@ def render_now_and_timeline(
         st.caption("Tamamlanan aşama henüz yok.")
     else:
         for row in rows[-30:]:
+            if row.get("cache"):
+                st.caption(f"{_clock(row.get('started_at'))} · ♻️ `{row.get('step_key')}` · cache")
+                continue
             cost = row.get("cost_usd")
-            cost_text = f"${float(cost):.4f}" if cost is not None else "ücret N/A"
+            cost_label = f"${float(cost):.4f}" if cost is not None else "ücret N/A"
             st.caption(
                 f"{_clock(row.get('started_at'))} → {_clock(row.get('finished_at'))} · "
                 f"{row.get('label') or row.get('agent')} · {float(row.get('duration_s', 0.0)):.1f} sn · "
-                f"{int(row.get('total_tokens', 0) or 0):,} token · {cost_text}"
+                f"{int(row.get('total_tokens', 0) or 0):,} token · {cost_label}"
             )
     return snapshot

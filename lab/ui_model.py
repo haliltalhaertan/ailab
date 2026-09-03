@@ -5,6 +5,9 @@ from pathlib import Path
 from typing import Any
 
 
+DEFAULT_AGENT_PROFILE_PATH = Path(__file__).resolve().parents[1] / "experiments" / "baseline_production_agents.json"
+
+
 def filter_models(model_ids: list[str], model_labels: dict[str, str], query: str) -> list[str]:
     needle = str(query or "").strip().casefold()
     if not needle:
@@ -68,6 +71,37 @@ def tool_status(event: dict[str, Any]) -> tuple[str, str]:
     return "FAIL", "error"
 
 
+def load_default_agent_profile(path: Path | None = None) -> dict[str, Any]:
+    """Load checked-in UI/model defaults from the production baseline profile."""
+
+    source = path or DEFAULT_AGENT_PROFILE_PATH
+    raw = json.loads(source.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError(f"Expected JSON object in {source}")
+    agents = raw.get("agents")
+    if not isinstance(agents, dict):
+        raise ValueError(f"Missing agents object in {source}")
+    orchestrator = raw.get("orchestrator_default")
+    if not isinstance(orchestrator, dict):
+        orchestrator = {"model": "z-ai/glm-5.3-flash", "reasoning_effort": "medium"}
+    return {"agents": agents, "orchestrator_default": orchestrator}
+
+
+def profile_model_ids(profile: dict[str, Any]) -> list[str]:
+    """Return stable, deduplicated model IDs used by the checked-in defaults."""
+
+    values: list[str] = []
+    orchestrator = profile.get("orchestrator_default") or {}
+    if isinstance(orchestrator, dict) and orchestrator.get("model"):
+        values.append(str(orchestrator["model"]))
+    agents = profile.get("agents") or {}
+    if isinstance(agents, dict):
+        for raw in agents.values():
+            if isinstance(raw, dict) and raw.get("model"):
+                values.append(str(raw["model"]))
+    return list(dict.fromkeys(values))
+
+
 def _parse_jsonl_lines(lines: list[str]) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for line in lines:
@@ -107,6 +141,49 @@ def read_jsonl_tail(path: Path, *, max_bytes: int = 2_000_000) -> list[dict[str,
         raw = handle.read()
     text = raw.decode("utf-8", errors="replace")
     return _parse_jsonl_lines(text.splitlines())
+
+
+def read_jsonl_since(path: Path, offset: int) -> tuple[list[dict[str, Any]], int]:
+    """Read complete JSONL records after ``offset`` without losing a partial tail."""
+
+    if not path.exists():
+        return [], 0
+    size = path.stat().st_size
+    start = int(offset)
+    if start < 0 or start > size:
+        start = 0
+    if start == size:
+        return [], start
+    with path.open("rb") as handle:
+        handle.seek(start)
+        raw = handle.read()
+    last_newline = raw.rfind(b"\n")
+    if last_newline < 0:
+        return [], start
+    complete = raw[: last_newline + 1]
+    new_offset = start + last_newline + 1
+    text = complete.decode("utf-8", errors="replace")
+    return _parse_jsonl_lines(text.splitlines()), new_offset
+
+
+def live_log_offsets(run_dir: Path) -> dict[str, int]:
+    return {
+        "trace": (run_dir / "trace.jsonl").stat().st_size if (run_dir / "trace.jsonl").exists() else 0,
+        "stream": (run_dir / "stream.jsonl").stat().st_size if (run_dir / "stream.jsonl").exists() else 0,
+    }
+
+
+def load_live_run_delta(
+    run_dir: Path,
+    offsets: dict[str, int],
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Read only newly appended trace/stream records after the previous fragment."""
+
+    trace_events, trace_offset = read_jsonl_since(run_dir / "trace.jsonl", int(offsets.get("trace", 0) or 0))
+    stream_events, stream_offset = read_jsonl_since(run_dir / "stream.jsonl", int(offsets.get("stream", 0) or 0))
+    events = trace_events + stream_events
+    events.sort(key=lambda ev: str(ev.get("ts") or ""))
+    return events, {"trace": trace_offset, "stream": stream_offset}
 
 
 def load_run_events(run_dir: Path, *, include_stream: bool = True) -> list[dict[str, Any]]:

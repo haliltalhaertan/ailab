@@ -114,6 +114,32 @@ def test_theorem_stage_total_formula_two_configurations(tmp_path):
     second.close()
 
 
+def test_theorem_stage_index_honors_resume_offset(tmp_path):
+    trace = Trace("theorem-offset", out_dir=tmp_path / "runs")
+    trace.log(
+        "project_context",
+        project_id="p",
+        project_uuid="u",
+        experiment="Teorem Araştırması",
+        experiment_method="theorem_lab",
+    )
+    trace.configure_theorem_stages(iterations=6, checkpoint_every=2, has_literature_agent=True)
+    trace._stage_index = 10
+    trace.log(
+        "agent_start",
+        agent="Theorist",
+        model="fake/model",
+        reasoning_effort="high",
+        step_key="iter:3:proposer",
+    )
+    rows = _rows(trace)
+    trace.close()
+
+    stage = next(row for row in rows if row.get("type") == "stage")
+    assert stage["index"] == 11
+    assert stage["total"] == 29
+
+
 def test_unknown_theorem_step_key_keeps_legacy_label():
     assert Trace._theorem_stage_label("iter:1:proposal", "Theorist") == (
         "Theorist · iter:1:proposal"

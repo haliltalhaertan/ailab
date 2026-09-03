@@ -1,4 +1,8 @@
 {
+  "orchestrator_default": {
+    "model": "z-ai/glm-5.3-flash",
+    "reasoning_effort": "medium"
+  },
   "agents": {
     "ResearchManager": {
       "model": "z-ai/glm-5.3-flash",

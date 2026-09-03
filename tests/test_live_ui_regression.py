@@ -6,7 +6,7 @@ from streamlit.testing.v1 import AppTest
 
 from lab.integrity import ProjectRunLock
 from lab.project_manager import ProjectManager
-from lab.ui_model import load_live_run_events
+from lab.ui_model import load_live_run_delta, load_live_run_events, live_log_offsets
 
 
 def test_sidebar_agent_config_is_not_emitted_by_streamlit_magic():
@@ -32,15 +32,30 @@ def test_live_loader_keeps_trace_and_only_recent_stream_tail(tmp_path):
     assert not any(event.get("delta") == "OLD" for event in events)
 
 
-def test_main_page_shows_research_loop_stage_progress_and_timeline(tmp_path, monkeypatch):
-    app_path = Path(__file__).resolve().parents[1] / "app.py"
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+def test_live_loader_reads_only_new_jsonl_records_after_offset(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    trace = run_dir / "trace.jsonl"
+    stream = run_dir / "stream.jsonl"
+    trace.write_text(json.dumps({"type": "stage", "step_key": "a"}) + "\n", encoding="utf-8")
+    stream.write_text(json.dumps({"type": "agent_stream", "step_key": "a", "delta": "old"}) + "\n", encoding="utf-8")
+    offsets = live_log_offsets(run_dir)
 
-    import lab.openrouter_catalog as catalog
+    with trace.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"type": "stage_end", "step_key": "a"}) + "\n")
+    with stream.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"type": "agent_stream", "step_key": "b", "delta": "new"}) + "\n")
 
-    monkeypatch.setattr(catalog, "fetch_openrouter_models", lambda: [])
+    events, new_offsets = load_live_run_delta(run_dir, offsets)
 
+    assert [event.get("type") for event in events] == ["stage_end", "agent_stream"]
+    assert not any(event.get("delta") == "old" for event in events)
+    assert any(event.get("delta") == "new" for event in events)
+    assert new_offsets["trace"] > offsets["trace"]
+    assert new_offsets["stream"] > offsets["stream"]
+
+
+def _prepare_live_project(tmp_path: Path, *, completed_card: bool):
     pm = ProjectManager()
     info = pm.create_project(
         title="Live loop",
@@ -135,6 +150,24 @@ def test_main_page_shows_research_loop_stage_progress_and_timeline(tmp_path, mon
                 "prompt": "critic task",
             },
         ]
+        if completed_card:
+            events.append(
+                {
+                    "ts": now,
+                    "type": "llm_call",
+                    "agent": "Sceptik",
+                    "model": "fake/model",
+                    "output": "final critique",
+                    "provider_reasoning": "final reasoning",
+                    "prompt_tokens": 20,
+                    "completion_tokens": 30,
+                    "reasoning_tokens": 10,
+                    "cached_tokens": 0,
+                    "total_tokens": 50,
+                    "cost_usd": 0.001,
+                    "latency_s": 1.0,
+                }
+            )
         (run_dir / "trace.jsonl").write_text(
             "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in events),
             encoding="utf-8",
@@ -171,7 +204,22 @@ def test_main_page_shows_research_loop_stage_progress_and_timeline(tmp_path, mon
             + "\n",
             encoding="utf-8",
         )
+    except Exception:
+        lock.release()
+        raise
+    return pm, info, root, lock
 
+
+def test_main_page_shows_research_loop_stage_progress_and_timeline(tmp_path, monkeypatch):
+    app_path = Path(__file__).resolve().parents[1] / "app.py"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+
+    import lab.openrouter_catalog as catalog
+
+    monkeypatch.setattr(catalog, "fetch_openrouter_models", lambda: [])
+    _pm, _info, _root, lock = _prepare_live_project(tmp_path, completed_card=False)
+    try:
         at = AppTest.from_file(str(app_path), default_timeout=10).run()
         assert not at.exception
         subheader_values = [element.value for element in at.subheader]
@@ -181,5 +229,61 @@ def test_main_page_shows_research_loop_stage_progress_and_timeline(tmp_path, mon
         assert any("Tur 1/1 · Sceptik · eleştiri" in value for value in markdown_values)
         assert any("İlk çözüm · Teorisyen" in value for value in caption_values)
         assert len(at.get("progress")) >= 1
+    finally:
+        lock.release()
+
+
+def test_completed_live_card_header_stays_done_across_fragment_reruns(tmp_path, monkeypatch):
+    app_path = Path(__file__).resolve().parents[1] / "app.py"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+
+    import lab.openrouter_catalog as catalog
+
+    monkeypatch.setattr(catalog, "fetch_openrouter_models", lambda: [])
+    _pm, _info, _root, lock = _prepare_live_project(tmp_path, completed_card=True)
+    try:
+        at = AppTest.from_file(str(app_path), default_timeout=10).run()
+        assert not at.exception
+        first_labels = [getattr(element, "label", "") for element in at.get("expander")]
+        assert any(label.startswith("✅ Sceptik") for label in first_labels)
+        assert not any(label.startswith("⏳ Sceptik") for label in first_labels)
+
+        at = at.run()
+        assert not at.exception
+        second_labels = [getattr(element, "label", "") for element in at.get("expander")]
+        assert any(label.startswith("✅ Sceptik") for label in second_labels)
+        assert not any(label.startswith("⏳ Sceptik") for label in second_labels)
+    finally:
+        lock.release()
+
+
+def test_live_worker_replaces_run_action_with_stop_even_when_heartbeat_is_stale(tmp_path, monkeypatch):
+    app_path = Path(__file__).resolve().parents[1] / "app.py"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+
+    import lab.openrouter_catalog as catalog
+
+    monkeypatch.setattr(catalog, "fetch_openrouter_models", lambda: [])
+    _pm, _info, root, lock = _prepare_live_project(tmp_path, completed_card=False)
+    runtime = json.loads((root / "runtime.json").read_text(encoding="utf-8"))
+    runtime["heartbeat_at"] = "2026-01-01T00:00:00+00:00"
+    runtime["updated_at"] = runtime["heartbeat_at"]
+    (root / "runtime.json").write_text(json.dumps(runtime), encoding="utf-8")
+    try:
+        at = AppTest.from_file(str(app_path), default_timeout=10).run()
+        assert not at.exception
+        labels = [button.label for button in at.button]
+        assert "DURDUR" in labels
+        assert "Deneyi Çalıştır" not in labels
+        assert any("STALE_RUNNING" in caption.value for caption in at.caption)
+
+        stop = next(button for button in at.button if button.label == "DURDUR")
+        at = stop.click().run()
+        assert not at.exception
+        assert (root / "stop.flag").exists()
+        labels = [button.label for button in at.button]
+        assert "Durdurma isteği gönderildi…" in labels
     finally:
         lock.release()
