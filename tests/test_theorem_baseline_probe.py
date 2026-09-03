@@ -6,13 +6,14 @@ from typing import Any
 
 from lab import baseline_probe
 from lab.agent import Agent
-from lab.baseline_probe import _markdown_report, summarize_probe
+from lab.baseline_probe import _markdown_report, resolve_agent_config, summarize_probe
 from lab.client import LLMResponse
 
 
 def test_summarize_probe_counts_run_level_events(tmp_path: Path) -> None:
     trace_path = tmp_path / "trace.jsonl"
     events = [
+        {"type": "baseline_probe_config", "iterations": 2, "agent_config": {"Theorist": {"model": "m"}}},
         {"type": "structured_output_parse_failed"},
         {"type": "structured_output_repaired"},
         {
@@ -30,6 +31,12 @@ def test_summarize_probe_counts_run_level_events(tmp_path: Path) -> None:
             "metadata": {"status": "unsat"},
         },
         {
+            "type": "stage",
+            "agent": "Theorist",
+            "step_key": "iter:1:proposer",
+            "label": "Tur 1 · Theorist · öneri",
+        },
+        {
             "type": "llm_call",
             "agent": "Theorist",
             "model": "example/model",
@@ -40,6 +47,12 @@ def test_summarize_probe_counts_run_level_events(tmp_path: Path) -> None:
             "total_tokens": 150,
             "cost_usd": 0.001,
             "latency_s": 1.2,
+            "output": "candidate output",
+        },
+        {
+            "type": "stage_end",
+            "agent": "Theorist",
+            "step_key": "iter:1:proposer",
         },
         {
             "type": "iteration_end",
@@ -77,6 +90,8 @@ def test_summarize_probe_counts_run_level_events(tmp_path: Path) -> None:
     assert report["event_counts"]["structured_output_parse_failed"] == 1
     assert report["event_counts"]["structured_output_repaired"] == 1
     assert report["event_counts"]["status_downgraded_by_guard"] == 1
+    assert report["requested_iterations"] == 2
+    assert report["completed_iterations"] == 1
     assert report["iterations"] == [
         {
             "iteration": 1,
@@ -88,12 +103,58 @@ def test_summarize_probe_counts_run_level_events(tmp_path: Path) -> None:
     ]
     assert report["tool_results"][0]["tool"] == "z3"
     assert report["llm_calls"][0]["total_tokens"] == 150
+    assert report["llm_calls"][0]["step_key"] == "iter:1:proposer"
+    assert report["per_iteration"][0]["total_tokens"] == 150
+    assert report["per_iteration"][0]["cost_usd"] == 0.001
+    assert report["role_outputs"]["Theorist"][0]["output_preview"] == "candidate output"
+
+
+def test_resolve_agent_config_accepts_worker_request_agent_dictionary() -> None:
+    resolved = resolve_agent_config(
+        model="fallback/model",
+        reasoning_effort="low",
+        max_tokens=1200,
+        agent_config={
+            "agents": {
+                "Theorist": {
+                    "model": "deepseek/deepseek-v4-pro",
+                    "reasoning_effort": "high",
+                    "max_tokens": 1600,
+                },
+                "AdversarialCritic": {
+                    "model": "moonshotai/kimi-k2.5",
+                    "reasoning_effort": "high",
+                },
+            }
+        },
+    )
+
+    assert resolved["Theorist"] == {
+        "model": "deepseek/deepseek-v4-pro",
+        "reasoning_effort": "high",
+        "max_tokens": 1600,
+    }
+    assert resolved["AdversarialCritic"]["model"] == "moonshotai/kimi-k2.5"
+    assert resolved["ResearchManager"] == {
+        "model": "fallback/model",
+        "reasoning_effort": "low",
+        "max_tokens": 1200,
+    }
 
 
 def test_markdown_report_exposes_acceptance_metrics() -> None:
     report = {
         "git_sha": "abc123",
         "run_id": "run-1",
+        "requested_iterations": 2,
+        "completed_iterations": 1,
+        "agent_config": {
+            "Theorist": {
+                "model": "example/model",
+                "reasoning_effort": "high",
+                "max_tokens": 1200,
+            }
+        },
         "total_calls": 2,
         "total_tokens": 300,
         "total_cost_usd": 0.02,
@@ -111,6 +172,24 @@ def test_markdown_report_exposes_acceptance_metrics() -> None:
         "iterations": [
             {"iteration": 1, "status": "OPEN", "decision": "REVISE", "item_id": "C1", "next_task": "x"}
         ],
+        "per_iteration": [
+            {
+                "iteration": 1,
+                "calls": 1,
+                "total_tokens": 300,
+                "cost_usd": 0.02,
+                "cost_available_calls": 1,
+                "cost_complete": True,
+                "llm_latency_s": 1.0,
+                "roles": ["Theorist"],
+            }
+        ],
+        "role_outputs": {
+            "Theorist": [
+                {"step_key": "iter:1:proposer", "model": "example/model", "output_preview": "candidate"}
+            ]
+        },
+        "errors": [],
         "tool_results": [
             {"step_key": "iter:1:tool", "tool": "z3", "ok": True, "error": "", "metadata": {}}
         ],
@@ -118,6 +197,7 @@ def test_markdown_report_exposes_acceptance_metrics() -> None:
             {
                 "agent": "Theorist",
                 "model": "example/model",
+                "step_key": "iter:1:proposer",
                 "total_tokens": 300,
                 "cost_usd": 0.02,
                 "latency_s": 1.0,
@@ -127,10 +207,15 @@ def test_markdown_report_exposes_acceptance_metrics() -> None:
 
     text = _markdown_report(report)
 
+    assert "requested/completed iterations: **2/1**" in text
     assert "JSON repairs completed: **1**" in text
     assert "guard downgrades: **1**" in text
+    assert "iteration 1: **300 tokens**, **$0.020000**" in text
     assert "iteration 1: `OPEN` / `REVISE`" in text
+    assert "**Theorist**" in text
+    assert "`iter:1:proposer`: candidate" in text
     assert "`iter:1:tool`: `z3`" in text
+    assert "## Errors\n- none recorded" in text
 
 
 class _FakeClient:
@@ -194,13 +279,17 @@ def test_run_probe_exercises_real_engine_with_fake_agents(tmp_path: Path, monkey
         "IndependentAuditor": ["Fake final audit completed."],
     }
 
+    seen: dict[str, tuple[str, str | None]] = {}
+
     def fake_agent(role: str, model: str, max_tokens: int, reasoning_effort: str | None) -> Agent:
+        del max_tokens
+        seen[role] = (model, reasoning_effort)
         return Agent(
             name=role,
             system_prompt=f"fake {role}",
             model=model,
             temperature=0.0,
-            max_tokens=max_tokens,
+            max_tokens=128,
             reasoning_effort=reasoning_effort,
             client=_FakeClient(outputs[role]),  # type: ignore[arg-type]
         )
@@ -216,6 +305,12 @@ def test_run_probe_exercises_real_engine_with_fake_agents(tmp_path: Path, monkey
         reasoning_effort="low",
         out_dir=tmp_path / "baseline_runs",
         problem="Toy baseline regression problem",
+        agent_config={
+            "agents": {
+                "Theorist": {"model": "fake/theorist", "reasoning_effort": "high"},
+                "VerificationEngineer": {"model": "fake/verifier", "reasoning_effort": "medium"},
+            }
+        },
     )
     report = json.loads(report_path.read_text(encoding="utf-8"))
 
@@ -232,3 +327,7 @@ def test_run_probe_exercises_real_engine_with_fake_agents(tmp_path: Path, monkey
     ]
     assert report["total_calls"] == 6
     assert report["event_counts"]["structured_output_repair_failed"] == 0
+    assert seen["Theorist"] == ("fake/theorist", "high")
+    assert seen["VerificationEngineer"] == ("fake/verifier", "medium")
+    assert seen["ResearchManager"] == ("fake/model", "low")
+    assert report["agent_config"]["Theorist"]["model"] == "fake/theorist"

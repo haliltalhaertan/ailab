@@ -1,0 +1,28 @@
+{
+  "agents": {
+    "ResearchManager": {
+      "model": "z-ai/glm-5.3-flash",
+      "reasoning_effort": "medium"
+    },
+    "Theorist": {
+      "model": "deepseek/deepseek-v4-pro",
+      "reasoning_effort": "high"
+    },
+    "AdversarialCritic": {
+      "model": "moonshotai/kimi-k2.5",
+      "reasoning_effort": "high"
+    },
+    "VerificationEngineer": {
+      "model": "google/gemini-3.7-flash",
+      "reasoning_effort": "medium"
+    },
+    "LiteratureScout": {
+      "model": "z-ai/glm-5.3-flash",
+      "reasoning_effort": "medium"
+    },
+    "IndependentAuditor": {
+      "model": "google/gemini-3.7-flash",
+      "reasoning_effort": "medium"
+    }
+  }
+}
