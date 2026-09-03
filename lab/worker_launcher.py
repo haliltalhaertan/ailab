@@ -18,6 +18,9 @@ from lab.integrity import (
 from lab.project_manager import ProjectManager
 
 
+EXPERIMENT_METHODS = {"theorem_lab", "research_loop", "debate", "pipeline", "panel"}
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -86,7 +89,7 @@ def _windows_popen(
         return subprocess.Popen(command, **kwargs, creationflags=base_flags), False
 
 
-def launch_theorem_worker(project_id: str, *, root: str | Path = "research_state") -> int:
+def launch_worker(project_id: str, *, root: str | Path = "research_state") -> int:
     project_root = Path(root) / project_id
     request = project_root / "worker_request.json"
     if not request.exists():
@@ -143,25 +146,53 @@ def launch_theorem_worker(project_id: str, *, root: str | Path = "research_state
         guard.unlink(missing_ok=True)
 
 
+def launch_theorem_worker(project_id: str, *, root: str | Path = "research_state") -> int:
+    """Backward-compatible alias for callers that still use the old name."""
+
+    return launch_worker(project_id, root=root)
+
+
 def build_request_from_ui(
     *,
     project_id: str,
-    problem: str,
-    iterations: int,
-    literature_query: str | None,
-    checkpoint_every: int,
-    agents: dict[str, dict[str, Any]],
+    agents: dict[str, dict[str, Any]] | list[dict[str, Any]],
+    problem: str | None = None,
+    iterations: int | None = None,
+    literature_query: str | None = None,
+    checkpoint_every: int = 2,
+    experiment_method: str = "theorem_lab",
+    experiment_name: str | None = None,
+    optional_agents: dict[str, dict[str, Any]] | None = None,
+    param: int | None = None,
+    prompt: str | None = None,
 ) -> dict[str, Any]:
+    if experiment_method not in EXPERIMENT_METHODS:
+        raise ValueError(f"Unsupported experiment_method: {experiment_method}")
     pm = ProjectManager()
     info = pm.get(project_id)
-    return {
-        "request_version": 1,
+    resolved_prompt = str(prompt if prompt is not None else problem or "")
+    resolved_param = int(param if param is not None else iterations if iterations is not None else 0)
+    payload: dict[str, Any] = {
+        "request_version": 2,
         "project_id": project_id,
         "project_uuid": info.project_uuid,
-        "problem": problem,
-        "iterations": int(iterations),
-        "literature_query": literature_query,
-        "checkpoint_every": int(checkpoint_every),
+        "experiment_method": experiment_method,
+        "experiment_name": experiment_name or (
+            "Teorem Araştırması" if experiment_method == "theorem_lab" else experiment_method
+        ),
         "agents": agents,
+        "optional_agents": optional_agents or {},
+        "param": resolved_param,
+        "prompt": resolved_prompt,
         "created_at": _now(),
     }
+    if experiment_method == "theorem_lab":
+        payload.update(
+            {
+                "problem": resolved_prompt,
+                "iterations": resolved_param or 5,
+                "literature_query": literature_query,
+                "checkpoint_every": int(checkpoint_every),
+            }
+        )
+    return payload

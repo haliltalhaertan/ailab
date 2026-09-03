@@ -7,10 +7,11 @@ from collections import defaultdict
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 _ACTIVE_TRACE: ContextVar["Trace | None"] = ContextVar("ailab_active_trace", default=None)
+StageListener = Callable[[dict[str, Any]], None]
 
 
 def get_active_trace() -> "Trace | None":
@@ -21,7 +22,13 @@ def get_active_trace() -> "Trace | None":
 
 
 class Trace:
-    """Append-only run trace with a separate buffered streaming channel."""
+    """Append-only run trace with a separate buffered streaming channel.
+
+    ``stage`` / ``stage_end`` are the common live-run lifecycle. Callers such as
+    Orchestrator may emit them explicitly. Legacy/theorem callers that already
+    emit ``agent_start`` + ``llm_call`` are adapted here so the UI has one event
+    contract without changing evidence/contract/ledger code.
+    """
 
     STREAM_FLUSH_S = 0.20
     STREAM_FLUSH_CHARS = 4096
@@ -30,6 +37,8 @@ class Trace:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         run_nonce = uuid.uuid4().hex[:10]
         self.run_id = f"{stamp}_{run_nonce}_{experiment}"
+        self.experiment = experiment
+        self.experiment_method: str | None = None
         self.out_dir = Path(out_dir)
         self.run_dir = self.out_dir / self.run_id
         self.run_dir.mkdir(parents=True, exist_ok=False)
@@ -45,17 +54,91 @@ class Trace:
         self._stream_handle = self.stream_path.open("a", encoding="utf-8", buffering=1)
         self._stream_buffers: dict[tuple[str, str, str, str], dict[str, Any]] = {}
         self._stream_last_flush = time.monotonic()
+        self._stage_listener: StageListener | None = None
+        self._stage_index = 0
+        self._active_stages: dict[str, dict[str, Any]] = {}
+        self._auto_stage_by_agent: dict[str, str] = {}
         self._index("run_started", experiment=experiment, started_at=self.started_at)
         _ACTIVE_TRACE.set(self)
 
+    def set_stage_listener(self, listener: StageListener | None) -> None:
+        self._stage_listener = listener
+
     def _index(self, event: str, **data: Any) -> None:
         self.out_dir.mkdir(parents=True, exist_ok=True)
-        row = {"ts": datetime.now(timezone.utc).isoformat(), "event": event, "run_id": self.run_id, "run_dir": str(self.run_dir), **data}
+        row = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "event": event,
+            "run_id": self.run_id,
+            "run_dir": str(self.run_dir),
+            **data,
+        }
         with self.index_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     def _write_trace(self, event: dict[str, Any]) -> None:
         self._trace_handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+    def _notify_stage(self, event: dict[str, Any]) -> None:
+        if self._stage_listener is not None:
+            self._stage_listener(dict(event))
+
+    def _write_stage(self, event_type: str, data: dict[str, Any]) -> dict[str, Any]:
+        event = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "type": event_type,
+            **data,
+        }
+        self._write_trace(event)
+        self._notify_stage(event)
+        return event
+
+    def _auto_stage_for_agent_start(self, data: dict[str, Any]) -> None:
+        step_key = str(data.get("step_key") or "").strip()
+        if not step_key or step_key in self._active_stages:
+            return
+        self._stage_index += 1
+        agent = str(data.get("agent") or "Agent")
+        method = str(self.experiment_method or "theorem_lab")
+        stage = {
+            "method": method,
+            "label": f"{agent} · {step_key}",
+            "index": self._stage_index,
+            "total": None,
+            "agent": agent,
+            "model": data.get("model"),
+            "reasoning_effort": data.get("reasoning_effort"),
+            "step_key": step_key,
+            "auto": True,
+        }
+        event = self._write_stage("stage", stage)
+        self._active_stages[step_key] = event
+        self._auto_stage_by_agent[agent] = step_key
+
+    def _auto_stage_end_for_llm_call(self, data: dict[str, Any]) -> None:
+        agent = str(data.get("agent") or "Agent")
+        step_key = self._auto_stage_by_agent.get(agent)
+        if not step_key:
+            return
+        start = self._active_stages.get(step_key)
+        if not start or start.get("auto") is not True:
+            return
+        end = {
+            "method": start.get("method") or self.experiment_method or "theorem_lab",
+            "label": start.get("label"),
+            "index": start.get("index"),
+            "total": start.get("total"),
+            "agent": agent,
+            "step_key": step_key,
+            "total_tokens": int(data.get("total_tokens", 0) or 0),
+            "reasoning_tokens": int(data.get("reasoning_tokens", 0) or 0),
+            "cost_usd": data.get("cost_usd"),
+            "latency_s": float(data.get("latency_s", 0.0) or 0.0),
+            "auto": True,
+        }
+        self._write_stage("stage_end", end)
+        self._active_stages.pop(step_key, None)
+        self._auto_stage_by_agent.pop(agent, None)
 
     def _flush_stream(self, *, force: bool = False) -> None:
         if not self._stream_buffers:
@@ -88,7 +171,12 @@ class Trace:
         # one stream event immediately rather than inflating trace.jsonl.
         if not isinstance(delta, str):
             self._flush_stream(force=True)
-            event = {"ts": datetime.now(timezone.utc).isoformat(), "type": "agent_stream", **data, "batch_parts": 1}
+            event = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "type": "agent_stream",
+                **data,
+                "batch_parts": 1,
+            }
             self._stream_handle.write(json.dumps(event, ensure_ascii=False) + "\n")
             self._stream_handle.flush()
             return
@@ -124,11 +212,37 @@ class Trace:
             self._buffer_stream(data)
             return
         self._flush_stream()
-        event = {"ts": datetime.now(timezone.utc).isoformat(), "type": event_type, **data}
+
+        if event_type == "stage":
+            event = self._write_stage("stage", data)
+            step_key = str(data.get("step_key") or "").strip()
+            if step_key:
+                self._active_stages[step_key] = event
+            return
+        if event_type == "stage_end":
+            self._write_stage("stage_end", data)
+            step_key = str(data.get("step_key") or "").strip()
+            if step_key:
+                active = self._active_stages.pop(step_key, None)
+                if active:
+                    agent = str(active.get("agent") or "")
+                    if self._auto_stage_by_agent.get(agent) == step_key:
+                        self._auto_stage_by_agent.pop(agent, None)
+            return
+        if event_type == "agent_start":
+            self._auto_stage_for_agent_start(data)
+
+        event = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "type": event_type,
+            **data,
+        }
         self._write_trace(event)
         if event_type == "project_context":
             self.project_id = str(data.get("project_id") or "") or None
             self.project_uuid = str(data.get("project_uuid") or "") or None
+            if data.get("experiment_method"):
+                self.experiment_method = str(data["experiment_method"])
             self._index(
                 "run_context",
                 project_id=self.project_id,
@@ -136,6 +250,8 @@ class Trace:
                 title=data.get("title"),
                 experiment=data.get("experiment"),
             )
+        elif event_type == "llm_call":
+            self._auto_stage_end_for_llm_call(data)
 
     def agent_call(self, agent: str, model: str, temperature: float, messages: list[dict], response) -> None:
         exact_messages = getattr(response, "request_messages", None) or messages
@@ -197,7 +313,13 @@ class Trace:
                 effort = ev.get("reasoning_effort")
                 if effort is not None and effort not in t["reasoning_efforts"]:
                     t["reasoning_efforts"].append(effort)
-                for key in ("prompt_tokens", "completion_tokens", "reasoning_tokens", "cached_tokens", "total_tokens"):
+                for key in (
+                    "prompt_tokens",
+                    "completion_tokens",
+                    "reasoning_tokens",
+                    "cached_tokens",
+                    "total_tokens",
+                ):
                     t[key] += int(ev.get(key, 0) or 0)
                 if ev.get("cost_usd") is not None:
                     t["cost_usd"] += float(ev["cost_usd"])
