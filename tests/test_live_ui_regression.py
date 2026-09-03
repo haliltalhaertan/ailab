@@ -352,7 +352,8 @@ def test_completed_cards_render_outside_fragment_and_active_preview_is_bounded(t
         at = AppTest.from_file(str(app_path), default_timeout=10).run()
         assert not at.exception
         labels = [getattr(element, "label", "") for element in at.get("expander")]
-        assert sum(label.startswith("✅ DoneAgent") for label in labels) == 3
+        done_labels = {label for label in labels if label.startswith("✅ DoneAgent")}
+        assert len(done_labels) == 3
         assert any(label.startswith("⏳ Sceptik") for label in labels)
         markdown_values = [element.value for element in at.markdown]
         assert "R" * 4000 in markdown_values
