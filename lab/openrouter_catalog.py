@@ -13,6 +13,7 @@ from urllib.request import Request, urlopen
 MODELS_URL = "https://openrouter.ai/api/v1/models?sort=most-popular"
 CATALOG_CACHE_TTL_S = 6 * 60 * 60
 CATALOG_CACHE_SCHEMA_VERSION = 1
+_ALL_GATEWAY_REASONING_EFFORTS = ("max", "xhigh", "high", "medium", "low", "minimal", "none")
 
 
 @dataclass(frozen=True)
@@ -71,6 +72,26 @@ def _string_tuple(value: Any) -> tuple[str, ...]:
     return tuple(str(item).strip() for item in value if str(item).strip())
 
 
+def _reasoning_efforts(reasoning: Any) -> tuple[str, ...]:
+    """Normalize catalog effort metadata while preserving absent-vs-null semantics.
+
+    OpenRouter documents an omitted ``supported_efforts`` field as unknown/not
+    selectable, but an explicit null as accepting all gateway effort values.
+    Mandatory-reasoning models must never be sent ``effort=none``.
+    """
+
+    if not isinstance(reasoning, dict) or "supported_efforts" not in reasoning:
+        return ()
+    raw = reasoning.get("supported_efforts")
+    if raw is None:
+        efforts = _ALL_GATEWAY_REASONING_EFFORTS
+    else:
+        efforts = _string_tuple(raw)
+    if bool(reasoning.get("mandatory", False)):
+        return tuple(value for value in efforts if value.casefold() != "none")
+    return efforts
+
+
 def parse_models_payload(payload: dict[str, Any]) -> list[OpenRouterModel]:
     models: list[OpenRouterModel] = []
     for raw in payload.get("data", []):
@@ -78,7 +99,8 @@ def parse_models_payload(payload: dict[str, Any]) -> list[OpenRouterModel]:
             continue
         pricing = raw.get("pricing") or {}
         top_provider = raw.get("top_provider") or {}
-        reasoning = raw.get("reasoning") or {}
+        reasoning_raw = raw.get("reasoning")
+        reasoning = reasoning_raw if isinstance(reasoning_raw, dict) else {}
         models.append(
             OpenRouterModel(
                 id=str(raw["id"]),
@@ -87,7 +109,7 @@ def parse_models_payload(payload: dict[str, Any]) -> list[OpenRouterModel]:
                 max_completion_tokens=_optional_int(top_provider.get("max_completion_tokens")),
                 supported_parameters=_string_tuple(raw.get("supported_parameters")),
                 reasoning_mandatory=bool(reasoning.get("mandatory", False)),
-                reasoning_supported_efforts=_string_tuple(reasoning.get("supported_efforts")),
+                reasoning_supported_efforts=_reasoning_efforts(reasoning_raw),
                 reasoning_default_effort=(
                     str(reasoning.get("default_effort")).strip()
                     if reasoning.get("default_effort") not in (None, "")
