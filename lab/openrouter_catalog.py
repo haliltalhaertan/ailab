@@ -219,9 +219,9 @@ def cached_openrouter_models(
     global _MEMORY_CACHE
     current = time.time() if now is None else float(now)
     if _MEMORY_CACHE is not None:
-        fetched_epoch, models, origin = _MEMORY_CACHE
+        fetched_epoch, cached_models, origin = _MEMORY_CACHE
         if current - fetched_epoch < ttl_s:
-            return list(models), "memory" if models else origin
+            return list(cached_models), "memory" if cached_models else origin
 
     path = cache_path or catalog_cache_path()
     disk = _read_disk_cache(path)
@@ -236,7 +236,7 @@ def cached_openrouter_models(
 
     loader = fetcher or fetch_openrouter_models
     try:
-        models = loader(api_key=api_key, timeout=timeout)
+        loaded_models = loader(api_key=api_key, timeout=timeout)
     except Exception:
         if stale_epoch is not None:
             _MEMORY_CACHE = (current, tuple(stale_models), "stale_disk")
@@ -244,9 +244,9 @@ def cached_openrouter_models(
         _MEMORY_CACHE = (current, (), "unavailable")
         return [], "unavailable"
 
-    _write_disk_cache(path, models, current)
-    _MEMORY_CACHE = (current, tuple(models), "network")
-    return models, "network"
+    _write_disk_cache(path, loaded_models, current)
+    _MEMORY_CACHE = (current, tuple(loaded_models), "network")
+    return loaded_models, "network"
 
 
 def lookup_openrouter_model(
