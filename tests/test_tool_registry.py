@@ -45,6 +45,30 @@ def test_lean_is_exposed_only_when_enabled_and_binary_exists(tmp_path, monkeypat
     assert "`have`" in prompt
 
 
+def test_z3_is_hidden_when_import_fails(tmp_path, monkeypatch):
+    def fail_import(name: str):
+        if name == "z3":
+            raise ImportError("broken z3 install")
+        raise AssertionError(name)
+
+    monkeypatch.setattr("lab.tool_registry.importlib.import_module", fail_import)
+    registry = _registry(tmp_path)
+
+    row = registry.availability()["z3"]
+    assert row["available"] is False
+    assert "import edilemiyor" in row["reason"]
+    assert "z3" not in registry.names(available_only=True)
+
+
+def test_z3_is_exposed_when_import_succeeds(tmp_path, monkeypatch):
+    monkeypatch.setattr("lab.tool_registry.importlib.import_module", lambda name: object() if name == "z3" else None)
+    registry = _registry(tmp_path)
+
+    row = registry.availability()["z3"]
+    assert row["available"] is True
+    assert "z3" in registry.names(available_only=True)
+
+
 def test_frozen_effective_snapshot_cannot_be_widened_by_runtime(tmp_path, monkeypatch):
     monkeypatch.setenv("LAB_ALLOW_HOST_LEAN", "1")
     monkeypatch.setattr("lab.tool_registry.shutil.which", lambda _name: "C:/fake/lean.exe")
