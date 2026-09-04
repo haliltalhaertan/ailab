@@ -10,6 +10,12 @@ _ROLE_COMPLETION: ContextVar[dict[str, bool]] = ContextVar(
 )
 
 
+def reset_completion_integrity() -> None:
+    """Start a fresh completion-integrity scope for a new theorem lab."""
+
+    _ROLE_COMPLETION.set({})
+
+
 def record_role_completion(role: str, *, truncated: bool) -> None:
     """Record whether the latest response for a research role was truncated.
 
