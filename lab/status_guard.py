@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from lab.completion_integrity import load_bearing_structured_incomplete
 from lab.evidence import Evidence, evidence_from_tool_result, validate_evidence_binding
 from lab.json_io import IncompleteJSONObject
 from lab.research_contract import ResearchContract
@@ -33,8 +34,11 @@ def choose_status(
     """Return the strongest status justified by machine-observable evidence."""
 
     requested = str(requested or "OPEN").upper()
-    verifier_incomplete = isinstance(verifier, IncompleteJSONObject)
-    critic_incomplete = isinstance(critic, IncompleteJSONObject)
+    completion = load_bearing_structured_incomplete()
+    proposer_incomplete = bool(completion.get("proposer"))
+    verifier_incomplete = bool(completion.get("verifier")) or isinstance(verifier, IncompleteJSONObject)
+    critic_incomplete = bool(completion.get("critic")) or isinstance(critic, IncompleteJSONObject)
+    manager_incomplete = bool(completion.get("manager"))
     verifier_verdict = str(verifier.get("verdict") or "INCONCLUSIVE").upper()
     critic_verdict = str(critic.get("verdict") or "REVISE").upper()
     tmeta = dict((tool_result.metadata if tool_result else None) or {})
@@ -95,8 +99,10 @@ def choose_status(
         "computation_ok": computation_ok,
         "verifier_verdict": verifier_verdict,
         "critic_verdict": critic_verdict,
+        "proposer_incomplete": proposer_incomplete,
         "verifier_incomplete": verifier_incomplete,
         "critic_incomplete": critic_incomplete,
+        "manager_incomplete": manager_incomplete,
         "deterministic_counterexample": deterministic_counterexample,
         "deterministic_counterexample_type": evidence_kind if deterministic_counterexample else "",
         "llm_counterexample": llm_counterexample,
@@ -110,14 +116,23 @@ def choose_status(
         "resolution_scope": bound_evidence.resolution_scope if bound_evidence else "",
     }
 
-    if deterministic_counterexample:
-        return GuardDecision(requested, "FAIL", "Deterministically verified counterexample evidence forces FAIL.", requested != "FAIL", metadata)
-
-    if verifier_incomplete or critic_incomplete:
+    if proposer_incomplete:
         return GuardDecision(
             requested,
             "OPEN",
-            "Promotion rejected: verifier/critic structured output was provider-truncated and is incomplete.",
+            "Promotion rejected: the current proposer structured output is provider-truncated/incomplete.",
+            requested != "OPEN",
+            metadata,
+        )
+
+    if deterministic_counterexample:
+        return GuardDecision(requested, "FAIL", "Deterministically verified counterexample evidence forces FAIL.", requested != "FAIL", metadata)
+
+    if verifier_incomplete or critic_incomplete or manager_incomplete:
+        return GuardDecision(
+            requested,
+            "OPEN",
+            "Promotion rejected: a load-bearing structured review/manager response was provider-truncated and is incomplete.",
             requested != "OPEN",
             metadata,
         )
