@@ -21,7 +21,7 @@ from lab.integrity import (
 from lab.project_manager import ProjectManager
 from lab.research_state import ResearchState
 from lab.run_controller import ResearchStopped, RunController
-from lab.tool_registry import EFFECTIVE_AVAILABILITY_ENV
+from lab.tool_registry import EFFECTIVE_AVAILABILITY_ENV, ToolRegistry
 from lab.trace import Trace
 from lab.worker_runtime import WorkerRuntimeBridge
 
@@ -77,35 +77,55 @@ def _availability_row(available: bool, reason: str) -> dict[str, Any]:
     return {"available": bool(available), "reason": str(reason)}
 
 
-def _tool_availability_for_run(root: Path, lab: TheoremResearchLab, runtime_before: dict[str, Any]) -> dict[str, Any]:
+def _availability_map(value: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(value, dict):
+        return {}
+    rows: dict[str, dict[str, Any]] = {}
+    for name, raw in value.items():
+        if isinstance(raw, dict):
+            rows[str(name)] = dict(raw)
+    return rows
+
+
+def _tool_availability_for_run(root: Path, lab: Any, runtime_before: dict[str, Any]) -> dict[str, Any]:
     """Freeze run capabilities and only allow resume-time narrowing.
 
     A newly installed tool never widens a paused/stopped run. Start a new run to
     acquire new capabilities. A tool that disappears on resume is removed from
-    the effective universe immediately.
+    the effective universe immediately. Missing capability surfaces are treated
+    as unavailable rather than crashing or being assumed open.
     """
 
-    runtime = lab.registry.availability()
-    runtime["code_experiment"] = _availability_row(
-        bool(lab.code_workspace.execution_available),
-        (
-            f"container engine kullanılabilir: {lab.code_workspace.container_engine}"
-            if lab.code_workspace.execution_available
-            else "container engine kullanılamıyor"
-        ),
-    )
+    registry = getattr(lab, "registry", None)
+    availability_fn = getattr(registry, "availability", None)
+    if callable(availability_fn):
+        runtime = _availability_map(availability_fn())
+    else:
+        runtime = ToolRegistry().availability()
+
+    workspace = getattr(lab, "code_workspace", None)
+    if workspace is None:
+        runtime["code_experiment"] = _availability_row(False, "code workspace bu runner'da tanımlı değil")
+    else:
+        execution_available = bool(getattr(workspace, "execution_available", False))
+        engine = str(getattr(workspace, "container_engine", "") or "")
+        runtime["code_experiment"] = _availability_row(
+            execution_available,
+            f"container engine kullanılabilir: {engine}" if execution_available else "container engine kullanılamıyor",
+        )
+
     path = root / TOOL_AVAILABILITY_FILE
     previous = read_json_tolerant(path, {})
     previous = dict(previous) if isinstance(previous, dict) else {}
     previous_declared = previous.get("declared_tool_availability")
     status_before = str(runtime_before.get("status") or "NEW").upper()
     resume = status_before in RESUMABLE_TOOL_SNAPSHOT_STATUSES and isinstance(previous_declared, dict)
-    declared = dict(previous_declared) if resume else {name: dict(raw) for name, raw in runtime.items()}
+    declared = _availability_map(previous_declared) if resume else {name: dict(raw) for name, raw in runtime.items()}
 
     effective: dict[str, dict[str, Any]] = {}
     for name in sorted(set(declared) | set(runtime)):
-        drow = declared.get(name) if isinstance(declared.get(name), dict) else {}
-        rrow = runtime.get(name) if isinstance(runtime.get(name), dict) else {}
+        drow = declared.get(name, {})
+        rrow = runtime.get(name, {})
         declared_open = bool(drow.get("available"))
         runtime_open = bool(rrow.get("available"))
         if not declared_open:
@@ -126,7 +146,9 @@ def _tool_availability_for_run(root: Path, lab: TheoremResearchLab, runtime_befo
         "captured_at": _now(),
     }
     atomic_write_json(path, snapshot)
-    lab.registry.set_effective_availability(effective)
+    set_effective = getattr(registry, "set_effective_availability", None)
+    if callable(set_effective):
+        set_effective(effective)
     return snapshot
 
 
@@ -147,9 +169,9 @@ def _persist_tool_availability_in_run_config(root: Path, snapshot: dict[str, Any
 
 
 def _trace_tool_availability(trace: Trace, snapshot: dict[str, Any]) -> None:
-    declared = snapshot.get("declared_tool_availability") or {}
-    runtime = snapshot.get("runtime_tool_availability") or {}
-    effective = snapshot.get("effective_tool_availability") or {}
+    declared = _availability_map(snapshot.get("declared_tool_availability"))
+    runtime = _availability_map(snapshot.get("runtime_tool_availability"))
+    effective = _availability_map(snapshot.get("effective_tool_availability"))
     trace.log(
         "tool_availability",
         declared_tool_availability=declared,
@@ -158,9 +180,9 @@ def _trace_tool_availability(trace: Trace, snapshot: dict[str, Any]) -> None:
         resumed_snapshot=bool(snapshot.get("resumed_snapshot")),
     )
     for name, raw in declared.items():
-        if not isinstance(raw, dict) or not raw.get("available"):
+        if not raw.get("available"):
             continue
-        current = runtime.get(name) if isinstance(runtime.get(name), dict) else {}
+        current = runtime.get(name, {})
         if not current.get("available"):
             trace.log(
                 "tool_availability_narrowed",
@@ -170,9 +192,9 @@ def _trace_tool_availability(trace: Trace, snapshot: dict[str, Any]) -> None:
                 effective=effective.get(name),
             )
     for name, raw in runtime.items():
-        if not isinstance(raw, dict) or not raw.get("available"):
+        if not raw.get("available"):
             continue
-        original = declared.get(name) if isinstance(declared.get(name), dict) else {}
+        original = declared.get(name, {})
         if original and not original.get("available"):
             trace.log(
                 "tool_availability_not_widened",
