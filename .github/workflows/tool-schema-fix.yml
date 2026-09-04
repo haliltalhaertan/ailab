@@ -1,0 +1,82 @@
+name: tool-schema-fix
+
+on:
+  push:
+    branches: [fix/tool-schema-clarity]
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: contains(github.event.head_commit.message, '[tool-schema-bootstrap]')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: fix/tool-schema-clarity
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply tool schema clarity fixes
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          # 1) Trusted script discovery for prompt visibility.
+          path = Path('lab/tools.py')
+          text = path.read_text(encoding='utf-8')
+          old = '''        self.trusted_roots = tuple(roots)\n        self.timeout_s = int(timeout_s)\n\n    def _resolve(self, name: str) -> tuple[Path, Path]:\n'''
+          new = '''        self.trusted_roots = tuple(roots)\n        self.timeout_s = int(timeout_s)\n\n    def available_scripts(self) -> tuple[str, ...]:\n        """Return unambiguous checked-in Python paths accepted by this tool."""\n\n        counts: dict[str, int] = {}\n        for root in self.trusted_roots:\n            if not root.is_dir():\n                continue\n            for script in root.rglob("*.py"):\n                if not script.is_file():\n                    continue\n                relative = script.relative_to(root).as_posix()\n                counts[relative] = counts.get(relative, 0) + 1\n        return tuple(sorted(name for name, count in counts.items() if count == 1))\n\n    def _resolve(self, name: str) -> tuple[Path, Path]:\n'''
+          if old not in text:
+              raise RuntimeError('ScriptTool insertion marker not found')
+          text = text.replace(old, new, 1)
+          path.write_text(text, encoding='utf-8')
+
+          # 2) Show concrete script names and steer authored code to code_experiment.
+          path = Path('lab/prompts.py')
+          text = path.read_text(encoding='utf-8')
+          old = '''    for name in sorted(availability):\n        raw = availability[name]\n        label = "AÇIK" if raw.get("available") else "KAPALI"\n        rows.append(f"- {name}: {label} — {raw.get('reason', '')}")\n'''
+          new = '''    for name in sorted(availability):\n        raw = availability[name]\n        label = "AÇIK" if raw.get("available") else "KAPALI"\n        reason = str(raw.get("reason") or "")\n        if name == "script" and raw.get("available"):\n            scripts = getattr(registry.toolbox, "scripts", None)\n            available_scripts = (\n                scripts.available_scripts()\n                if scripts is not None and hasattr(scripts, "available_scripts")\n                else ()\n            )\n            listed = ", ".join(available_scripts) if available_scripts else "(yok)"\n            reason += f"; checked-in .py dosyaları: {listed}."\n            if registry.is_available("code_experiment"):\n                reason += " Kendi yazdığın/yeni kod için `script` değil `code_experiment` kullan."\n            else:\n                reason += " `script` yeni source kabul etmez; yalnız listedeki checked-in dosyaları çalıştırır."\n        rows.append(f"- {name}: {label} — {reason}")\n'''
+          if old not in text:
+              raise RuntimeError('tool_environment_block marker not found')
+          text = text.replace(old, new, 1)
+          path.write_text(text, encoding='utf-8')
+
+          # 3) Recover the common run_python args/path schema slip without weakening _resolve.
+          path = Path('lab/code_experiment.py')
+          text = path.read_text(encoding='utf-8')
+          old = '''        if name == "run_python":\n            args = action.get("args")\n            return self.run_python(str(action.get("path") or ""), [str(x) for x in args] if isinstance(args, list) else None)\n        return WorkspaceActionResult(False, name or "unknown", error=f"Bilinmeyen action: {name}")\n'''
+          new = '''        if name == "run_python":\n            raw_args = action.get("args")\n            args = [str(x) for x in raw_args] if isinstance(raw_args, list) else []\n            run_path = str(action.get("path") or "").strip()\n            normalized_from_args = False\n            if not run_path and args:\n                candidate = args[0].strip()\n                candidate_path = Path(candidate)\n                if (\n                    candidate\n                    and not candidate_path.is_absolute()\n                    and ".." not in candidate_path.parts\n                    and candidate_path.suffix.lower() == ".py"\n                ):\n                    run_path = candidate\n                    args = args[1:]\n                    normalized_from_args = True\n            if not run_path:\n                return WorkspaceActionResult(\n                    False,\n                    "run_python",\n                    error=(\n                        'run_python için "path" alanı gerekli; script dosyasını args içine koymayın. '\n                        'Örnek: {"action":"run_python","path":"exp_001.py","args":[]}'\n                    ),\n                )\n            result = self.run_python(run_path, args)\n            if normalized_from_args:\n                result.metadata = {**(result.metadata or {}), "normalized_path_from_args": True}\n            return result\n        return WorkspaceActionResult(False, name or "unknown", error=f"Bilinmeyen action: {name}")\n'''
+          if old not in text:
+              raise RuntimeError('run_python dispatch marker not found')
+          text = text.replace(old, new, 1)
+
+          start = text.index('CODE_EXPERIMENT_SYSTEM_PROMPT = """')
+          end_marker = '\n"""\n\n\nclass CodeExperimentRunner:'
+          end = text.index(end_marker, start)
+          prompt = '''CODE_EXPERIMENT_SYSTEM_PROMPT = """Sen CodeExperimentAgent'sın.\nGörevin matematik/teorik CS araştırmasındaki aday iddiaları hesaplamalı deneylerle sınamak.\nDosya işlemleri proje workspace'iyle sınırlıdır. Python yalnız no-network disposable container içinde çalışır.\nHost shell, host filesystem ve API anahtarları erişilebilir değildir.\n\nÖNEMLİ ACTION ŞEMASI:\n- write_file: {"action":"write_file","path":"exp_001.py","content":"..."}\n- run_python: {"action":"run_python","path":"exp_001.py","args":[]}\n- `run_python.args` yalnız script'e verilecek komut satırı argümanlarıdır; script dosya adını `args` içine koyma, `path` alanına koy.\n- read_file/patch_file/list_files aynı workspace içindeki göreli yolları kullanır.\n\nPYTHON POLİTİKASI — kodu yazmadan önce uygula:\n- Dunder isim/attribute kullanma: `__name__`, `__main__`, `__dict__` vb. yasaktır. Top-level kod doğrudan çalışabilir; `if __name__ == "__main__"` yazma.\n- `_` ile başlayan private attribute erişimleri yasaktır.\n- Yalnız izinli saf-kütüphane importlarını kullan; os/sys/subprocess/socket/importlib/ctypes ve ağ/host erişimi yoktur.\n- open/eval/exec/getattr/setattr/__import__/globals/locals/vars gibi dinamik veya host-I/O built-in'leri kullanma.\n\nHer tur SADECE tek JSON object döndür:\n{\n  "action": "write_file|patch_file|read_file|list_files|run_python|finish",\n  "path": "exp_001.py",\n  "content": "write_file için tam içerik",\n  "old": "patch_file için birebir eski parça",\n  "new": "patch_file için yeni parça",\n  "args": [],\n  "summary": "finish için kısa deney özeti"\n}\n\nÖnce küçük, deterministik ve denetlenebilir script yaz. Her tur geçmiş aksiyon/sonuç özetini kullan; aynı hatayı körlemesine tekrarlama.\nfinish ancak en az bir gerçek run_python başarıyla bittikten ve en son run_python denemesi başarılı olduktan sonra kabul edilir.\nFinite computation ispat değildir.\n"""'''
+          text = text[:start] + prompt + text[end + len('\n"""'):]
+          path.write_text(text, encoding='utf-8')
+          PY
+      - name: Install
+        run: python -m pip install -e '.[dev]'
+      - name: Focused tests
+        run: python -m pytest tests/test_code_experiment.py tests/test_tool_registry.py -q -p no:cacheprovider
+      - name: Full offline suite
+        run: python -m pytest tests -q -p no:cacheprovider -k 'not container_integration'
+      - name: Ruff
+        run: python -m ruff check lab tests app.py pages experiments
+      - name: Mypy
+        run: python -m mypy lab
+      - name: Commit fix and remove bootstrap workflow
+        shell: bash
+        run: |
+          rm -f .github/workflows/tool-schema-fix.yml
+          git config user.name 'ailab-maintenance-bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add -A
+          git commit -m 'Clarify deterministic tool schemas for research agents'
+          git push origin HEAD:fix/tool-schema-clarity
