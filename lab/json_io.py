@@ -107,7 +107,63 @@ def parse_json_object(text: str) -> dict[str, Any]:
     raise StructuredOutputError(f"Could not parse required JSON object.{detail}")
 
 
-def repair_instruction(raw: str) -> str:
+def parse_truncated_object_prefix(text: str) -> dict[str, Any]:
+    """Recover only complete top-level fields already present in a cut-off object.
+
+    The function closes the object immediately before an already-observed
+    top-level comma. It never synthesizes a missing key, value or verdict.
+    """
+
+    raw = strip_code_fence(text)
+    start = raw.find("{")
+    if start < 0:
+        raise StructuredOutputError("Truncated response has no JSON object prefix.")
+    source = raw[start:]
+    depth = 0
+    in_string = False
+    escaped = False
+    boundaries: list[int] = []
+    for index, ch in enumerate(source):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch in "{[":
+            depth += 1
+            continue
+        if ch in "}]":
+            depth = max(0, depth - 1)
+            continue
+        if ch == "," and depth == 1:
+            boundaries.append(index)
+
+    for boundary in reversed(boundaries):
+        candidate = repair_json_text(source[:boundary].rstrip() + "}")
+        try:
+            value = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and value:
+            return value
+    raise StructuredOutputError("No complete top-level JSON fields could be recovered from truncated output.")
+
+
+def repair_instruction(raw: str, *, truncated: bool = False) -> str:
+    if truncated:
+        return (
+            "The provider ended the previous response because of a token length limit. "
+            "Recover ONLY keys and values that are already completely present in the malformed prefix. "
+            "Do not guess, create, complete, infer or replace any missing key, value, verdict or claim. "
+            "Omit an incomplete field entirely. Return ONLY one valid JSON object containing that recovered prefix.\n\n"
+            "TRUNCATED RESPONSE:\n" + str(raw)
+        )
     return (
         "Your previous response was required to be one valid JSON object but could not be parsed. "
         "Repair formatting only: preserve the substantive content, keys and verdicts; do not add new claims. "
