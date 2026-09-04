@@ -44,6 +44,7 @@ def test_build_cards_reduces_stream_to_one_done_card():
             "type": "llm_call",
             "agent": "Theorist",
             "model": "fake/model",
+            "step_key": "iter:1:proposer",
             "provider_reasoning": "AB final",
             "output": "final answer",
             "total_tokens": 123,
@@ -53,6 +54,23 @@ def test_build_cards_reduces_stream_to_one_done_card():
             "cached_tokens": 4,
             "cost_usd": 0.002,
             "latency_s": 3.5,
+            "finish_reason": "stop",
+            "truncated": False,
+            "requested_max_tokens": 384000,
+            "model_max_completion_tokens": 384000,
+            "max_tokens_source": "catalog",
+            "catalog_source": "memory",
+            "answer_chars": 12,
+            "reasoning_effort_requested": "high",
+            "reasoning_effort_sent": "high",
+            "effort_resolution": "exact",
+            "reasoning_max_tokens_sent": None,
+        },
+        {
+            "type": "truncated_retry",
+            "agent": "Theorist",
+            "step_key": "iter:1:proposer",
+            "outcome": "recovered",
         },
     ]
 
@@ -68,6 +86,16 @@ def test_build_cards_reduces_stream_to_one_done_card():
     assert card.reasoning_tokens == 80
     assert card.cost_usd == 0.002
     assert card.latency_s == 3.5
+    assert card.finish_reason == "stop"
+    assert card.requested_max_tokens == 384000
+    assert card.model_max_completion_tokens == 384000
+    assert card.max_tokens_source == "catalog"
+    assert card.catalog_source == "memory"
+    assert card.answer_chars == 12
+    assert card.reasoning_effort_requested == "high"
+    assert card.reasoning_effort_sent == "high"
+    assert card.effort_resolution == "exact"
+    assert card.truncation_retry == "recovered"
 
 
 def test_build_cards_without_llm_call_stays_running():
