@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-import json
 import time
 from dataclasses import replace
 from typing import Any
@@ -118,9 +116,6 @@ class TheoremResearchLab(_BaseTheoremResearchLab):
         legacy_empty = status == "COMPLETE" and truncated_empty
         same_model = not cached.get("model") or str(cached.get("model")) == str(agent.model or "")
 
-        # PR-C legacy compatibility: the PR-E prompt itself changes the fingerprint.
-        # Replaying the old 703-second empty attempt would be pure cost duplication,
-        # so the same-model legacy failure is historical state, not a candidate.
         if truncated_empty and (same_fingerprint or (legacy_empty and same_model)):
             self._partial_clear(step_key)
             meta = _cached_meta(cached)
@@ -353,10 +348,7 @@ class TheoremResearchLab(_BaseTheoremResearchLab):
             retry_step_key=retry_step,
             agent=agent.name,
             model=agent.model,
-            effort_transition={
-                "first": current_effort,
-                "retry": retry_effort,
-            },
+            effort_transition={"first": current_effort, "retry": retry_effort},
             first=_retry_event_payload(first_meta),
             retry=_retry_event_payload(retry_meta),
             outcome=outcome,
@@ -366,8 +358,6 @@ class TheoremResearchLab(_BaseTheoremResearchLab):
                 f"{agent.name} automatic truncated retry already exhausted; ikinci length+empty yanıtından sonra fail-closed durduruldu."
             )
 
-        # The logical proposal step now reflects the retry result. This is what
-        # _run_inner uses to decide whether a parsed proposal is INCOMPLETE_OUTPUT.
         self._llm_step_meta[step_key] = {
             **retry_meta,
             "truncation_retry": "recovered",
@@ -388,11 +378,7 @@ class TheoremResearchLab(_BaseTheoremResearchLab):
         if bool(retry_meta.get("truncated")):
             return self._parse_truncated_prefix(retry_raw, agent=agent, step_key=retry_step)
 
-        repair_raw = self._call(
-            retry_agent,
-            repair_instruction(retry_raw),
-            f"{retry_step}:json_repair",
-        )
+        repair_raw = self._call(retry_agent, repair_instruction(retry_raw), f"{retry_step}:json_repair")
         try:
             repaired = parse_json_object(repair_raw)
         except StructuredOutputError as exc:
