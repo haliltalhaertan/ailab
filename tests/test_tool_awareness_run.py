@@ -74,7 +74,7 @@ def test_real_theorem_run_fails_closed_when_model_requests_closed_lean(tmp_path:
         "P",
         manager=FakeAgent(
             "manager",
-            ['{"decision":"KEEP","status":"OPEN","reason":"tool unavailable","next_task":"use an available checker"}'],
+            ['{"decision":"KEEP","status":"FAIL","reason":"incorrectly treating unavailable Lean as failure","next_task":"use an available checker"}'],
         ),
         proposer=FakeAgent("proposer", [proposal]),
         critic=FakeAgent(
@@ -99,6 +99,8 @@ def test_real_theorem_run_fails_closed_when_model_requests_closed_lean(tmp_path:
     trace_text = trace.path.read_text(encoding="utf-8")
     assert "frozen Lean off" in trace_text
     assert '"tool_unavailable": true' in trace_text
+    assert '"requested": "FAIL"' in trace_text
+    assert '"granted": "OPEN"' in trace_text
 
 
 def test_real_theorem_run_uses_open_tropical_checker_and_promotes_computation(tmp_path: Path):
