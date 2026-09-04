@@ -16,19 +16,30 @@ PILOT_EVIDENCE_KINDS = {
 PILOT_SOURCE_ORIGINS = {"BUILTIN", "CHECKED_IN"}
 
 
+def _revision_number(value: Any, default: int = 1) -> int:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value if value >= 1 else default
+    if isinstance(value, str):
+        try:
+            parsed = int(value)
+        except ValueError:
+            return default
+        return parsed if parsed >= 1 else default
+    return default
+
+
 def _revision_evidence(revision: dict[str, Any]) -> dict[str, Any] | None:
     raw = revision.get("evidence")
     if not isinstance(raw, dict):
         return None
     evidence = dict(raw)
     expected_hash = str(revision.get("claim_hash") or "")
-    expected_revision = int(revision.get("revision", 1) or 1)
+    expected_revision = _revision_number(revision.get("revision"))
     if str(evidence.get("claim_hash") or "") != expected_hash:
         return None
-    try:
-        evidence_revision = int(evidence.get("revision"))
-    except (TypeError, ValueError):
-        return None
+    evidence_revision = _revision_number(evidence.get("revision"), default=0)
     if evidence_revision != expected_revision:
         return None
     return evidence
@@ -61,7 +72,7 @@ def ledger_records(
             records.append(
                 {
                     "item_id": item.id,
-                    "revision": int(revision.get("revision", 1) or 1),
+                    "revision": _revision_number(revision.get("revision")),
                     "record_kind": "conjecture",
                     "claim": claim,
                     "claim_hash": str(revision.get("claim_hash") or ""),
