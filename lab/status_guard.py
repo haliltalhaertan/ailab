@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from lab.evidence import Evidence, evidence_from_tool_result, validate_evidence_binding
+from lab.ledger_semantics import active_revision_binding
 from lab.research_contract import ResearchContract
 from lab.tools import ToolResult
 
@@ -36,15 +37,39 @@ def choose_status(
     verifier_verdict = str(verifier.get("verdict") or "INCONCLUSIVE").upper()
     critic_verdict = str(critic.get("verdict") or "REVISE").upper()
     tmeta = dict((tool_result.metadata if tool_result else None) or {})
+    binding = active_revision_binding()
+    effective_revision = expected_revision
+    binding_matches_claim = bool(
+        expected_claim_hash
+        and str(binding.get("claim_hash") or "") == str(expected_claim_hash)
+    )
+    if effective_revision is None and binding_matches_claim and binding.get("revision") is not None:
+        effective_revision = int(binding["revision"])
+
     bound_evidence = evidence
     if bound_evidence is None and tool_result is not None:
         bound_evidence = evidence_from_tool_result(tool_result, contract=contract)
+    # The theorem engine produces this Evidence from the current tool result in
+    # the same context. Bind legacy/unannotated fresh evidence once, here. A
+    # historical Evidence object already carrying claim_hash/revision is never
+    # rebound, so stale evidence cannot cross a revision boundary.
+    if (
+        bound_evidence is not None
+        and binding_matches_claim
+        and not bound_evidence.claim_hash
+        and bound_evidence.revision is None
+    ):
+        bound_evidence = replace(
+            bound_evidence,
+            claim_hash=str(expected_claim_hash or ""),
+            revision=effective_revision,
+        )
     if bound_evidence is not None:
         bound_evidence = validate_evidence_binding(
             bound_evidence,
             contract=contract,
-            expected_claim_hash=expected_claim_hash,
-            expected_revision=expected_revision,
+            expected_claim_hash=expected_claim_hash if bound_evidence.claim_hash else None,
+            expected_revision=effective_revision if bound_evidence.revision is not None else None,
         )
 
     claim_hash_matches = bool(
@@ -96,7 +121,7 @@ def choose_status(
         "claim_hash_matches": claim_hash_matches,
         "expected_claim_hash": expected_claim_hash,
         "actual_claim_hash": str(tmeta.get("claim_hash") or ""),
-        "expected_revision": expected_revision,
+        "expected_revision": effective_revision,
         "actual_evidence_revision": bound_evidence.revision if bound_evidence else None,
         "evidence_claim_hash": bound_evidence.claim_hash if bound_evidence else "",
         "computation_ok": computation_ok,
