@@ -27,13 +27,14 @@ def tool_environment_block(registry: ToolRegistry | None) -> str:
     lean_open = bool((availability.get("lean_draft") or {}).get("available"))
     if lean_open:
         lean_rule = (
-            "Lean bu koşuda kullanılabilir. lean_draft kullanırsan dosyada tam olarak BİR top-level theorem/lemma declaration olsun; "
+            "Lean bu koşuda yeni formal doğrulama için kullanılabilir. lean_draft kullanırsan dosyada tam olarak BİR top-level theorem/lemma declaration olsun; "
             "yardımcı lemma gerekiyorsa aynı theorem içinde `have` kullan. İkinci bir `theorem`/`lemma` satırı yazma."
         )
     else:
         lean_rule = (
-            "Bu koşuda formal doğrulama (Lean) YOK; PROVEN bu araç evreninde ulaşılamaz. "
-            "Lean taslağı yazma ve lean_draft isteme. Deterministic Z3/script/checker evidence veya deterministic counterexample hedefle."
+            "Bu koşuda YENİ formal doğrulama (Lean) çalıştırılamaz; yeni Lean taslağı yazma ve yeni lean_draft isteme. "
+            "Ancak aynı run içinde daha önce tamamlanmış, claim-bound ve bütünlük kontrolünden geçen formal evidence tool result olarak yeniden kullanılmışsa "
+            "onu sırf runtime Lean şu an kapalı diye geçersiz sayma. Yeni evidence için deterministic Z3/script/checker veya counterexample hedefle."
         )
     return "TOOL AVAILABILITY (run-scoped effective universe):\n" + "\n".join(rows) + "\n" + lean_rule
 
@@ -126,6 +127,7 @@ def verifier_prompt(
         "A tool failure is NEVER by itself a mathematical FAIL. "
         "A tropical_grid GRID_PASS establishes only finite-grid functional equality on the tested nonnegative weights; it does NOT establish formal monomial-level provenance polynomial equality. "
         "If a formal tool result is present, verify that theorem_type is a faithful formalization of the candidate claim; a compiled unrelated tautology is not evidence for this claim. "
+        "A previously completed claim-bound formal result may remain valid when current Lean execution is unavailable; judge the supplied evidence itself. "
         "Return ONLY JSON: "
         '{"verdict":"PASS|FAIL|INCONCLUSIVE","reason":"...","formal_proof_required":true,"counterexample":""}'
     )
@@ -170,7 +172,10 @@ def manager_prompt(
     lean_manager = (
         "Lean açıktır; PROOF_CANDIDATE/PROVEN yine yalnız gerçek bound formal evidence ile istenebilir."
         if lean_open
-        else "Lean kapalıdır: PROOF_CANDIDATE/PROVEN isteme. Formal yükümlülük varsa next_task içinde 'Lean ortamı gerektirir' diye açıkça etiketle."
+        else (
+            "Yeni Lean çalıştırması kapalıdır: yeni formal doğrulama isteme. PROVEN yalnız Tool alanında daha önce tamamlanmış, "
+            "same-item/same-iteration/same-claim bound formal evidence açıkça mevcutsa istenebilir; aksi halde PROVEN isteme."
+        )
     )
     return (
         f"Frozen problem:\n{problem}\n\nCandidate {item_id}: {claim}\n\n"
