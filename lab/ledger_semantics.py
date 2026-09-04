@@ -14,6 +14,24 @@ FORMAL_VERIFICATION_RE = re.compile(
 )
 VERIFICATION_RE = re.compile(r"\b(?:verified|doğrulanmış)\b", re.IGNORECASE)
 PROVEN_RE = re.compile(r"\b(?:proven|ispatlandı|kanıtlandı)\b", re.IGNORECASE)
+FORMAL_METADATA_KEYS = {
+    "item_id",
+    "claim_sha256",
+    "lean_file",
+    "file",
+    "lean_sha256",
+    "theorem_name",
+    "theorem_type",
+    "iteration",
+    "axioms",
+    "formal_verified",
+    "formal_binding_verified",
+    "axioms_verified",
+    "source_clean",
+    "proof_seal",
+    "evidence_key_mode",
+    "sealed_at",
+}
 
 
 def claim_hash(claim: str) -> str:
@@ -96,6 +114,7 @@ def revision_record(
     meta = dict(metadata or {})
     raw_evidence = meta.get("evidence")
     evidence = dict(raw_evidence) if isinstance(raw_evidence, dict) else None
+    formal_metadata = {key: meta[key] for key in FORMAL_METADATA_KEYS if key in meta}
     return {
         "revision": int(revision),
         "title": str(title),
@@ -105,6 +124,7 @@ def revision_record(
         "created_at": str(created_at),
         "iteration": int(iteration) if iteration is not None else None,
         "evidence": evidence,
+        "formal_metadata": formal_metadata,
         "strategy": meta.get("strategy"),
         "evidence_needed": list(meta.get("evidence_needed") or []),
         "tool_request_summary": dict(meta.get("tool_request_summary") or {}),
@@ -149,21 +169,8 @@ def clear_revision_bound_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     blocked = {
         "evidence",
         "status_guard",
-        "formal_verified",
-        "formal_binding_verified",
-        "axioms_verified",
-        "source_clean",
-        "proof_seal",
-        "evidence_key_mode",
-        "sealed_at",
-        "lean_file",
-        "file",
-        "lean_sha256",
-        "claim_sha256",
+        *FORMAL_METADATA_KEYS,
         "claim_hash",
-        "theorem_name",
-        "theorem_type",
-        "axioms",
     }
     return {key: value for key, value in metadata.items() if key not in blocked}
 
@@ -194,6 +201,7 @@ def persist_tool_artifact(
 ) -> dict[str, Any]:
     """Persist reviewable tool source outside ledger metadata and return provenance."""
 
+    root_path = Path(root)
     request = dict(tool_request or {})
     metadata = dict(tool_result_metadata or {})
     tool = str(request.get("tool") or "none").strip().lower()
@@ -205,17 +213,17 @@ def persist_tool_artifact(
     }
     if tool in {"lean", "lean_draft"} and str(request.get("source") or ""):
         target = _immutable_write(
-            Path(root) / "formal" / item_id / f"r{int(revision)}.lean",
+            root_path / "formal" / item_id / f"r{int(revision)}.lean",
             str(request["source"]),
         )
-        summary["artifact_path"] = str(target.relative_to(Path(root)))
+        summary["artifact_path"] = str(target.relative_to(root_path))
         summary["sha256"] = sha256_file(target)
     elif tool == "z3" and str(request.get("smt2") or ""):
         target = _immutable_write(
-            Path(root) / "formal" / item_id / f"r{int(revision)}.smt2",
+            root_path / "formal" / item_id / f"r{int(revision)}.smt2",
             str(request["smt2"]),
         )
-        summary["artifact_path"] = str(target.relative_to(Path(root)))
+        summary["artifact_path"] = str(target.relative_to(root_path))
         summary["sha256"] = sha256_file(target)
     elif tool == "script":
         summary["artifact_path"] = str(request.get("name") or "")
