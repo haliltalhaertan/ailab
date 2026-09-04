@@ -119,6 +119,8 @@ def test_run_can_reach_proven_with_bound_lean_evidence(tmp_path, monkeypatch):
     assert item.metadata["lean_sha256"]
     assert item.metadata["claim_hash"] == content_fingerprint("claim:v1", item.claim)
     assert item.metadata["claim_sha256"] == hashlib.sha256(item.claim.encode("utf-8")).hexdigest()
+    assert item.metadata["evidence"]["claim_hash"] == content_fingerprint("claim:v1", item.claim)
+    assert item.metadata["evidence"]["revision"] == 1
 
 
 def test_run_rejects_lean_sorry_warning(tmp_path, monkeypatch):
@@ -279,3 +281,60 @@ def test_resume_rejects_cached_proof_after_bound_lean_sha_changes(tmp_path, monk
     assert item.status != "PROVEN"
     assert item.metadata.get("formal_verified") is False
     assert "Stored PROVEN downgraded" in item.metadata.get("integrity_warning", "")
+
+
+def test_proven_revision_one_cannot_promote_revision_two_without_fresh_evidence(tmp_path, monkeypatch):
+    monkeypatch.setenv("LAB_ALLOW_HOST_LEAN", "1")
+    monkeypatch.setattr(LeanTool, "_run_lean", _clean_lean)
+    state = ResearchState(tmp_path / "state")
+
+    _run(tmp_path, state, _proposal("First claim"), name="revision-one")
+    first = state.list_items(kind="conjecture")[0]
+    assert first.status == "PROVEN"
+    assert first.current_revision == 1
+    assert first.metadata["evidence"]["revision"] == 1
+
+    revised_proposal = {
+        "title": "Bound theorem revised",
+        "claim": "Second claim",
+        "revises": first.id,
+        "strategy": "revise the statement and require fresh evidence",
+        "evidence_needed": ["fresh formal proof"],
+        "tool_request": {"tool": "none"},
+    }
+    trace = Trace("revision-two", out_dir=tmp_path / "runs")
+    lab = TheoremResearchLab(trace, state, literature=EmptyLiterature())
+    lab.run(
+        "P",
+        manager=FakeAgent(
+            "ResearchManager",
+            ['{"decision":"KEEP","status":"PROVEN","reason":"try old proof","next_task":"fresh proof"}'],
+        ),
+        proposer=FakeAgent("Theorist", [json.dumps(revised_proposal)]),
+        critic=FakeAgent(
+            "AdversarialCritic",
+            ['{"verdict":"KEEP","reason":"revision needs fresh evidence","counterexample":""}'],
+        ),
+        verifier=FakeAgent(
+            "VerificationEngineer",
+            ['{"verdict":"PASS","reason":"LLM opinion only","formal_proof_required":true,"counterexample":""}'],
+        ),
+        auditor=FakeAgent("IndependentAuditor", ["PASS"]),
+        iterations=2,
+        checkpoint_every=0,
+    )
+    trace.close()
+
+    current = state.get(first.id)
+    assert current.current_revision == 2
+    assert current.status == "OPEN"
+    assert current.revisions[0]["status"] == "PROVEN"
+    assert current.revisions[1]["status"] == "OPEN"
+    assert current.revisions[0]["claim"] == "First claim"
+    assert current.revisions[1]["claim"] == "Second claim"
+    assert current.revisions[0]["claim_hash"] != current.revisions[1]["claim_hash"]
+    assert "evidence" not in current.metadata
+    assert "proof_seal" not in current.metadata
+    trace_text = trace.path.read_text(encoding="utf-8")
+    assert '"type": "item_revision_added"' in trace_text
+    assert '"granted": "OPEN"' in trace_text
