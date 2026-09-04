@@ -72,6 +72,20 @@ class ScriptTool:
         self.trusted_roots = tuple(roots)
         self.timeout_s = int(timeout_s)
 
+    def available_scripts(self) -> tuple[str, ...]:
+        """Return unambiguous checked-in Python paths accepted by this tool."""
+
+        counts: dict[str, int] = {}
+        for root in self.trusted_roots:
+            if not root.is_dir():
+                continue
+            for script in root.rglob("*.py"):
+                if not script.is_file():
+                    continue
+                relative = script.relative_to(root).as_posix()
+                counts[relative] = counts.get(relative, 0) + 1
+        return tuple(sorted(name for name, count in counts.items() if count == 1))
+
     def _resolve(self, name: str) -> tuple[Path, Path]:
         requested = Path(str(name or ""))
         if requested.is_absolute() or ".." in requested.parts:

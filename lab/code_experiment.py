@@ -458,8 +458,35 @@ class GuardedExperimentWorkspace:
         if name == "list_files":
             return self.list_files()
         if name == "run_python":
-            args = action.get("args")
-            return self.run_python(str(action.get("path") or ""), [str(x) for x in args] if isinstance(args, list) else None)
+            raw_args = action.get("args")
+            args = [str(x) for x in raw_args] if isinstance(raw_args, list) else []
+            run_path = str(action.get("path") or "").strip()
+            normalized_from_args = False
+            if not run_path and args:
+                candidate = args[0].strip()
+                candidate_path = Path(candidate)
+                if (
+                    candidate
+                    and not candidate_path.is_absolute()
+                    and ".." not in candidate_path.parts
+                    and candidate_path.suffix.lower() == ".py"
+                ):
+                    run_path = candidate
+                    args = args[1:]
+                    normalized_from_args = True
+            if not run_path:
+                return WorkspaceActionResult(
+                    False,
+                    "run_python",
+                    error=(
+                        'run_python için "path" alanı gerekli; script dosyasını args içine koymayın. '
+                        'Örnek: {"action":"run_python","path":"exp_001.py","args":[]}'
+                    ),
+                )
+            result = self.run_python(run_path, args)
+            if normalized_from_args:
+                result.metadata = {**(result.metadata or {}), "normalized_path_from_args": True}
+            return result
         return WorkspaceActionResult(False, name or "unknown", error=f"Bilinmeyen action: {name}")
 
 
@@ -467,6 +494,18 @@ CODE_EXPERIMENT_SYSTEM_PROMPT = """Sen CodeExperimentAgent'sın.
 Görevin matematik/teorik CS araştırmasındaki aday iddiaları hesaplamalı deneylerle sınamak.
 Dosya işlemleri proje workspace'iyle sınırlıdır. Python yalnız no-network disposable container içinde çalışır.
 Host shell, host filesystem ve API anahtarları erişilebilir değildir.
+
+ÖNEMLİ ACTION ŞEMASI:
+- write_file: {"action":"write_file","path":"exp_001.py","content":"..."}
+- run_python: {"action":"run_python","path":"exp_001.py","args":[]}
+- `run_python.args` yalnız script'e verilecek komut satırı argümanlarıdır; script dosya adını `args` içine koyma, `path` alanına koy.
+- read_file/patch_file/list_files aynı workspace içindeki göreli yolları kullanır.
+
+PYTHON POLİTİKASI — kodu yazmadan önce uygula:
+- Dunder isim/attribute kullanma: `__name__`, `__main__`, `__dict__` vb. yasaktır. Top-level kod doğrudan çalışabilir; `if __name__ == "__main__"` yazma.
+- `_` ile başlayan private attribute erişimleri yasaktır.
+- Yalnız izinli saf-kütüphane importlarını kullan; os/sys/subprocess/socket/importlib/ctypes ve ağ/host erişimi yoktur.
+- open/eval/exec/getattr/setattr/__import__/globals/locals/vars gibi dinamik veya host-I/O built-in'leri kullanma.
 
 Her tur SADECE tek JSON object döndür:
 {
