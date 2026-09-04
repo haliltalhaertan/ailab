@@ -9,7 +9,7 @@ from lab.run_controller import ResearchPaused, ResearchStopped
 from lab.theorem_recovery import TheoremResearchLab
 from lab.tool_registry import ToolRegistry
 from lab.tools import LeanTool, ResearchToolbox, ScriptTool, ToolResult, TropicalGridTool, Z3Tool
-from lab.trace import Trace
+from lab.trace_completion import Trace
 
 __all__ = [
     "Agent",
