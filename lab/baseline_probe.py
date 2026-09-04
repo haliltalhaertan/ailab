@@ -16,7 +16,7 @@ from lab.agent import Agent
 from lab.literature import LiteratureClient
 from lab.prompts import ROLE_LIBRARY
 from lab.research_state import ResearchState
-from lab.trace_completion import Trace
+from lab.trace import Trace
 
 
 TOY_PROBLEM = (

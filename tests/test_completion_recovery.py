@@ -67,7 +67,7 @@ def _lab(tmp_path: Path, name: str = "recovery") -> tuple[TheoremResearchLab, Tr
 
 
 def test_length_empty_retries_once_and_preserves_original_agent(tmp_path: Path, monkeypatch):
-    monkeypatch.setattr("lab.theorem_recovery.next_lower_supported_effort", lambda model, effort: "medium")
+    monkeypatch.setattr("lab.theorem_engine.next_lower_supported_effort", lambda model, effort: "medium")
     client = SequenceClient(
         [
             _response("", "length", effort="high", cost=0.10),
@@ -113,7 +113,7 @@ def test_truncated_nonempty_prefix_keeps_pr_c_path_without_retry(tmp_path: Path)
 
 
 def test_second_length_empty_exhausts_retry_and_resume_makes_zero_calls(tmp_path: Path, monkeypatch):
-    monkeypatch.setattr("lab.theorem_recovery.next_lower_supported_effort", lambda model, effort: effort)
+    monkeypatch.setattr("lab.theorem_engine.next_lower_supported_effort", lambda model, effort: effort)
     client = SequenceClient([_response("", "length"), _response("", "length")])
     agent = _agent(client)
     lab, trace = _lab(tmp_path, "first")
@@ -134,7 +134,7 @@ def test_second_length_empty_exhausts_retry_and_resume_makes_zero_calls(tmp_path
 
 
 def test_legacy_complete_length_empty_skips_original_paid_call_even_after_prompt_fingerprint_change(tmp_path: Path, monkeypatch):
-    monkeypatch.setattr("lab.theorem_recovery.next_lower_supported_effort", lambda model, effort: effort)
+    monkeypatch.setattr("lab.theorem_engine.next_lower_supported_effort", lambda model, effort: effort)
     client = SequenceClient([_response('{"title":"Recovered","claim":"C"}', "stop")])
     agent = _agent(client)
     lab, trace = _lab(tmp_path, "legacy")
