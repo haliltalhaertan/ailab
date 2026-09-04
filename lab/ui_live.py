@@ -27,6 +27,15 @@ class CardState:
     finish_reason: str | None = None
     truncated: bool = False
     requested_max_tokens: int | None = None
+    model_max_completion_tokens: int | None = None
+    max_tokens_source: str = "provider_default"
+    catalog_source: str = "unavailable"
+    answer_chars: int = 0
+    reasoning_effort_requested: str | None = None
+    reasoning_effort_sent: str | None = None
+    effort_resolution: str = "provider_default"
+    reasoning_max_tokens_sent: int | None = None
+    truncation_retry: str | None = None
     expected_min_tokens: int | None = None
     expected_max_tokens: int | None = None
     over_budget: bool = False
@@ -72,10 +81,13 @@ def _apply_card_events(cards: list[CardState], events: list[dict[str, Any]]) -> 
 
     for event in events:
         kind = str(event.get("type") or "")
-        if kind not in {"agent_start", "agent_stream", "llm_call", "agent_error"}:
+        if kind not in {"agent_start", "agent_stream", "llm_call", "agent_error", "truncated_retry"}:
             continue
-        state = get_state(event)
+        state = get_state(event, create=kind != "truncated_retry")
         if state is None:
+            continue
+        if kind == "truncated_retry":
+            state.truncation_retry = str(event.get("outcome") or "") or None
             continue
         if event.get("agent"):
             state.agent = str(event["agent"])
@@ -112,6 +124,30 @@ def _apply_card_events(cards: list[CardState], events: list[dict[str, Any]]) -> 
             state.finish_reason = str(event["finish_reason"]) if event.get("finish_reason") is not None else None
             state.truncated = bool(event.get("truncated"))
             state.requested_max_tokens = int(event["requested_max_tokens"]) if event.get("requested_max_tokens") is not None else None
+            state.model_max_completion_tokens = (
+                int(event["model_max_completion_tokens"])
+                if event.get("model_max_completion_tokens") is not None
+                else None
+            )
+            state.max_tokens_source = str(event.get("max_tokens_source") or "provider_default")
+            state.catalog_source = str(event.get("catalog_source") or "unavailable")
+            state.answer_chars = int(event.get("answer_chars", len(str(event.get("output") or ""))) or 0)
+            state.reasoning_effort_requested = (
+                str(event["reasoning_effort_requested"])
+                if event.get("reasoning_effort_requested") is not None
+                else None
+            )
+            state.reasoning_effort_sent = (
+                str(event["reasoning_effort_sent"])
+                if event.get("reasoning_effort_sent") is not None
+                else None
+            )
+            state.effort_resolution = str(event.get("effort_resolution") or "provider_default")
+            state.reasoning_max_tokens_sent = (
+                int(event["reasoning_max_tokens_sent"])
+                if event.get("reasoning_max_tokens_sent") is not None
+                else None
+            )
             budget = event.get("budget") or {}
             state.expected_min_tokens = int(budget["expected_min"]) if budget.get("expected_min") is not None else None
             state.expected_max_tokens = int(budget["expected_max"]) if budget.get("expected_max") is not None else None
@@ -182,10 +218,16 @@ def stage_timeline(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     if start.get("ts")
                     else float(event.get("latency_s", 0.0) or 0.0),
                     "total_tokens": int(event.get("total_tokens", 0) or 0),
+                    "completion_tokens": int(event.get("completion_tokens", 0) or 0),
                     "reasoning_tokens": int(event.get("reasoning_tokens", 0) or 0),
+                    "answer_chars": int(event.get("answer_chars", 0) or 0),
                     "cost_usd": event.get("cost_usd"),
                     "finish_reason": event.get("finish_reason"),
                     "truncated": bool(event.get("truncated")),
+                    "requested_max_tokens": event.get("requested_max_tokens"),
+                    "model_max_completion_tokens": event.get("model_max_completion_tokens"),
+                    "max_tokens_source": event.get("max_tokens_source"),
+                    "catalog_source": event.get("catalog_source"),
                     "over_budget": bool(budget.get("over_budget")),
                     "expected_max": budget.get("expected_max"),
                     "index": start.get("index", event.get("index")),

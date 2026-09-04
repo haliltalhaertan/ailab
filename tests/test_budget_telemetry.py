@@ -56,14 +56,15 @@ def test_emergency_max_tokens_is_absent_by_default(monkeypatch):
     assert response.finish_reason == "stop"
 
 
-def test_emergency_max_tokens_is_sent_only_when_configured(monkeypatch):
+def test_emergency_ceiling_does_not_manufacture_unknown_model_limit(monkeypatch):
     monkeypatch.setenv("LAB_EMERGENCY_MAX_TOKENS", "9000")
     client, fake = _client()
 
     response = client.complete([{"role": "user", "content": "p"}], model="fake/model")
 
-    assert fake.completions.kwargs["max_tokens"] == 9000
-    assert response.requested_max_tokens == 9000
+    assert "max_tokens" not in fake.completions.kwargs
+    assert response.requested_max_tokens is None
+    assert response.max_tokens_source == "provider_default"
 
 
 def test_emergency_ceiling_only_narrows_an_explicit_cap(monkeypatch):
@@ -78,6 +79,7 @@ def test_emergency_ceiling_only_narrows_an_explicit_cap(monkeypatch):
 
     assert fake.completions.kwargs["max_tokens"] == 9000
     assert response.requested_max_tokens == 9000
+    assert response.max_tokens_source == "explicit+emergency"
 
 
 def test_expected_token_ranges_are_observational_only():
@@ -126,6 +128,11 @@ def test_trace_records_finish_reason_truncation_and_unusual_cost(tmp_path, monke
         latency_s=1.0,
         finish_reason="length",
         requested_max_tokens=9000,
+        model_max_completion_tokens=12000,
+        max_tokens_source="catalog+emergency",
+        catalog_source="memory",
+        reasoning_effort_sent="high",
+        effort_resolution="exact",
     )
 
     trace.agent_call("Theorist", "fake/model", 0.2, [{"role": "user", "content": "p"}], response)
