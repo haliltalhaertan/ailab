@@ -77,8 +77,10 @@ class Evidence:
     input_sha256: str
     output_sha256: str
     tool_sha256: str
+    claim_hash: str = ""
+    revision: int | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
-    evidence_version: int = 1
+    evidence_version: int = 2
 
     def __post_init__(self) -> None:
         if self.kind not in EVIDENCE_KINDS:
@@ -95,6 +97,8 @@ class Evidence:
             raise ValueError("EXHAUSTIVE evidence requires exhaustive=True")
         if self.kind == "DETERMINISTIC_COUNTEREXAMPLE" and self.witness is None:
             raise ValueError("deterministic counterexample requires a witness")
+        if self.revision is not None and int(self.revision) < 1:
+            raise ValueError("evidence revision must be >= 1")
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -222,6 +226,8 @@ def evidence_from_tool_result(
     request: dict[str, Any] | None = None,
     contract: "ResearchContract | None" = None,
     target_id: str | None = None,
+    claim_hash: str | None = None,
+    revision: int | None = None,
 ) -> Evidence:
     kind, exhaustive, witness, metadata = _classify(result)
 
@@ -291,6 +297,8 @@ def evidence_from_tool_result(
         input_sha256=input_sha,
         output_sha256=output_sha,
         tool_sha256=_tool_sha(result),
+        claim_hash=str(claim_hash or ""),
+        revision=int(revision) if revision is not None else None,
         metadata=metadata,
     )
 
@@ -299,9 +307,15 @@ def validate_evidence_binding(
     evidence: Evidence,
     *,
     contract: "ResearchContract | None" = None,
+    expected_claim_hash: str | None = None,
+    expected_revision: int | None = None,
 ) -> Evidence:
     if evidence.termination_reason != "completed":
         return evidence.downgrade("termination was not completed", downgraded_from=evidence.kind)
+    if expected_claim_hash is not None and evidence.claim_hash != str(expected_claim_hash):
+        return evidence.downgrade("claim hash mismatch", downgraded_from=evidence.kind)
+    if expected_revision is not None and evidence.revision != int(expected_revision):
+        return evidence.downgrade("revision mismatch", downgraded_from=evidence.kind)
     if evidence.source_origin == "GENERATED" and evidence.kind not in {
         "NUMERICAL_PASS",
         "SOLVER_RESULT",
