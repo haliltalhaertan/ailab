@@ -237,14 +237,14 @@ def persist_tool_artifact(
             root_path / "formal" / item_id / f"r{int(revision)}.lean",
             str(request["source"]),
         )
-        summary["artifact_path"] = str(target.relative_to(root_path))
+        summary["artifact_path"] = target.relative_to(root_path).as_posix()
         summary["sha256"] = sha256_file(target)
     elif tool == "z3" and str(request.get("smt2") or ""):
         target = _immutable_write(
             root_path / "formal" / item_id / f"r{int(revision)}.smt2",
             str(request["smt2"]),
         )
-        summary["artifact_path"] = str(target.relative_to(root_path))
+        summary["artifact_path"] = target.relative_to(root_path).as_posix()
         summary["sha256"] = sha256_file(target)
     elif tool == "script":
         summary["artifact_path"] = str(request.get("name") or "")
