@@ -15,7 +15,6 @@ from lab.ledger_semantics import (
     clear_revision_bound_metadata,
     persist_tool_artifact,
     revision_record,
-    set_active_revision_binding,
     sync_current_revision,
     verification_claim_annotation,
 )
@@ -43,6 +42,20 @@ def _now() -> str:
 def _safe_label(value: str) -> str:
     value = re.sub(r"[^A-Za-z0-9_.-]+", "-", value.strip()).strip("-")
     return value[:80] or "checkpoint"
+
+
+def _revision_number(value: Any, default: int = 1) -> int:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value if value >= 1 else default
+    if isinstance(value, str):
+        try:
+            parsed = int(value)
+        except ValueError:
+            return default
+        return parsed if parsed >= 1 else default
+    return default
 
 
 @dataclass
@@ -179,13 +192,19 @@ class ResearchState:
     def _revision_iteration(raw: dict[str, Any]) -> int | None:
         metadata = dict(raw.get("metadata") or {})
         value = metadata.get("iteration")
-        try:
-            return int(value) if value is not None else None
-        except (TypeError, ValueError):
+        if isinstance(value, bool):
             return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            try:
+                return int(value)
+            except ValueError:
+                return None
+        return None
 
     def _ensure_revision_fields(self, raw: dict[str, Any]) -> None:
-        current = int(raw.get("current_revision", 1) or 1)
+        current = _revision_number(raw.get("current_revision"))
         revisions = raw.get("revisions")
         if not isinstance(revisions, list) or not revisions:
             revisions = [
@@ -241,6 +260,13 @@ class ResearchState:
         revision: int,
         metadata: dict[str, Any],
     ) -> dict[str, Any]:
+        """Validate an already-bound evidence record for the current claim revision.
+
+        The ledger never invents a claim/revision binding. Unbound or stale
+        evidence is removed from promotable metadata and retained only under the
+        rejected evidence audit trail.
+        """
+
         merged = dict(metadata)
         raw_evidence = merged.get("evidence")
         if not isinstance(raw_evidence, dict):
@@ -249,17 +275,11 @@ class ResearchState:
         expected_hash = claim_hash(claim)
         evidence_hash = str(evidence.get("claim_hash") or "")
         evidence_revision = evidence.get("revision")
-        unbound = not evidence_hash and evidence_revision in {None, ""}
+        unbound = not evidence_hash or evidence_revision in {None, ""}
         revision_matches = False
-        if evidence_revision not in {None, ""}:
-            try:
-                revision_matches = int(evidence_revision) == int(revision)
-            except (TypeError, ValueError):
-                revision_matches = False
-        if unbound:
-            evidence["claim_hash"] = expected_hash
-            evidence["revision"] = int(revision)
-        elif evidence_hash != expected_hash or not revision_matches:
+        if not unbound:
+            revision_matches = _revision_number(evidence_revision, default=0) == int(revision)
+        if unbound or evidence_hash != expected_hash or not revision_matches:
             merged.pop("evidence", None)
             rejected = list(merged.get("rejected_revision_evidence") or [])
             rejected.append(evidence)
@@ -271,6 +291,7 @@ class ResearchState:
                 expected_claim_hash=expected_hash,
                 evidence_claim_hash=evidence_hash,
                 evidence_revision=evidence_revision,
+                reason="unbound evidence" if unbound else "claim/revision mismatch",
             )
             return merged
         merged["evidence"] = evidence
@@ -343,7 +364,7 @@ class ResearchState:
                     metadata["integrity_warning"] = f"Stored PROVEN downgraded: {reason}"
                     metadata["formal_verified"] = False
                     item["metadata"] = metadata
-            current = int(item.get("current_revision", 1) or 1)
+            current = _revision_number(item.get("current_revision"))
             revisions = []
             for entry in item.get("revisions", []):
                 revision = dict(entry)
@@ -352,7 +373,7 @@ class ResearchState:
                     if not valid:
                         revision["status"] = "PROOF_CANDIDATE"
                         revision["integrity_warning"] = f"Stored PROVEN revision downgraded: {reason}"
-                        if int(revision.get("revision", 0) or 0) == current:
+                        if _revision_number(revision.get("revision"), default=0) == current:
                             item["status"] = "PROOF_CANDIDATE"
                 revisions.append(revision)
             item["revisions"] = revisions
@@ -369,7 +390,7 @@ class ResearchState:
                 "kind": item["kind"],
                 "title": item["title"],
                 "status": item["status"],
-                "current_revision": int(item.get("current_revision", 1) or 1),
+                "current_revision": _revision_number(item.get("current_revision")),
             }
             for item in data.get("items", [])
         ]
@@ -479,12 +500,13 @@ class ResearchState:
         clean_title = title.strip()
         clean_claim = claim.strip()
         merged_metadata = self._prepare_proposal_metadata(item_id, 1, base_metadata)
-        merged_metadata = self._bind_current_evidence(
-            item_id,
-            clean_claim,
-            1,
-            merged_metadata,
-        )
+        if kind == "conjecture":
+            merged_metadata = self._bind_current_evidence(
+                item_id,
+                clean_claim,
+                1,
+                merged_metadata,
+            )
         merged_metadata = self._annotate_claim(
             item_id,
             clean_title,
@@ -529,18 +551,13 @@ class ResearchState:
         data["items"].append(asdict(item))
         data["events"].append({"ts": _now(), "type": "item_added", "item_id": item.id})
         self._write_state(data)
-        if kind == "conjecture":
-            set_active_revision_binding(item.id, item.claim, item.current_revision)
         return item
 
     def get(self, item_id: str) -> ResearchItem:
         for raw in self._read_state()["items"]:
             if raw["id"] == item_id:
                 self._ensure_revision_fields(raw)
-                item = ResearchItem(**raw)
-                if item.kind == "conjecture":
-                    set_active_revision_binding(item.id, item.claim, item.current_revision)
-                return item
+                return ResearchItem(**raw)
         raise KeyError(item_id)
 
     def revise_item(
@@ -563,7 +580,7 @@ class ResearchState:
             if str(raw.get("kind") or "") != "conjecture":
                 break
             self._ensure_revision_fields(raw)
-            current = int(raw.get("current_revision", 1) or 1)
+            current = _revision_number(raw.get("current_revision"))
             existing_metadata = dict(raw.get("metadata") or {})
             raw["revisions"] = sync_current_revision(
                 list(raw.get("revisions") or []),
@@ -628,9 +645,7 @@ class ResearchState:
                 revision=next_revision,
                 iteration=int(iteration),
             )
-            item = ResearchItem(**raw)
-            set_active_revision_binding(item.id, item.claim, item.current_revision)
-            return item
+            return ResearchItem(**raw)
         self._trace("revision_target_invalid", item_id=item_id, iteration=int(iteration))
         raise KeyError(item_id)
 
@@ -651,12 +666,14 @@ class ResearchState:
             self._ensure_revision_fields(raw)
             effective_status = status or str(raw.get("status") or "OPEN")
             merged_metadata = {**raw.get("metadata", {}), **(metadata or {})}
-            merged_metadata = self._bind_current_evidence(
-                item_id,
-                str(raw.get("claim") or ""),
-                int(raw.get("current_revision", 1) or 1),
-                merged_metadata,
-            )
+            current_revision = _revision_number(raw.get("current_revision"))
+            if str(raw.get("kind") or "") == "conjecture":
+                merged_metadata = self._bind_current_evidence(
+                    item_id,
+                    str(raw.get("claim") or ""),
+                    current_revision,
+                    merged_metadata,
+                )
             merged_metadata = self._annotate_claim(
                 item_id,
                 str(raw.get("title") or ""),
@@ -681,7 +698,7 @@ class ResearchState:
             raw["metadata"] = merged_metadata
             raw["revisions"] = sync_current_revision(
                 list(raw.get("revisions") or []),
-                current_revision=int(raw.get("current_revision", 1) or 1),
+                current_revision=current_revision,
                 title=str(raw.get("title") or ""),
                 claim=str(raw.get("claim") or ""),
                 status=str(raw.get("status") or "OPEN"),
@@ -692,10 +709,7 @@ class ResearchState:
                 {"ts": _now(), "type": "item_updated", "item_id": item_id, "status": status}
             )
             self._write_state(data)
-            item = ResearchItem(**raw)
-            if item.kind == "conjecture":
-                set_active_revision_binding(item.id, item.claim, item.current_revision)
-            return item
+            return ResearchItem(**raw)
         raise KeyError(item_id)
 
     def add_counterexample(
@@ -735,17 +749,6 @@ class ResearchState:
             items = [x for x in items if x.kind == kind]
         if status:
             items = [x for x in items if x.status == status]
-        conjectures = [item for item in items if item.kind == "conjecture"]
-        if conjectures:
-            def iteration_key(item: ResearchItem) -> tuple[int, str]:
-                try:
-                    iteration = int(item.metadata.get("iteration", -1) or -1)
-                except (TypeError, ValueError):
-                    iteration = -1
-                return iteration, item.updated_at
-
-            active = max(conjectures, key=iteration_key)
-            set_active_revision_binding(active.id, active.claim, active.current_revision)
         return items
 
     @staticmethod
@@ -753,7 +756,12 @@ class ResearchState:
         claim = item.claim.replace("\n", " ")
         if len(claim) > claim_limit:
             claim = claim[: claim_limit - 3] + "..."
-        claim_tag = " [İDDİA]" if item.metadata.get("self_verification_claim") and not item.metadata.get("verification_claim_supported") else ""
+        claim_tag = (
+            " [İDDİA]"
+            if item.metadata.get("self_verification_claim")
+            and not item.metadata.get("verification_claim_supported")
+            else ""
+        )
         revision_tag = f" r{item.current_revision}" if item.current_revision > 1 else ""
         return f"[{item.id}] [{item.status}]{revision_tag}{claim_tag} {item.title}: {claim}"
 
@@ -795,7 +803,7 @@ class ResearchState:
                 (item, revision)
                 for item in live
                 for revision in item.revisions
-                if int(revision.get("revision", 0) or 0) != item.current_revision
+                if _revision_number(revision.get("revision"), default=0) != item.current_revision
             ]
             if historical:
                 lines.append("HISTORICAL REVISIONS - evidence remains bound to its own claim_hash:")
