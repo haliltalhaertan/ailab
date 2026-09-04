@@ -198,6 +198,10 @@ def test_markdown_report_exposes_acceptance_metrics() -> None:
                 "agent": "Theorist",
                 "model": "example/model",
                 "step_key": "iter:1:proposer",
+                "completion_tokens": 200,
+                "reasoning_tokens": 150,
+                "answer_chars": 900,
+                "reasoning_completion_ratio": 0.75,
                 "total_tokens": 300,
                 "cost_usd": 0.02,
                 "latency_s": 1.0,
@@ -216,6 +220,8 @@ def test_markdown_report_exposes_acceptance_metrics() -> None:
     assert "`iter:1:proposer`: candidate" in text
     assert "`iter:1:tool`: `z3`" in text
     assert "## Errors\n- none recorded" in text
+    assert "completion=200, reasoning=150, answer_chars=900" in text
+    assert "ratio=0.7500" in text
 
 
 class _FakeClient:
