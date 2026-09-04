@@ -8,6 +8,7 @@ import streamlit as st
 from lab.integrity import project_lock_is_live
 from lab.openrouter_catalog import fetch_openrouter_models
 from lab.project_manager import ProjectManager
+from lab.research_state import ResearchState
 from lab.runtime_health import cleanup_stale_run
 from lab.step_store import StepStore
 from lab.ui_live import render_now_and_timeline
@@ -146,6 +147,42 @@ def live_status() -> None:
 
 live_status()
 
+if experiment_method == "theorem_lab" and (project / "state.json").exists():
+    ledger_state = ResearchState(project)
+    conjectures = ledger_state.list_items(kind="conjecture")
+    st.subheader("İddia revizyonları")
+    st.caption("Her revizyon kendi claim hash'i ve evidence'ı ile ayrı tutulur; eski kanıt yeni revizyona taşınmaz.")
+    if not conjectures:
+        st.caption("Henüz kaydedilmiş conjecture yok.")
+    for item in conjectures:
+        title_col, badge_col = st.columns([5, 1])
+        with title_col:
+            st.markdown(f"**`{item.id}` · {item.title} · Current {item.current_revision}**")
+        with badge_col:
+            if item.metadata.get("self_verification_claim") and not item.metadata.get("verification_claim_supported"):
+                st.badge("İDDİA", color="orange")
+        revision_summary = " · ".join(
+            f"Revision {revision.get('revision', '?')} — {revision.get('status', 'OPEN')}"
+            for revision in item.revisions
+        )
+        st.caption(f"{revision_summary} · Current {item.current_revision}")
+        with st.expander(f"{item.id} revizyon ayrıntıları", expanded=False):
+            rows = []
+            for revision in item.revisions:
+                raw_evidence = revision.get("evidence")
+                evidence_kind = str(raw_evidence.get("kind") or "") if isinstance(raw_evidence, dict) else ""
+                rows.append(
+                    {
+                        "Revision": revision.get("revision"),
+                        "Status": revision.get("status", "OPEN"),
+                        "Current": revision.get("revision") == item.current_revision,
+                        "Claim": revision.get("claim", ""),
+                        "Claim hash": revision.get("claim_hash", ""),
+                        "Evidence": evidence_kind or "—",
+                    }
+                )
+            st.dataframe(rows, width="stretch", hide_index=True)
+
 current_info = pm.get(selected_id)
 running = project_lock_is_live(project)
 left, middle, right = st.columns(3)
@@ -208,6 +245,7 @@ if experiment_method != "theorem_lab":
         retry_request = dict(request)
         retry_request["project_id"] = selected_id
         retry_request["project_uuid"] = project_info.project_uuid
+        retry_request["resume"] = False
         write_worker_request(project, retry_request)
         try:
             pid = launch_worker(selected_id, root=ROOT)
@@ -282,6 +320,7 @@ else:
                 "project_uuid": project_info.project_uuid,
                 "experiment_method": "theorem_lab",
                 "experiment_name": "Teorem Araştırması",
+                "resume": True,
                 "problem": str(config.get("problem") or frozen.get("problem") or ""),
                 "prompt": str(config.get("problem") or frozen.get("problem") or ""),
                 "iterations": int(config.get("iterations", 5)),

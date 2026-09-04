@@ -45,6 +45,7 @@ def proposal_schema(registry: ToolRegistry | None = None) -> dict[str, Any]:
         "title": "...",
         "claim": "...",
         "target_id": "",
+        "revises": "",
         "strategy": "...",
         "evidence_needed": ["..."],
         "tool_request": {
@@ -97,6 +98,9 @@ def proposal_prompt(
         "Produce exactly one research candidate. Do not reopen a FAIL/DROPPED idea listed in the ledger. "
         "When a frozen research contract is present, target_id MUST be one of the OPEN TARGETS shown in the contract block; "
         "do not invent claim_role because code assigns SUBCLAIM/TARGET_RESOLUTION. "
+        "If CURRENT TASK asks you to revise an existing candidate, set `revises` to that exact ledger item_id. Otherwise set it to an empty string. "
+        "A revision is append-only: the item_id stays stable, the new claim gets a new claim_hash/revision and starts OPEN; evidence from an older revision never proves the new text. "
+        "Never invent a revises id; an invalid id is rejected by code. "
         "A REFUTATION_CANDIDATE is still active: when relevant, prioritize checking its claimed counterexample with a deterministic tool instead of treating it as settled. "
         "Separate proved facts from assumptions. If computation/formal checking is useful, request ONE tool from the available tool schema only. "
         "Do not describe your own candidate as verified/proven before deterministic evidence exists; call it an aday/candidate. "
@@ -150,6 +154,8 @@ def critic_prompt(
         f"Frozen previous ledger:\n{ledger}\n\n"
         "Try to refute the candidate: hidden assumption, small counterexample, asymptotic mistake, wrong computational model, known-result risk, "
         "or mismatch between natural-language claim and any supplied formal theorem_type. "
+        "A ledger `[İDDİA]` tag means the canonical title/claim itself uses verified/proven language that is not yet supported by the required machine evidence; do not treat the wording as evidence. "
+        "Historical revision evidence is bound to that revision's claim_hash and cannot be transferred to the current revision. "
         "Return ONLY JSON: "
         '{"verdict":"KEEP|REVISE|KILL","reason":"...","counterexample":""}'
     )
@@ -193,6 +199,7 @@ def manager_prompt(
         "Choose research direction. Status and target transitions are REQUESTS only; code-side evidence guards may downgrade or reject them. "
         "An LLM-written counterexample is only a REFUTATION_CANDIDATE until a deterministic tool verifies it; make deterministic verification the next task rather than treating the claim as dead. "
         "Do not claim PROVEN unless a successful same-item bound formal checker result is explicitly present. "
+        "If decision is REVISE, next_task should name the exact item_id to revise so the next Theorist proposal can set `revises` rather than opening a duplicate item. "
         "If you propose a target transition, put it in target_proposal; code will apply it only when the target-type evidence gate is satisfied. Return ONLY JSON: "
         '{"decision":"KEEP|REVISE|KILL|CHECKPOINT","status":"OPEN|REFUTATION_CANDIDATE|COMPUTATION_PASS|PROOF_CANDIDATE|PROVEN|FAIL|DROPPED",'
         '"reason":"...","next_task":"...","target_proposal":{"target_id":"","status":"CLOSED|FAILED|SUPERSEDED","superseded_by":""}}'
@@ -212,5 +219,6 @@ def checkpoint_prompt(
         f"{label}\n\nFrozen problem:\n{problem}\n\nLedger:\n{ledger}\n{contract_block}\n\n"
         "Audit with zero trust. Look for LLM opinion being treated as evidence, reopened failed ideas, claim/evidence mismatches, "
         "formal statement/claim mismatches, novelty overclaims, and whether pilot_policy/forbidden_claims are being respected. "
+        "Treat `[İDDİA]` as unsupported self-verification wording, not as evidence. Verify that historical revision evidence stays bound to its own claim_hash/revision and was not reused to promote a newer revision. "
         "Return PASS / PASS-WITH-GAPS / FAIL with reasons."
     )

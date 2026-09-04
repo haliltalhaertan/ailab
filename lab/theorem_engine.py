@@ -1094,6 +1094,8 @@ class TheoremResearchLab:
                     metadata={"truncated": True, "completion": "INCOMPLETE_OUTPUT"},
                 )
             claim = item.claim
+            expected_claim_hash = content_fingerprint("claim:v1", claim)
+            expected_revision = int(item.current_revision)
             if contract is not None and target_id is not None:
                 target = contract.target(target_id, require_open=True)
                 role = contract.claim_role(target_id, claim)
@@ -1126,12 +1128,19 @@ class TheoremResearchLab:
                         request=tool_request,
                         contract=contract,
                         target_id=target_id,
+                        claim_hash=expected_claim_hash,
+                        revision=expected_revision,
                     )
                     bound_evidence = replace(
                         bound_evidence,
                         metadata={**bound_evidence.metadata, "item_id": item.id},
                     )
-                    bound_evidence = validate_evidence_binding(bound_evidence, contract=contract)
+                    bound_evidence = validate_evidence_binding(
+                        bound_evidence,
+                        contract=contract,
+                        expected_claim_hash=expected_claim_hash,
+                        expected_revision=expected_revision,
+                    )
                 except (KeyError, ValueError) as exc:
                     self.trace.log(
                         "evidence_binding_rejected",
@@ -1146,6 +1155,8 @@ class TheoremResearchLab:
                         iteration=iteration,
                         item_id=item.id,
                         evidence_kind=bound_evidence.kind,
+                        claim_hash=bound_evidence.claim_hash,
+                        revision=bound_evidence.revision,
                         evidence=bound_evidence.as_dict(),
                     )
 
@@ -1178,7 +1189,6 @@ class TheoremResearchLab:
             requested_status = str(manager_decision.get("status") or "OPEN").upper()
             if tool_result and tool_result.tool == "lean" and tool_result.ok and (tool_result.metadata or {}).get("formal_verified"):
                 requested_status = "PROVEN"
-            expected_claim_hash = content_fingerprint("claim:v1", item.claim)
             if proposal_incomplete:
                 status = "OPEN"
                 status_reason = "INCOMPLETE_OUTPUT cannot be promoted; provider ended the proposer response at a token limit."
@@ -1204,6 +1214,7 @@ class TheoremResearchLab:
                     expected_item_id=item.id,
                     expected_iteration=iteration,
                     expected_claim_hash=expected_claim_hash,
+                    expected_revision=expected_revision,
                     evidence=bound_evidence,
                     contract=contract,
                 )

@@ -2,13 +2,13 @@ import json
 from types import SimpleNamespace
 
 from lab.tool_registry import EFFECTIVE_AVAILABILITY_ENV, ToolRegistry
+from lab.trace import Trace
 from lab.worker import (
     _bind_special_tool_guards,
     _persist_tool_availability_in_run_config,
     _tool_availability_for_run,
     _trace_tool_availability,
 )
-from lab.trace import Trace
 
 
 class FakeRegistry:
@@ -51,6 +51,7 @@ def test_new_run_declares_current_capabilities_and_persists_sidecar(tmp_path):
 
     snapshot = _tool_availability_for_run(tmp_path, lab, {"status": "COMPLETED"})
 
+    assert snapshot["resume_requested"] is False
     assert snapshot["resumed_snapshot"] is False
     assert snapshot["declared_tool_availability"]["lean_draft"]["available"] is False
     assert snapshot["effective_tool_availability"]["z3"]["available"] is True
@@ -65,8 +66,14 @@ def test_resume_does_not_widen_when_a_new_tool_appears(tmp_path):
     _tool_availability_for_run(tmp_path, first, {"status": "NEW"})
 
     resumed = _lab({"lean_draft": _row(True, "Lean installed"), "z3": _row(True, "Z3 on")})
-    snapshot = _tool_availability_for_run(tmp_path, resumed, {"status": "PAUSED_ERROR"})
+    snapshot = _tool_availability_for_run(
+        tmp_path,
+        resumed,
+        {"status": "PAUSED_ERROR"},
+        resume_requested=True,
+    )
 
+    assert snapshot["resume_requested"] is True
     assert snapshot["resumed_snapshot"] is True
     assert snapshot["runtime_tool_availability"]["lean_draft"]["available"] is True
     assert snapshot["declared_tool_availability"]["lean_draft"]["available"] is False
@@ -79,11 +86,33 @@ def test_resume_narrows_when_a_declared_tool_disappears(tmp_path):
     _tool_availability_for_run(tmp_path, first, {"status": "NEW"})
 
     resumed = _lab({"lean_draft": _row(False, "Lean missing"), "z3": _row(True, "Z3 on")})
-    snapshot = _tool_availability_for_run(tmp_path, resumed, {"status": "INTERRUPTED"})
+    snapshot = _tool_availability_for_run(
+        tmp_path,
+        resumed,
+        {"status": "INTERRUPTED"},
+        resume_requested=True,
+    )
 
     assert snapshot["declared_tool_availability"]["lean_draft"]["available"] is True
     assert snapshot["effective_tool_availability"]["lean_draft"]["available"] is False
     assert "runtime daralması" in snapshot["effective_tool_availability"]["lean_draft"]["reason"]
+
+
+def test_stopped_project_fresh_run_remeasures_capabilities(tmp_path):
+    first = _lab({"lean_draft": _row(False, "Lean off")})
+    _tool_availability_for_run(tmp_path, first, {"status": "NEW"})
+
+    fresh = _lab({"lean_draft": _row(True, "Lean installed")})
+    snapshot = _tool_availability_for_run(
+        tmp_path,
+        fresh,
+        {"status": "STOPPED"},
+        resume_requested=False,
+    )
+
+    assert snapshot["resumed_snapshot"] is False
+    assert snapshot["declared_tool_availability"]["lean_draft"]["available"] is True
+    assert snapshot["effective_tool_availability"]["lean_draft"]["available"] is True
 
 
 def test_completed_run_starts_a_fresh_capability_snapshot(tmp_path):
@@ -134,6 +163,7 @@ def test_trace_records_narrowing_and_refuses_silent_widening(tmp_path):
             "lean_draft": _row(False, "runtime daralması"),
             "script": _row(False, "run başında kapalı"),
         },
+        "resume_requested": True,
         "resumed_snapshot": True,
     }
 
@@ -142,6 +172,7 @@ def test_trace_records_narrowing_and_refuses_silent_widening(tmp_path):
     text = trace.path.read_text(encoding="utf-8")
 
     assert '"type": "tool_availability"' in text
+    assert '"resume_requested": true' in text
     assert '"type": "tool_availability_narrowed"' in text
     assert '"type": "tool_availability_not_widened"' in text
 

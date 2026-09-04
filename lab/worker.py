@@ -153,13 +153,19 @@ def _bind_special_tool_guards(lab: Any, snapshot: dict[str, Any]) -> None:
         )
 
 
-def _tool_availability_for_run(root: Path, lab: Any, runtime_before: dict[str, Any]) -> dict[str, Any]:
-    """Freeze run capabilities and only allow resume-time narrowing.
+def _tool_availability_for_run(
+    root: Path,
+    lab: Any,
+    runtime_before: dict[str, Any],
+    *,
+    resume_requested: bool = False,
+) -> dict[str, Any]:
+    """Freeze run capabilities and only allow explicit resume-time narrowing.
 
-    A newly installed tool never widens a paused/stopped run. Start a new run to
-    acquire new capabilities. A tool that disappears on resume is removed from
-    the effective universe immediately. Missing capability surfaces are treated
-    as unavailable rather than crashing or being assumed open.
+    A previous capability snapshot is reused only when the worker request is an
+    explicit resume and the previous runtime state is resumable. Merely starting
+    a new run from a STOPPED/INTERRUPTED project always measures a fresh declared
+    universe. A tool that disappears on a true resume is removed immediately.
     """
 
     registry = getattr(lab, "registry", None)
@@ -185,7 +191,11 @@ def _tool_availability_for_run(root: Path, lab: Any, runtime_before: dict[str, A
     previous = dict(previous) if isinstance(previous, dict) else {}
     previous_declared = previous.get("declared_tool_availability")
     status_before = str(runtime_before.get("status") or "NEW").upper()
-    resume = status_before in RESUMABLE_TOOL_SNAPSHOT_STATUSES and isinstance(previous_declared, dict)
+    resume = bool(
+        resume_requested
+        and status_before in RESUMABLE_TOOL_SNAPSHOT_STATUSES
+        and isinstance(previous_declared, dict)
+    )
     declared = _availability_map(previous_declared) if resume else {name: dict(raw) for name, raw in runtime.items()}
 
     effective: dict[str, dict[str, Any]] = {}
@@ -208,6 +218,7 @@ def _tool_availability_for_run(root: Path, lab: Any, runtime_before: dict[str, A
         "declared_tool_availability": declared,
         "runtime_tool_availability": runtime,
         "effective_tool_availability": effective,
+        "resume_requested": bool(resume_requested),
         "resumed_snapshot": bool(resume),
         "captured_at": _now(),
     }
@@ -243,6 +254,7 @@ def _trace_tool_availability(trace: Trace, snapshot: dict[str, Any]) -> None:
         declared_tool_availability=declared,
         runtime_tool_availability=runtime,
         effective_tool_availability=effective,
+        resume_requested=bool(snapshot.get("resume_requested")),
         resumed_snapshot=bool(snapshot.get("resumed_snapshot")),
     )
     for name, raw in declared.items():
@@ -412,7 +424,12 @@ def run_project(project_id: str, *, agent_factory: AgentFactory = _agent) -> int
                 state,
                 code_experiment_settings_override=request.get("code_experiment") if isinstance(request.get("code_experiment"), dict) else None,
             )
-            tool_snapshot = _tool_availability_for_run(root, lab, runtime_prelaunch)
+            tool_snapshot = _tool_availability_for_run(
+                root,
+                lab,
+                runtime_prelaunch,
+                resume_requested=bool(request.get("resume")),
+            )
             _trace_tool_availability(trace, tool_snapshot)
             _bind_special_tool_guards(lab, tool_snapshot)
             os.environ[EFFECTIVE_AVAILABILITY_ENV] = json.dumps(
