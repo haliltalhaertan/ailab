@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from lab.completion_integrity import record_cached_step_completion
 from lab.integrity import EvidenceSigner
 
 
@@ -183,6 +184,7 @@ class StepStore:
             )
         if payload is None or not self._step_valid(key, payload):
             return None
+        record_cached_step_completion(key, payload)
         return payload
 
     def put_step(self, key: str, value: dict[str, Any]) -> None:
