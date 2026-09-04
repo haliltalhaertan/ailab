@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
@@ -32,10 +33,28 @@ FORMAL_METADATA_KEYS = {
     "evidence_key_mode",
     "sealed_at",
 }
+_ACTIVE_REVISION_BINDING: ContextVar[dict[str, Any]] = ContextVar(
+    "ailab_active_revision_binding",
+    default={},
+)
 
 
 def claim_hash(claim: str) -> str:
     return content_fingerprint("claim:v1", str(claim or ""))
+
+
+def set_active_revision_binding(item_id: str, claim: str, revision: int) -> dict[str, Any]:
+    binding = {
+        "item_id": str(item_id),
+        "claim_hash": claim_hash(claim),
+        "revision": int(revision),
+    }
+    _ACTIVE_REVISION_BINDING.set(binding)
+    return binding
+
+
+def active_revision_binding() -> dict[str, Any]:
+    return dict(_ACTIVE_REVISION_BINDING.get())
 
 
 def _evidence_kind(metadata: dict[str, Any] | None) -> str:
@@ -61,7 +80,6 @@ def verification_claim_annotation(
     if FORMAL_VERIFICATION_RE.search(text):
         terms.append("formal_verified")
         requirements.append("FORMAL_PROOF")
-    # Do not double-count the ``verified`` inside ``formally verified``.
     stripped = FORMAL_VERIFICATION_RE.sub("", text)
     if VERIFICATION_RE.search(stripped):
         terms.append("verified")
