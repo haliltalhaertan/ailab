@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from lab.completion_integrity import record_cached_step_completion
+from lab.completion_integrity import record_cached_step_completion, reset_completion_integrity
 from lab.integrity import EvidenceSigner
 
 
@@ -24,6 +24,7 @@ class StepStore:
     """
 
     def __init__(self, project_root: str | Path):
+        reset_completion_integrity()
         self.root = Path(project_root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.path = self.root / "research_steps.sqlite3"
