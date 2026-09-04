@@ -23,7 +23,7 @@ from lab.research_state import ResearchState
 from lab.run_controller import ResearchStopped, RunController
 from lab.tool_registry import EFFECTIVE_AVAILABILITY_ENV, ToolRegistry
 from lab.tools import ToolResult
-from lab.trace import Trace
+from lab.trace_completion import Trace
 from lab.worker_runtime import WorkerRuntimeBridge
 
 
