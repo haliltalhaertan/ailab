@@ -12,11 +12,12 @@ class _FakeCompletions:
                 usage=None,
                 choices=[
                     SimpleNamespace(
+                        finish_reason=None,
                         delta=SimpleNamespace(
                             content="",
                             reasoning="r1",
                             reasoning_details=[{"type": "detail", "data": "d1"}],
-                        )
+                        ),
                     )
                 ],
             ),
@@ -25,11 +26,12 @@ class _FakeCompletions:
                 usage=None,
                 choices=[
                     SimpleNamespace(
+                        finish_reason="length",
                         delta=SimpleNamespace(
                             content="answer",
                             reasoning="r2",
                             reasoning_details=[{"type": "detail", "data": "d2"}],
-                        )
+                        ),
                     )
                 ],
             ),
@@ -62,6 +64,7 @@ def test_reasoning_details_are_not_duplicated_into_stream_callback():
         [{"role": "user", "content": "p"}],
         "fake/model",
         "high",
+        1234,
         lambda channel, delta: seen.append((channel, delta)),
     )
 
@@ -72,3 +75,5 @@ def test_reasoning_details_are_not_duplicated_into_stream_callback():
         {"type": "detail", "data": "d1"},
         {"type": "detail", "data": "d2"},
     ]
+    assert response.finish_reason == "length"
+    assert response.requested_max_tokens == 1234

@@ -43,6 +43,8 @@ EVENT_COUNTERS = (
     "agent_error",
     "agent_retry",
     "step_reused",
+    "unusually_expensive_call",
+    "incomplete_output_not_promotable",
 )
 
 
@@ -131,7 +133,7 @@ def resolve_agent_config(
     *,
     model: str,
     reasoning_effort: str | None,
-    max_tokens: int,
+    max_tokens: int | None,
     agent_config: dict[str, Any] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Resolve a worker_request-style agent dictionary into probe role settings."""
@@ -143,17 +145,45 @@ def resolve_agent_config(
         role_model = str(raw.get("model") or model).strip()
         role_effort_value = raw.get("reasoning_effort", reasoning_effort)
         role_effort = None if role_effort_value in {None, "", "none"} else str(role_effort_value)
-        role_max_tokens = int(raw.get("max_tokens") or max_tokens)
+        raw_max = raw.get("max_tokens") if "max_tokens" in raw else max_tokens
+        role_max_tokens = int(str(raw_max)) if raw_max not in {None, ""} else None
         if not role_model:
             raise ValueError(f"Missing model for baseline role {role}")
-        if role_max_tokens < 128:
-            raise ValueError(f"max_tokens for {role} must be >= 128")
+        if role_max_tokens is not None and role_max_tokens < 128:
+            raise ValueError(f"max_tokens for {role} must be >= 128 when explicitly configured")
         resolved[role] = {
             "model": role_model,
             "reasoning_effort": role_effort,
             "max_tokens": role_max_tokens,
         }
     return resolved
+
+
+def verified_progress_from_events(events: list[dict[str, Any]]) -> int:
+    """Return the code-observable 0–4 progress scale used by fair probes.
+
+    The generic probe only awards levels that are visible in trace evidence. A
+    domain-specific fixture may emit ``verified_progress_claim_match`` after it
+    independently checks that the candidate copied the exact result.
+    """
+
+    progress = 0
+    for event in events:
+        kind = str(event.get("type") or "")
+        if kind == "tool_result" and bool(event.get("ok")):
+            progress = max(progress, 1)
+        elif kind == "tool_result_evidence" and str(event.get("evidence_kind") or "").upper() == "EXACT_PASS":
+            progress = max(progress, 2)
+        elif kind == "verified_progress_claim_match" and bool(event.get("ok", True)):
+            progress = max(progress, 3)
+        elif kind in {"target_transition_applied", "pilot_target_transition_applied"}:
+            detail = event.get("detail") or {}
+            status = str(event.get("status") or (detail.get("status") if isinstance(detail, dict) else "") or "").upper()
+            if status == "CLOSED" or bool((detail.get("closed") if isinstance(detail, dict) else False)):
+                progress = max(progress, 4)
+        elif kind == "run_completed_all_targets_closed":
+            progress = max(progress, 4)
+    return progress
 
 
 def summarize_probe(trace_path: Path, summary_path: Path) -> dict[str, Any]:
@@ -165,6 +195,7 @@ def summarize_probe(trace_path: Path, summary_path: Path) -> dict[str, Any]:
     llm_calls: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
     role_outputs: dict[str, list[dict[str, Any]]] = {}
+    role_budget: dict[str, dict[str, Any]] = {}
     iteration_usage: dict[int, dict[str, Any]] = {}
     active_step_by_agent: dict[str, str] = {}
     probe_config: dict[str, Any] = {}
@@ -216,6 +247,7 @@ def summarize_probe(trace_path: Path, summary_path: Path) -> dict[str, Any]:
         elif event_type == "llm_call":
             agent = str(event.get("agent") or "Agent")
             step_key = active_step_by_agent.get(agent, "")
+            budget = event.get("budget") or {}
             call = {
                 "agent": agent,
                 "step_key": step_key,
@@ -227,6 +259,10 @@ def summarize_probe(trace_path: Path, summary_path: Path) -> dict[str, Any]:
                 "total_tokens": event.get("total_tokens", 0),
                 "cost_usd": event.get("cost_usd"),
                 "latency_s": event.get("latency_s", 0.0),
+                "finish_reason": event.get("finish_reason"),
+                "truncated": bool(event.get("truncated")),
+                "requested_max_tokens": event.get("requested_max_tokens"),
+                "budget": budget,
                 "output_preview": _preview(event.get("output")),
             }
             llm_calls.append(call)
@@ -237,6 +273,27 @@ def summarize_probe(trace_path: Path, summary_path: Path) -> dict[str, Any]:
                     "output_preview": call["output_preview"],
                 }
             )
+            role_row = role_budget.setdefault(
+                agent,
+                {
+                    "calls": 0,
+                    "actual_tokens": 0,
+                    "expected_min": None,
+                    "expected_max": None,
+                    "over_budget_calls": 0,
+                    "truncated_calls": 0,
+                },
+            )
+            role_row["calls"] += 1
+            role_row["actual_tokens"] += int(event.get("total_tokens", 0) or 0)
+            if budget.get("expected_min") is not None:
+                role_row["expected_min"] = int(budget["expected_min"])
+            if budget.get("expected_max") is not None:
+                role_row["expected_max"] = int(budget["expected_max"])
+            if budget.get("over_budget"):
+                role_row["over_budget_calls"] += 1
+            if event.get("truncated"):
+                role_row["truncated_calls"] += 1
             iteration = _iteration_from_step(step_key)
             if iteration is not None:
                 usage = iteration_usage.setdefault(
@@ -294,11 +351,13 @@ def summarize_probe(trace_path: Path, summary_path: Path) -> dict[str, Any]:
         "total_cost_usd": run_summary.get("total_cost_usd", 0.0),
         "cost_complete": run_summary.get("cost_complete", False),
         "event_counts": counts,
+        "verified_progress": verified_progress_from_events(events),
         "iterations": iterations,
         "per_iteration": per_iteration,
         "tool_results": tool_results,
         "llm_calls": llm_calls,
         "role_outputs": role_outputs,
+        "role_budget": role_budget,
         "errors": errors,
         "agent_totals": run_summary.get("agents", {}),
     }
@@ -309,11 +368,12 @@ def _markdown_report(report: dict[str, Any]) -> str:
     requested = int(report.get("requested_iterations", 0) or 0)
     completed = int(report.get("completed_iterations", len(report.get("iterations", []))) or 0)
     lines = [
-        "# ailab two-iteration baseline probe",
+        "# ailab baseline probe",
         "",
         f"- git SHA: `{report['git_sha']}`",
         f"- run ID: `{report['run_id']}`",
         f"- requested/completed iterations: **{requested}/{completed}**",
+        f"- verified progress: **{int(report.get('verified_progress', 0))}/4**",
         f"- LLM calls: **{report['total_calls']}**",
         f"- total tokens: **{report['total_tokens']}**",
         f"- reported cost: **${float(report['total_cost_usd'] or 0.0):.6f}**",
@@ -321,6 +381,8 @@ def _markdown_report(report: dict[str, Any]) -> str:
         f"- JSON parse failures: **{counts['structured_output_parse_failed']}**",
         f"- JSON repairs completed: **{counts['structured_output_repaired']}**",
         f"- JSON repair failures: **{counts['structured_output_repair_failed']}**",
+        f"- incomplete outputs blocked from promotion: **{counts.get('incomplete_output_not_promotable', 0)}**",
+        f"- unusually expensive calls: **{counts.get('unusually_expensive_call', 0)}**",
         f"- guard downgrades: **{counts['status_downgraded_by_guard']}**",
         f"- agent retries: **{counts['agent_retry']}**",
         "",
@@ -331,12 +393,26 @@ def _markdown_report(report: dict[str, Any]) -> str:
         for role, spec in agent_config.items():
             if not isinstance(spec, dict):
                 continue
+            max_label = spec.get("max_tokens") if spec.get("max_tokens") is not None else "provider/default (no role cap)"
             lines.append(
                 f"- `{role}`: `{spec.get('model')}` / effort=`{spec.get('reasoning_effort') or 'provider-default'}` / "
-                f"max_tokens={spec.get('max_tokens')}"
+                f"max_tokens={max_label}"
             )
     else:
         lines.append("- configuration was not recorded")
+
+    lines += ["", "## Passive token telemetry"]
+    if report.get("role_budget"):
+        for role, row in report["role_budget"].items():
+            minimum = row.get("expected_min")
+            maximum = row.get("expected_max")
+            expected = f"{minimum}–{maximum}" if minimum is not None or maximum is not None else "N/A (not calibrated)"
+            lines.append(
+                f"- `{role}`: expected={expected}; actual_total={row.get('actual_tokens', 0)}; "
+                f"exceed_calls={row.get('over_budget_calls', 0)}; truncated_calls={row.get('truncated_calls', 0)}"
+            )
+    else:
+        lines.append("- no LLM calls recorded")
 
     lines += ["", "## Per-iteration usage"]
     if report.get("per_iteration"):
@@ -393,14 +469,17 @@ def _markdown_report(report: dict[str, Any]) -> str:
 
     lines += ["", "## Per-call usage"]
     for index, call in enumerate(report["llm_calls"], 1):
+        budget = call.get("budget") or {}
         lines.append(
             f"- {index}. `{call['agent']}` / `{call['model']}` / `{call.get('step_key') or '-'}`: "
-            f"{call['total_tokens']} tokens, cost={call['cost_usd']}, latency={call['latency_s']}s"
+            f"{call['total_tokens']} tokens, cost={call['cost_usd']}, latency={call['latency_s']}s, "
+            f"finish={call.get('finish_reason')}, truncated={call.get('truncated')}, "
+            f"requested_max_tokens={call.get('requested_max_tokens')}, expected_max={budget.get('expected_max')}"
         )
     return "\n".join(lines) + "\n"
 
 
-def _agent(role: str, model: str, max_tokens: int, reasoning_effort: str | None) -> Agent:
+def _agent(role: str, model: str, max_tokens: int | None, reasoning_effort: str | None) -> Agent:
     return Agent(
         name=role,
         system_prompt=ROLE_LIBRARY[role],
@@ -415,7 +494,7 @@ def run_probe(
     *,
     model: str,
     iterations: int,
-    max_tokens: int,
+    max_tokens: int | None,
     reasoning_effort: str | None,
     out_dir: Path,
     problem: str,
@@ -459,7 +538,7 @@ def run_probe(
         role: _agent(
             role,
             str(spec["model"]),
-            int(spec["max_tokens"]),
+            int(spec["max_tokens"]) if spec.get("max_tokens") is not None else None,
             spec.get("reasoning_effort"),
         )
         for role, spec in resolved_config.items()
@@ -516,13 +595,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--model", default=os.environ.get("LAB_BASELINE_MODEL", "openai/gpt-4o-mini"))
     parser.add_argument("--iterations", type=int, default=2)
-    parser.add_argument("--max-tokens", type=int, default=1200)
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        help="Optional explicit cap for a special probe. Default: no role cap; LAB_EMERGENCY_MAX_TOKENS remains a separate global safety ceiling.",
+    )
     parser.add_argument("--reasoning-effort", default=os.environ.get("LAB_BASELINE_REASONING_EFFORT", "low"))
     parser.add_argument(
         "--agent-config",
         help=(
             "Worker-request-style agent JSON object, full worker_request JSON, or path to either. "
-            "Per-role model/reasoning_effort/max_tokens override the global defaults."
+            "Per-role model/reasoning_effort and optional max_tokens override the global defaults."
         ),
     )
     parser.add_argument("--out-dir", type=Path, default=Path("baseline_runs"))
@@ -539,8 +623,8 @@ def main() -> None:
     args = parse_args()
     if args.iterations < 1:
         raise SystemExit("--iterations must be >= 1")
-    if args.max_tokens < 128:
-        raise SystemExit("--max-tokens must be >= 128")
+    if args.max_tokens is not None and args.max_tokens < 128:
+        raise SystemExit("--max-tokens must be >= 128 when explicitly configured")
     agent_config = _load_agent_config(args.agent_config)
     report_path = run_probe(
         model=args.model,

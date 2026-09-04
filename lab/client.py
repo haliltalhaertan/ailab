@@ -30,6 +30,8 @@ class LLMResponse:
     reasoning_details: Any = None
     request_messages: list[dict] | None = None
     requested_reasoning_effort: str | None = None
+    finish_reason: str | None = None
+    requested_max_tokens: int | None = None
 
     @property
     def total_tokens(self) -> int:
@@ -90,6 +92,35 @@ def _usage_values(usage: Any) -> tuple[int, int, int, int, float | None]:
     return prompt_tokens, completion_tokens, reasoning_tokens, cached_tokens, cost_usd
 
 
+def _emergency_max_tokens() -> int | None:
+    """Return the optional global runaway-cost ceiling.
+
+    This is intentionally not a role budget and is never shown to agents.  It is
+    a single operator safety ceiling that defaults to disabled.
+    """
+
+    raw = str(os.environ.get("LAB_EMERGENCY_MAX_TOKENS") or "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError("LAB_EMERGENCY_MAX_TOKENS must be a positive integer") from exc
+    if value <= 0:
+        raise ValueError("LAB_EMERGENCY_MAX_TOKENS must be a positive integer")
+    return value
+
+
+def _requested_max_tokens(explicit: int | None) -> int | None:
+    emergency = _emergency_max_tokens()
+    if explicit is None:
+        return emergency
+    value = int(explicit)
+    if value <= 0:
+        return emergency
+    return min(value, emergency) if emergency is not None else value
+
+
 class LLMClient:
     """OpenAI-compatible client with *no hidden SDK retry layer*.
 
@@ -131,13 +162,14 @@ class LLMClient:
     ) -> LLMResponse:
         model = model or os.environ.get("LAB_MODEL", DEFAULT_MODEL)
         reasoning_effort = normalize_effort(reasoning_effort)
+        requested_max_tokens = _requested_max_tokens(max_tokens)
         kwargs: dict[str, Any] = {
             "model": model,
             "messages": messages,
             "temperature": temperature,
         }
-        if max_tokens:
-            kwargs["max_tokens"] = max_tokens
+        if requested_max_tokens is not None:
+            kwargs["max_tokens"] = requested_max_tokens
         if self.is_openrouter:
             reasoning: dict[str, Any] = {"exclude": False}
             if reasoning_effort is not None:
@@ -148,8 +180,21 @@ class LLMClient:
             }
 
         if stream_callback is None:
-            return self._complete_once(kwargs, messages, model, reasoning_effort)
-        return self._complete_stream(kwargs, messages, model, reasoning_effort, stream_callback)
+            return self._complete_once(
+                kwargs,
+                messages,
+                model,
+                reasoning_effort,
+                requested_max_tokens,
+            )
+        return self._complete_stream(
+            kwargs,
+            messages,
+            model,
+            reasoning_effort,
+            requested_max_tokens,
+            stream_callback,
+        )
 
     def _complete_once(
         self,
@@ -157,15 +202,18 @@ class LLMClient:
         messages: list[dict],
         model: str,
         reasoning_effort: str | None,
+        requested_max_tokens: int | None,
     ) -> LLMResponse:
         start = time.perf_counter()
         resp = self._client.chat.completions.create(**kwargs)
         latency = time.perf_counter() - start
         usage = resp.usage
-        message = resp.choices[0].message
+        choice = resp.choices[0]
+        message = choice.message
         prompt_tokens, completion_tokens, reasoning_tokens, cached_tokens, cost_usd = _usage_values(usage)
         provider_reasoning = _extra(message, "reasoning", "") or ""
         reasoning_details = _jsonable(_extra(message, "reasoning_details"))
+        finish_reason_raw = _extra(choice, "finish_reason")
         return LLMResponse(
             content=message.content or "",
             model=resp.model or model,
@@ -179,6 +227,8 @@ class LLMClient:
             reasoning_details=reasoning_details,
             request_messages=[dict(m) for m in messages],
             requested_reasoning_effort=reasoning_effort,
+            finish_reason=str(finish_reason_raw) if finish_reason_raw is not None else None,
+            requested_max_tokens=requested_max_tokens,
         )
 
     def _complete_stream(
@@ -187,6 +237,7 @@ class LLMClient:
         messages: list[dict],
         model: str,
         reasoning_effort: str | None,
+        requested_max_tokens: int | None,
         stream_callback: StreamCallback,
     ) -> LLMResponse:
         stream_kwargs = dict(kwargs)
@@ -200,6 +251,7 @@ class LLMClient:
         reasoning_details: list[Any] = []
         final_usage = None
         resolved_model = model
+        finish_reason: str | None = None
 
         for chunk in stream:
             if getattr(chunk, "model", None):
@@ -210,7 +262,11 @@ class LLMClient:
             choices = getattr(chunk, "choices", None) or []
             if not choices:
                 continue
-            delta = choices[0].delta
+            choice = choices[0]
+            finish_raw = _extra(choice, "finish_reason")
+            if finish_raw is not None:
+                finish_reason = str(finish_raw)
+            delta = choice.delta
 
             content_delta = _extra(delta, "content", "") or ""
             if content_delta:
@@ -249,6 +305,8 @@ class LLMClient:
             reasoning_details=reasoning_details or None,
             request_messages=[dict(m) for m in messages],
             requested_reasoning_effort=reasoning_effort,
+            finish_reason=finish_reason,
+            requested_max_tokens=requested_max_tokens,
         )
 
 

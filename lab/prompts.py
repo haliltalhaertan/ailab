@@ -165,6 +165,7 @@ def manager_prompt(
     *,
     contract_block: str = "",
     registry: ToolRegistry | None = None,
+    candidate_incomplete: bool = False,
 ) -> str:
     registry = registry or ToolRegistry()
     tools = tool_environment_block(registry)
@@ -177,12 +178,18 @@ def manager_prompt(
             "same-item/same-iteration/same-claim bound formal evidence açıkça mevcutsa istenebilir; aksi halde PROVEN isteme."
         )
     )
+    incomplete_rule = (
+        "IMPORTANT: Bu candidate provider token sınırında kesildi ve INCOMPLETE_OUTPUT olarak işaretlendi. "
+        "Yükseltme isteme; status OPEN kalsın. Eksik kısmı olmuş gibi varsayma ve target transition isteme. "
+        if candidate_incomplete
+        else ""
+    )
     return (
         f"Frozen problem:\n{problem}\n\nCandidate {item_id}: {claim}\n\n"
         f"Tool:\n{json.dumps(tool_result, ensure_ascii=False, indent=2)}\n"
         f"Verifier:\n{json.dumps(verification, ensure_ascii=False, indent=2)}\n"
         f"Critic:\n{json.dumps(critique, ensure_ascii=False, indent=2)}\n"
-        f"{contract_block}\n\n{tools}\n{lean_manager}\n\n"
+        f"{contract_block}\n\n{tools}\n{lean_manager}\n{incomplete_rule}\n"
         "Choose research direction. Status and target transitions are REQUESTS only; code-side evidence guards may downgrade or reject them. "
         "An LLM-written counterexample is only a REFUTATION_CANDIDATE until a deterministic tool verifies it; make deterministic verification the next task rather than treating the claim as dead. "
         "Do not claim PROVEN unless a successful same-item bound formal checker result is explicitly present. "

@@ -24,6 +24,12 @@ class CardState:
     system_prompt: str = ""
     prompt: str = ""
     error: str = ""
+    finish_reason: str | None = None
+    truncated: bool = False
+    requested_max_tokens: int | None = None
+    expected_min_tokens: int | None = None
+    expected_max_tokens: int | None = None
+    over_budget: bool = False
     order: int = 0
 
 
@@ -103,6 +109,13 @@ def _apply_card_events(cards: list[CardState], events: list[dict[str, Any]]) -> 
             state.cached_tokens = int(event.get("cached_tokens", 0) or 0)
             state.cost_usd = float(event["cost_usd"]) if event.get("cost_usd") is not None else None
             state.latency_s = float(event.get("latency_s", 0.0) or 0.0)
+            state.finish_reason = str(event["finish_reason"]) if event.get("finish_reason") is not None else None
+            state.truncated = bool(event.get("truncated"))
+            state.requested_max_tokens = int(event["requested_max_tokens"]) if event.get("requested_max_tokens") is not None else None
+            budget = event.get("budget") or {}
+            state.expected_min_tokens = int(budget["expected_min"]) if budget.get("expected_min") is not None else None
+            state.expected_max_tokens = int(budget["expected_max"]) if budget.get("expected_max") is not None else None
+            state.over_budget = bool(budget.get("over_budget"))
         elif kind == "agent_error":
             state.status = "error"
             state.error = str(event.get("error") or "Bilinmeyen hata")
@@ -157,6 +170,7 @@ def stage_timeline(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
             starts[step_key] = event
         elif kind == "stage_end" and step_key:
             start = starts.get(step_key, {})
+            budget = event.get("budget") or {}
             rows.append(
                 {
                     "step_key": step_key,
@@ -170,6 +184,10 @@ def stage_timeline(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "total_tokens": int(event.get("total_tokens", 0) or 0),
                     "reasoning_tokens": int(event.get("reasoning_tokens", 0) or 0),
                     "cost_usd": event.get("cost_usd"),
+                    "finish_reason": event.get("finish_reason"),
+                    "truncated": bool(event.get("truncated")),
+                    "over_budget": bool(budget.get("over_budget")),
+                    "expected_max": budget.get("expected_max"),
                     "index": start.get("index", event.get("index")),
                     "total": start.get("total", event.get("total")),
                     "total_is_minimum": bool(start.get("total_is_minimum", event.get("total_is_minimum", False))),
@@ -188,6 +206,10 @@ def stage_timeline(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "total_tokens": 0,
                     "reasoning_tokens": 0,
                     "cost_usd": None,
+                    "finish_reason": None,
+                    "truncated": False,
+                    "over_budget": False,
+                    "expected_max": None,
                     "index": event.get("index"),
                     "total": event.get("total"),
                     "total_is_minimum": bool(event.get("total_is_minimum", False)),
@@ -318,10 +340,17 @@ def render_stage_timeline(events: list[dict[str, Any]]) -> None:
             continue
         cost = row.get("cost_usd")
         cost_label = f"${float(cost):.4f}" if cost is not None else "ücret N/A"
+        flags = []
+        if row.get("truncated"):
+            flags.append("⚠️ token sınırında kesildi")
+        if row.get("over_budget"):
+            expected = row.get("expected_max")
+            flags.append(f"ℹ️ beklenen aralığın üstünde{f' (>{expected})' if expected is not None else ''}")
+        suffix = " · " + " · ".join(flags) if flags else ""
         st.caption(
             f"{_clock(row.get('started_at'))} → {_clock(row.get('finished_at'))} · "
             f"{row.get('label') or row.get('agent')} · {float(row.get('duration_s', 0.0)):.1f} sn · "
-            f"{int(row.get('total_tokens', 0) or 0):,} token · {cost_label}"
+            f"{int(row.get('total_tokens', 0) or 0):,} token · {cost_label}{suffix}"
         )
 
 

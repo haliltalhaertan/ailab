@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from lab.budget import budget_snapshot
+
 
 _ACTIVE_TRACE: ContextVar["Trace | None"] = ContextVar("ailab_active_trace", default=None)
 StageListener = Callable[[dict[str, Any]], None]
@@ -201,6 +203,10 @@ class Trace:
             "reasoning_tokens": int(data.get("reasoning_tokens", 0) or 0),
             "cost_usd": data.get("cost_usd"),
             "latency_s": float(data.get("latency_s", 0.0) or 0.0),
+            "finish_reason": data.get("finish_reason"),
+            "truncated": bool(data.get("truncated")),
+            "requested_max_tokens": data.get("requested_max_tokens"),
+            "budget": data.get("budget") or {},
             "auto": True,
         }
         self._write_stage("stage_end", end)
@@ -316,6 +322,10 @@ class Trace:
 
     def agent_call(self, agent: str, model: str, temperature: float, messages: list[dict], response) -> None:
         exact_messages = getattr(response, "request_messages", None) or messages
+        total_tokens = int(response.prompt_tokens or 0) + int(response.completion_tokens or 0)
+        budget = budget_snapshot(agent, model, total_tokens)
+        finish_reason = getattr(response, "finish_reason", None)
+        truncated = str(finish_reason or "").lower() == "length"
         self.log(
             "llm_call", agent=agent, model=model, temperature=temperature,
             reasoning_effort=getattr(response, "requested_reasoning_effort", None),
@@ -325,9 +335,22 @@ class Trace:
             prompt_tokens=response.prompt_tokens, completion_tokens=response.completion_tokens,
             reasoning_tokens=getattr(response, "reasoning_tokens", 0),
             cached_tokens=getattr(response, "cached_tokens", 0),
-            total_tokens=response.prompt_tokens + response.completion_tokens,
+            total_tokens=total_tokens,
             cost_usd=getattr(response, "cost_usd", None), latency_s=response.latency_s,
+            finish_reason=finish_reason,
+            truncated=truncated,
+            requested_max_tokens=getattr(response, "requested_max_tokens", None),
+            budget=budget,
         )
+        if budget.get("over_budget"):
+            self.log(
+                "unusually_expensive_call",
+                agent=agent,
+                model=model,
+                total_tokens=total_tokens,
+                expected_min=budget.get("expected_min"),
+                expected_max=budget.get("expected_max"),
+            )
 
     def close(self) -> Path:
         if self.closed:
@@ -340,6 +363,7 @@ class Trace:
                 "calls": 0, "models": [], "reasoning_efforts": [], "prompt_tokens": 0,
                 "completion_tokens": 0, "reasoning_tokens": 0, "cached_tokens": 0,
                 "total_tokens": 0, "cost_usd": 0.0, "cost_available_calls": 0, "latency_s": 0.0,
+                "truncated_calls": 0, "over_budget_calls": 0,
             }
 
         totals: dict[str, dict[str, Any]] = defaultdict(new_total)
@@ -366,6 +390,10 @@ class Trace:
                     t["cost_usd"] += float(ev["cost_usd"])
                     t["cost_available_calls"] += 1
                 t["latency_s"] += float(ev.get("latency_s", 0.0) or 0.0)
+                if ev.get("truncated"):
+                    t["truncated_calls"] += 1
+                if bool((ev.get("budget") or {}).get("over_budget")):
+                    t["over_budget_calls"] += 1
 
         agents = dict(totals)
         total_calls = sum(t["calls"] for t in agents.values())
