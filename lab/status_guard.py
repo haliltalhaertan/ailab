@@ -26,6 +26,7 @@ def choose_status(
     expected_item_id: str | None = None,
     expected_iteration: int | None = None,
     expected_claim_hash: str | None = None,
+    expected_revision: int | None = None,
     evidence: Evidence | None = None,
     contract: ResearchContract | None = None,
 ) -> GuardDecision:
@@ -39,7 +40,12 @@ def choose_status(
     if bound_evidence is None and tool_result is not None:
         bound_evidence = evidence_from_tool_result(tool_result, contract=contract)
     if bound_evidence is not None:
-        bound_evidence = validate_evidence_binding(bound_evidence, contract=contract)
+        bound_evidence = validate_evidence_binding(
+            bound_evidence,
+            contract=contract,
+            expected_claim_hash=expected_claim_hash,
+            expected_revision=expected_revision,
+        )
 
     claim_hash_matches = bool(
         expected_claim_hash
@@ -56,6 +62,7 @@ def choose_status(
         and claim_hash_matches
         and (expected_item_id is None or str(tmeta.get("item_id") or "") == str(expected_item_id))
         and (expected_iteration is None or int(tmeta.get("iteration", -1)) == int(expected_iteration))
+        and (bound_evidence is None or bound_evidence.kind != "INCONCLUSIVE")
     )
     evidence_kind = bound_evidence.kind if bound_evidence is not None else "INCONCLUSIVE"
     computation_ok = bool(
@@ -89,6 +96,9 @@ def choose_status(
         "claim_hash_matches": claim_hash_matches,
         "expected_claim_hash": expected_claim_hash,
         "actual_claim_hash": str(tmeta.get("claim_hash") or ""),
+        "expected_revision": expected_revision,
+        "actual_evidence_revision": bound_evidence.revision if bound_evidence else None,
+        "evidence_claim_hash": bound_evidence.claim_hash if bound_evidence else "",
         "computation_ok": computation_ok,
         "verifier_verdict": verifier_verdict,
         "critic_verdict": critic_verdict,
@@ -122,14 +132,14 @@ def choose_status(
             return GuardDecision(
                 requested,
                 "PROVEN",
-                "Bound Lean source passed the checker, claim-hash/source/axiom guards, verifier PASS, and critic did not KILL it.",
+                "Bound Lean source passed the checker, claim-hash/revision/source/axiom guards, verifier PASS, and critic did not KILL it.",
                 False,
                 metadata,
             )
         return GuardDecision(
             requested,
             "OPEN",
-            "PROVEN rejected: requires same-item/same-iteration/same-claim bound Lean evidence, clean source, verified axioms, verifier PASS, and critic not KILL.",
+            "PROVEN rejected: requires current-revision same-item/same-iteration/same-claim bound Lean evidence, clean source, verified axioms, verifier PASS, and critic not KILL.",
             True,
             metadata,
         )
@@ -141,11 +151,11 @@ def choose_status(
 
     if requested == "COMPUTATION_PASS":
         if computation_ok:
-            return GuardDecision(requested, "COMPUTATION_PASS", "Bound machine evidence justifies computation status.", False, metadata)
+            return GuardDecision(requested, "COMPUTATION_PASS", "Current-revision bound machine evidence justifies computation status.", False, metadata)
         return GuardDecision(
             requested,
             "OPEN",
-            f"COMPUTATION_PASS rejected: evidence kind {evidence_kind} is not sufficient.",
+            f"COMPUTATION_PASS rejected: evidence kind {evidence_kind} is not sufficient for the current claim revision.",
             True,
             metadata,
         )
