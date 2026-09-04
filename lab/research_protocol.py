@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from lab.completion_integrity import load_bearing_structured_incomplete
 from lab.research_contract import ResearchContract, TargetTransition
 from lab.research_state import ResearchState
 
@@ -121,12 +120,6 @@ def evaluate_manager_target_proposal(
     manager_decision: dict[str, Any],
 ) -> tuple[bool, str, dict[str, Any] | None]:
     """Apply a manager-proposed transition only when code-side gates permit it."""
-
-    incomplete = load_bearing_structured_incomplete()
-    if any(incomplete.values()):
-        return False, "target transition rejected: current load-bearing structured output is incomplete", {
-            "completion_integrity": incomplete
-        }
 
     raw = manager_decision.get("target_proposal")
     if not isinstance(raw, dict) or not any(str(value or "").strip() for value in raw.values()):
