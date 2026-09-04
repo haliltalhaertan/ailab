@@ -19,6 +19,7 @@ from lab.ui_model import (
     runs_for_project,
 )
 from lab.ui_project_settings import force_stop_worker, local_storage_summary
+from lab.ui_tool_availability import tool_availability_caption, tool_availability_rows
 from lab.worker_launcher import launch_worker, write_worker_request
 
 ROOT = Path("research_state")
@@ -98,6 +99,19 @@ with st.expander("Yerel dosya konumları", expanded=False):
     st.code(storage["project_root"], language=None)
     st.markdown("**Tüm run trace / stream / summary klasörleri**")
     st.code(storage["runs_root"], language=None)
+
+if experiment_method == "theorem_lab":
+    tool_snapshot = read_json(project / "tool_availability.json", {})
+    tool_rows = tool_availability_rows(tool_snapshot)
+    st.markdown("#### Araç yetenekleri")
+    if tool_rows:
+        columns = st.columns(len(tool_rows))
+        for column, row in zip(columns, tool_rows):
+            column.metric(str(row["label"]), "AÇIK" if row["available"] else "KAPALI")
+            column.caption(str(row["reason"]))
+    else:
+        st.caption("Henüz capability snapshot yok.")
+    st.caption(tool_availability_caption(tool_snapshot))
 
 
 @st.fragment(run_every=1.0)
