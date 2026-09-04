@@ -67,6 +67,34 @@ def test_catalog_parses_completion_and_reasoning_capabilities():
     assert second.reasoning_supports_max_tokens is False
 
 
+def test_catalog_distinguishes_absent_from_unrestricted_reasoning_efforts():
+    payload = {
+        "data": [
+            {
+                "id": "unrestricted/test",
+                "reasoning": {"supported_efforts": None, "mandatory": False},
+            },
+            {
+                "id": "unknown/test",
+                "reasoning": {},
+            },
+            {
+                "id": "mandatory/test",
+                "reasoning": {"supported_efforts": None, "mandatory": True},
+            },
+        ]
+    }
+
+    unrestricted, unknown, mandatory = parse_models_payload(payload)
+    assert "medium" in unrestricted.reasoning_supported_efforts
+    assert "none" in unrestricted.reasoning_supported_efforts
+    assert unknown.reasoning_supported_efforts == ()
+    assert "none" not in mandatory.reasoning_supported_efforts
+    assert _resolve_reasoning_effort("medium", unrestricted) == ("medium", "exact")
+    assert _resolve_reasoning_effort("medium", unknown) == (None, "catalog_unknown")
+    assert _resolve_reasoning_effort("none", mandatory) == (None, "unsupported")
+
+
 def test_catalog_memory_and_disk_cache_avoid_repeated_network(tmp_path: Path):
     clear_catalog_memory_cache()
     path = tmp_path / "catalog.json"
