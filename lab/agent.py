@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from lab.client import LLMClient, LLMResponse, get_default_client
-from lab.completion_integrity import record_role_completion
 from lab.reasoning_settings import get_reasoning_effort, normalize_effort
 from lab.trace import get_active_trace
 
@@ -73,8 +72,4 @@ class Agent:
                 max_tokens=self.max_tokens,
                 stream_callback=callback,
             )
-        record_role_completion(
-            self.name,
-            truncated=str(getattr(resp, "finish_reason", None) or "").lower() == "length",
-        )
         return resp.content, resp
