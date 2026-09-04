@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import importlib.util
+import importlib
 import json
 import os
 import shutil
@@ -50,6 +50,14 @@ class ToolRegistry:
     def _row(available: bool, reason: str) -> dict[str, Any]:
         return {"available": bool(available), "reason": str(reason)}
 
+    @staticmethod
+    def _z3_importable() -> bool:
+        try:
+            importlib.import_module("z3")
+        except Exception:
+            return False
+        return True
+
     def availability(self) -> ToolAvailability:
         """Measure the tool capabilities that are executable *right now*."""
 
@@ -62,8 +70,8 @@ class ToolRegistry:
                     binary = shutil.which("lake") or shutil.which("lean")
                     rows[name] = self._row(bool(binary), "lean/lake PATH'te bulundu" if binary else "lean/lake PATH'te yok")
             elif name == "z3":
-                available = importlib.util.find_spec("z3") is not None
-                rows[name] = self._row(available, "z3-solver kullanılabilir" if available else "z3-solver kurulu değil")
+                available = self._z3_importable()
+                rows[name] = self._row(available, "z3-solver kullanılabilir" if available else "z3-solver import edilemiyor")
             elif name == "script":
                 scripts = getattr(self.toolbox, "scripts", None)
                 roots = tuple(getattr(scripts, "trusted_roots", ())) if scripts is not None else ()
