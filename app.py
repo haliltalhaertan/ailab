@@ -413,7 +413,9 @@ def _card_header(card: CardState) -> str:
         return f"❌ {card.agent} · {card.model} — hata"
     if card.status == "done":
         cost_label = f"${card.cost_usd:.6f}" if card.cost_usd is not None else "ücret N/A"
-        return f"✅ {card.agent} · {card.model} — {card.total_tokens:,} token · {cost_label} · {card.latency_s:.1f} sn"
+        icon = "⚠️" if card.truncated else "✅"
+        extra = " · alışılmadık token kullanımı" if card.over_budget else ""
+        return f"{icon} {card.agent} · {card.model} — {card.total_tokens:,} token · {cost_label} · {card.latency_s:.1f} sn{extra}"
     return f"⏳ {card.agent} · {card.model} — çalışıyor · reasoning {card.effort or 'provider-default'}"
 
 
@@ -446,6 +448,15 @@ def render_agent_card(
         expanded = card.status == "running"
     show_key = f"show_card:{state_prefix}:{card.step_key}"
     with target.expander(_card_header(card), expanded=expanded):
+        if card.truncated:
+            limit_label = f" (requested_max_tokens={card.requested_max_tokens})" if card.requested_max_tokens is not None else ""
+            st.warning(f"⚠️ Yanıt token sınırında kesildi{limit_label}. Bu çıktı tamamlanmış kabul edilmez.")
+        if card.over_budget:
+            expected = f"{card.expected_min_tokens or '?'}–{card.expected_max_tokens or '?'}"
+            st.info(
+                f"ℹ️ Bu çağrı gözlemsel beklenen token aralığının üstünde: actual={card.total_tokens:,}, expected={expected}. "
+                "Bu yalnız telemetridir; run durdurulmadı."
+            )
         if lazy and not st.session_state.get(show_key, False):
             st.caption("Bitmiş kartın tam metni yalnız istediğinde yüklenir.")
             if st.button("Göster", key=f"{show_key}:button"):
