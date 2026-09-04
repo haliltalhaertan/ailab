@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 
 from lab.code_experiment_settings import load_code_experiment_settings, save_code_experiment_settings
 from lab.openrouter_catalog import fetch_openrouter_models
+from lab.reasoning_settings import API_TO_UI, UI_LEVELS, UI_TO_API, get_reasoning_effort, set_reasoning_effort
 
 load_dotenv()
 st.set_page_config(page_title="Code Deneyi Ayarları", layout="wide")
@@ -42,6 +43,15 @@ if ids:
     selected = st.selectbox("CodeExperimentAgent modeli", ids, index=ids.index(default), format_func=lambda mid: labels.get(mid, mid))
 manual = st.text_input("Manuel model ID (opsiyonel)", value="", placeholder="örn. z-ai/glm-5.3").strip()
 model = manual or selected
+current_effort = get_reasoning_effort("CodeExperimentAgent")
+current_effort_label = str(API_TO_UI.get(current_effort, "Provider default") or "Provider default")
+effort_label = st.selectbox(
+    "CodeExperimentAgent reasoning effort",
+    UI_LEVELS,
+    index=UI_LEVELS.index(current_effort_label),
+    help="Mekanik deney rolü için Low önerilir; yüksek effort teorize edip gereksiz token harcayabilir.",
+)
+reasoning_effort = UI_TO_API[effort_label]
 
 found_docker = shutil.which("docker")
 found_podman = shutil.which("podman")
@@ -58,7 +68,13 @@ c4, c5, c6 = st.columns(3)
 max_output_mb = c4.number_input("Stdout+stderr limiti (MB)", 1, 64, int(settings.get("max_output_mb", 4)))
 pid_limit = c5.number_input("PID limiti", 1, 128, int(settings.get("pid_limit", 8)))
 cpu_limit = c6.number_input("CPU limiti", 0.1, 16.0, float(settings.get("cpu_limit", 1.0)), step=0.1)
-engine = st.selectbox("Container engine", ["auto", "docker", "podman"], index=0 if not settings.get("container_engine") else (["auto", "docker", "podman"].index(settings.get("container_engine")) if settings.get("container_engine") in {"docker", "podman"} else 0))
+configured_engine = str(settings.get("container_engine") or "")
+engine_options = ["auto", "docker", "podman"]
+engine = st.selectbox(
+    "Container engine",
+    engine_options,
+    index=engine_options.index(configured_engine) if configured_engine in {"docker", "podman"} else 0,
+)
 image = st.text_input("Container image", value=str(settings.get("container_image") or "python:3.12-slim"))
 
 st.info(
@@ -70,6 +86,7 @@ if st.button("Code deney ayarlarını kaydet", type="primary", width="stretch"):
     path = save_code_experiment_settings(
         {
             "model": model,
+            "reasoning_effort": reasoning_effort,
             "max_steps": int(max_steps),
             "timeout_s": int(timeout_s),
             "memory_limit_mb": int(memory_limit_mb),
@@ -80,4 +97,5 @@ if st.button("Code deney ayarlarını kaydet", type="primary", width="stretch"):
             "container_image": image.strip() or "python:3.12-slim",
         }
     )
-    st.success(f"Kaydedildi: {path}")
+    set_reasoning_effort("CodeExperimentAgent", reasoning_effort)
+    st.success(f"Kaydedildi: {path} · reasoning={reasoning_effort or 'provider-default'}")

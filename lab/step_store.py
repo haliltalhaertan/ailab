@@ -314,3 +314,20 @@ class StepStore:
             payload=payload,
         )
         return self.get_iteration_snapshot(iteration) or {}
+
+
+    def clear_iteration(self, iteration: int) -> dict[str, int]:
+        """Remove resumable execution state for one iteration, not ledger evidence."""
+
+        number = int(iteration)
+        prefix = f"iter:{number}:%"
+        with self._connect() as con:
+            steps = int(con.execute("SELECT COUNT(*) FROM steps WHERE step_key LIKE ?", (prefix,)).fetchone()[0])
+            partials = int(con.execute("SELECT COUNT(*) FROM partials WHERE step_key LIKE ?", (prefix,)).fetchone()[0])
+            snapshots = int(
+                con.execute("SELECT COUNT(*) FROM iteration_snapshots WHERE iteration=?", (number,)).fetchone()[0]
+            )
+            con.execute("DELETE FROM steps WHERE step_key LIKE ?", (prefix,))
+            con.execute("DELETE FROM partials WHERE step_key LIKE ?", (prefix,))
+            con.execute("DELETE FROM iteration_snapshots WHERE iteration=?", (number,))
+        return {"steps": steps, "partials": partials, "snapshots": snapshots}

@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -14,7 +15,7 @@ from typing import Any, Callable
 
 from lab.agent import Agent
 from lab.integrity import sha256_file
-from lab.json_io import parse_json_object
+from lab.json_io import StructuredOutputError, parse_json_object
 from lab.tools import ToolResult
 from lab.trace import Trace
 
@@ -67,6 +68,34 @@ BLOCKED_ATTRIBUTES = {
     "format_map",
 }
 BLOCKED_OPERATOR_CALLS = {"attrgetter", "methodcaller"}
+
+INFRASTRUCTURE_ERROR_MARKERS = (
+    "failed to connect to the docker api",
+    "cannot connect to the docker daemon",
+    "error during connect",
+    "is the docker daemon running",
+    "daemon is running?",
+    "pull access denied",
+    "unable to find image",
+    "no such image",
+    "error response from daemon",
+    "cannot connect to podman",
+    "error pulling image",
+    "manifest unknown",
+)
+
+
+def infrastructure_failure(result: Any) -> bool:
+    metadata = getattr(result, "metadata", None)
+    if isinstance(result, dict):
+        metadata = result.get("metadata")
+        error = str(result.get("error") or "")
+    else:
+        error = str(getattr(result, "error", "") or "")
+    if isinstance(metadata, dict) and metadata.get("infrastructure_error") is True:
+        return True
+    folded = error.casefold()
+    return any(marker in folded for marker in INFRASTRUCTURE_ERROR_MARKERS)
 
 
 class UnsafeExperimentCode(ValueError):
@@ -143,6 +172,10 @@ class GuardedExperimentWorkspace:
         ).strip()
         extras = str(os.environ.get("LAB_CODE_EXTRA_IMPORTS") or "").strip()
         self.extra_imports = {x.strip() for x in extras.split(",") if x.strip()}
+        self._execution_available = False
+        self._availability_reason = "container engine henüz doğrulanmadı"
+        self._daemon_version = ""
+        self.refresh_execution_availability()
 
     @staticmethod
     def _discover_engine() -> str:
@@ -151,9 +184,61 @@ class GuardedExperimentWorkspace:
                 return name
         return ""
 
+    def _engine_cli_available(self) -> bool:
+        return bool(self.container_engine and shutil.which(self.container_engine))
+
+    @staticmethod
+    def _daemon_version_from_info(text: str) -> str:
+        for pattern in (r"Server Version:\s*([^\s]+)", r"version:\s*([^\s]+)"):
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+        return ""
+
+    def refresh_execution_availability(self) -> bool:
+        if not self._engine_cli_available():
+            self._execution_available = False
+            self._daemon_version = ""
+            self._availability_reason = "container CLI bulunamadı"
+            return False
+        try:
+            probe = subprocess.run(
+                [self.container_engine, "info"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+        except Exception as exc:
+            self._execution_available = False
+            self._daemon_version = ""
+            self._availability_reason = f"daemon erişilemiyor: {exc}"
+            return False
+        output = (str(probe.stdout or "") + "\n" + str(probe.stderr or "")).strip()
+        if probe.returncode != 0:
+            detail = output[-500:] or f"{self.container_engine} info exit={probe.returncode}"
+            self._execution_available = False
+            self._daemon_version = ""
+            self._availability_reason = f"daemon erişilemiyor: {detail}"
+            return False
+        self._daemon_version = self._daemon_version_from_info(output)
+        suffix = f": {self._daemon_version}" if self._daemon_version else f": {self.container_engine}"
+        self._execution_available = True
+        self._availability_reason = "daemon çalışıyor" + suffix
+        return True
+
     @property
     def execution_available(self) -> bool:
-        return bool(self.container_engine and shutil.which(self.container_engine))
+        return bool(self._execution_available)
+
+    @property
+    def availability_reason(self) -> str:
+        return self._availability_reason
+
+    @property
+    def daemon_version(self) -> str:
+        return self._daemon_version
 
     def capability_summary(self) -> str:
         engine = self.container_engine or "NONE"
@@ -163,7 +248,8 @@ class GuardedExperimentWorkspace:
             f"rootfs=read-only; workspace-only writable mount; memory={self.memory_limit_mb}MB; "
             f"pids={self.pid_limit}; cpus={self.cpu_limit}; timeout={self.timeout_s}s; "
             f"stdlib imports={', '.join(sorted(SAFE_IMPORT_ROOTS))}; configured extra imports={extras}. "
-            + ("Container execution is available." if self.execution_available else "Container engine is NOT available; run_python will fail closed.")
+            + ("Container execution is available; " if self.execution_available else "Container execution is NOT available; ")
+            + self.availability_reason
         )
 
     def _resolve(self, relative: str, *, must_exist: bool = False) -> Path:
@@ -300,7 +386,7 @@ class GuardedExperimentWorkspace:
         return "ailab-exp-" + uuid.uuid4().hex[:16]
 
     def _kill_container(self, name: str) -> None:
-        if not self.execution_available:
+        if not self._engine_cli_available():
             return
         try:
             subprocess.run(
@@ -320,15 +406,26 @@ class GuardedExperimentWorkspace:
         proc: subprocess.Popen | None = None
         container_name = self._container_name()
         termination_reason = ""
+        container_spawn_attempted = False
         try:
             target = self._resolve(path, must_exist=True)
             if target.suffix.lower() != ".py":
                 raise ValueError("run_python yalnızca .py dosyası çalıştırır.")
             code = target.read_text(encoding="utf-8")
             self._validate_python(code)
-            if not self.execution_available:
-                raise RuntimeError(
-                    "Güvenli container engine bulunamadı. Docker veya Podman kurmadan LLM-generated Python host üzerinde çalıştırılmaz."
+            if not self.refresh_execution_availability():
+                return WorkspaceActionResult(
+                    False,
+                    "run_python",
+                    error=f"infrastructure: {self.availability_reason}",
+                    metadata={
+                        "evidence_level": "COMPUTATION_ONLY",
+                        "container_required": True,
+                        "infrastructure_error": True,
+                        "tool_unavailable": True,
+                        "availability_reason": self.availability_reason,
+                        "container_engine": self.container_engine,
+                    },
                 )
             clean_args = [str(x)[:500] for x in (args or [])][:20]
             evidence_id, stdout_path, stderr_path = self._evidence_paths(target)
@@ -361,6 +458,7 @@ class GuardedExperimentWorkspace:
             ]
             started = time.monotonic()
             with stdout_path.open("wb") as stdout_handle, stderr_path.open("wb") as stderr_handle:
+                container_spawn_attempted = True
                 proc = subprocess.Popen(
                     command,
                     stdin=subprocess.DEVNULL,
@@ -424,8 +522,24 @@ class GuardedExperimentWorkspace:
                     "timeout": f"timeout ({self.timeout_s}s)",
                     "output_limit": "stdout/stderr limiti aşıldı",
                 }.get(termination_reason, termination_reason)
-                error = (error + "\n" if error else "") + reason
-            return WorkspaceActionResult(ok, "run_python", output=stdout_preview.strip(), error=error, metadata=metadata)
+                error = chr(10).join(part for part in (error, reason) if part)
+            result = WorkspaceActionResult(ok, "run_python", output=stdout_preview.strip(), error=error, metadata=metadata)
+            if not ok and not termination_reason and infrastructure_failure(result):
+                metadata.update(
+                    {
+                        "infrastructure_error": True,
+                        "tool_unavailable": True,
+                        "availability_reason": error or "container runtime failure",
+                    }
+                )
+                return WorkspaceActionResult(
+                    False,
+                    "run_python",
+                    output=stdout_preview.strip(),
+                    error="infrastructure: " + (error or "container runtime failure"),
+                    metadata=metadata,
+                )
+            return result
         except Exception as exc:
             if proc is not None and proc.poll() is None:
                 self._kill_container(container_name)
@@ -434,6 +548,14 @@ class GuardedExperimentWorkspace:
                 except Exception:
                     pass
             metadata: dict[str, Any] = {"evidence_level": "COMPUTATION_ONLY", "container_required": True}
+            if container_spawn_attempted and isinstance(exc, (FileNotFoundError, PermissionError, OSError)):
+                metadata.update(
+                    {
+                        "infrastructure_error": True,
+                        "tool_unavailable": True,
+                        "availability_reason": str(exc),
+                    }
+                )
             if target is not None and target.exists():
                 metadata["path"] = str(target.relative_to(self.root))
                 metadata["script_sha256"] = sha256_file(target)
@@ -443,7 +565,8 @@ class GuardedExperimentWorkspace:
             if stderr_path is not None and stderr_path.exists():
                 metadata["stderr_file"] = str(stderr_path.relative_to(self.root))
                 metadata["stderr_sha256"] = sha256_file(stderr_path)
-            return WorkspaceActionResult(False, "run_python", error=str(exc), metadata=metadata)
+            prefix = "infrastructure: " if metadata.get("infrastructure_error") else ""
+            return WorkspaceActionResult(False, "run_python", error=prefix + str(exc), metadata=metadata)
         finally:
             self._kill_container(container_name)
 
@@ -491,6 +614,8 @@ class GuardedExperimentWorkspace:
 
 
 CODE_EXPERIMENT_SYSTEM_PROMPT = """Sen CodeExperimentAgent'sın.
+Sen uygulayıcısın. Theorist'in belirttiği hesabı/deneyi kodla; matematiksel analiz, ispat denemesi veya yeni teori geliştirme yapma.
+Reasoning'i kısa tut. İlk eylemin deney scriptini write_file ile yazmak olsun; sonra çalıştır, sonucu gözle ve gerekirse küçük düzeltme yap.
 Görevin matematik/teorik CS araştırmasındaki aday iddiaları hesaplamalı deneylerle sınamak.
 Dosya işlemleri proje workspace'iyle sınırlıdır. Python yalnız no-network disposable container içinde çalışır.
 Host shell, host filesystem ve API anahtarları erişilebilir değildir.
@@ -555,12 +680,18 @@ class CodeExperimentRunner:
         call_agent: Callable[[Agent, str, str], str],
         execute_cached: Callable[[str, dict[str, Any]], WorkspaceActionResult],
     ) -> ToolResult:
-        if not self.workspace.execution_available:
+        if not self.workspace.refresh_execution_availability():
             return ToolResult(
                 False,
                 "code_experiment",
-                error="Docker/Podman bulunamadı; güvenlik nedeniyle LLM-generated Python host üzerinde çalıştırılmadı.",
-                metadata={"status": "CONTAINER_UNAVAILABLE", "evidence_level": "COMPUTATION_ONLY"},
+                error=f"infrastructure: {self.workspace.availability_reason}",
+                metadata={
+                    "status": "CONTAINER_UNAVAILABLE",
+                    "evidence_level": "COMPUTATION_ONLY",
+                    "infrastructure_error": True,
+                    "tool_unavailable": True,
+                    "availability_reason": self.workspace.availability_reason,
+                },
             )
         observation = self.workspace.list_files().output
         history: list[dict[str, Any]] = []
@@ -568,6 +699,7 @@ class CodeExperimentRunner:
         failed_runs: list[dict[str, Any]] = []
         last_run_ok: bool | None = None
         last_result: WorkspaceActionResult | None = None
+        previous_failure: tuple[str, str] | None = None
         for turn in range(1, self.max_steps + 1):
             history_text = json.dumps(history[-6:], ensure_ascii=False, indent=2)
             prompt = (
@@ -578,8 +710,56 @@ class CodeExperimentRunner:
                 f"Successful Python runs: {len(successful_runs)}; failed runs: {len(failed_runs)}.\n"
                 "Choose exactly one next action. Return only the JSON action object."
             )
-            raw = call_agent(agent, prompt, f"{step_key}:plan:{turn}")
-            action = parse_json_object(raw)
+            plan_step = f"{step_key}:plan:{turn}"
+            raw = call_agent(agent, prompt, plan_step)
+            try:
+                action = parse_json_object(raw)
+            except StructuredOutputError as first_error:
+                repair_step = f"{plan_step}:action_repair"
+                self.trace.log(
+                    "code_experiment_action_repair",
+                    step_key=plan_step,
+                    repair_step_key=repair_step,
+                    turn=turn,
+                    outcome="retrying",
+                    error=str(first_error),
+                )
+                repair_prompt = (
+                    "Önceki yanıt geçerli bir CodeExperiment action JSON object değildi. "
+                    "Matematiksel açıklama, markdown veya düz yazı verme. YALNIZ tek action JSON object döndür; "
+                    "action write_file|patch_file|read_file|list_files|run_python|finish seçeneklerinden biri olsun.\n\n"
+                    "ÖNCEKİ GEÇERSİZ YANIT:\n" + str(raw)[-self.observation_limit:]
+                )
+                repaired_raw = call_agent(agent, repair_prompt, repair_step)
+                try:
+                    action = parse_json_object(repaired_raw)
+                except StructuredOutputError as second_error:
+                    self.trace.log(
+                        "code_experiment_action_repair",
+                        step_key=plan_step,
+                        repair_step_key=repair_step,
+                        turn=turn,
+                        outcome="failed",
+                        error=str(second_error),
+                    )
+                    return ToolResult(
+                        False,
+                        "code_experiment",
+                        error="agent eylem üretemedi: " + str(second_error),
+                        metadata={
+                            "status": "ACTION_FORMAT_ERROR",
+                            "evidence_level": "COMPUTATION_ONLY",
+                            "format_error": True,
+                            "tool_unavailable": False,
+                        },
+                    )
+                self.trace.log(
+                    "code_experiment_action_repair",
+                    step_key=plan_step,
+                    repair_step_key=repair_step,
+                    turn=turn,
+                    outcome="recovered",
+                )
             action_name = str(action.get("action") or "").lower()
             self.trace.log("code_experiment_action", step_key=step_key, turn=turn, agent=agent.name, model=agent.model, action=self._action_for_trace(action))
             if action_name == "finish":
@@ -618,6 +798,55 @@ class CodeExperimentRunner:
                 evidence_record = {"ok": bool(last_result.ok), **dict(last_result.metadata or {})}
                 last_run_ok = bool(last_result.ok)
                 (successful_runs if last_result.ok else failed_runs).append(evidence_record)
+            if infrastructure_failure(last_result):
+                error = str(last_result.error or self.workspace.availability_reason or "container infrastructure unavailable")
+                self.trace.log(
+                    "tool_infrastructure_error",
+                    step_key=f"{step_key}:plan:{turn}",
+                    tool_step_key=step_key,
+                    turn=turn,
+                    agent=agent.name,
+                    model=agent.model,
+                    error=error.removeprefix("infrastructure: ").strip(),
+                )
+                return ToolResult(
+                    False,
+                    "code_experiment",
+                    error=error if error.startswith("infrastructure:") else "infrastructure: " + error,
+                    metadata={
+                        "status": "INFRASTRUCTURE_ERROR",
+                        "evidence_level": "COMPUTATION_ONLY",
+                        "infrastructure_error": True,
+                        "tool_unavailable": True,
+                        "availability_reason": (last_result.metadata or {}).get("availability_reason") or error,
+                        "failed_run_count": len(failed_runs),
+                    },
+                )
+            action_signature = json.dumps(
+                self._action_for_trace(action), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            )
+            current_failure = (action_signature, str(last_result.error or "")) if not last_result.ok else None
+            if current_failure is not None and current_failure == previous_failure:
+                reason = "aynı eylem aynı hatayı verdi; altyapı ya da kalıcı hata"
+                self.trace.log(
+                    "code_experiment_repeated_failure",
+                    step_key=step_key,
+                    turn=turn,
+                    action=self._action_for_trace(action),
+                    error=last_result.error,
+                    reason=reason,
+                )
+                return ToolResult(
+                    False,
+                    "code_experiment",
+                    error=reason + ": " + str(last_result.error or "bilinmeyen hata"),
+                    metadata={
+                        "status": "REPEATED_FAILURE",
+                        "evidence_level": "COMPUTATION_ONLY",
+                        "failed_run_count": len(failed_runs),
+                    },
+                )
+            previous_failure = current_failure
             observation = json.dumps(result_payload, ensure_ascii=False, indent=2)
 
         return ToolResult(
