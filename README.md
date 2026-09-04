@@ -66,6 +66,7 @@ research_state/<project_id>/
   theorem_graph.json
   runtime.json              # çalışma statüsünün tek kaynağı
   run_config.json
+  tool_availability.json    # declared/runtime/effective tool capability snapshot
   research_steps.sqlite3
   worker.json               # gerçek worker pid/run_id/launched_at
   worker_launch.json        # launcher pid + platform/breakaway bilgisi
@@ -225,6 +226,10 @@ Theorem pipeline'daki yapılandırılmış LLM çıktıları fail-closed parse e
 
 `ToolRegistry` theorem promptuna sunulan tool şemalarıyla gerçek dispatch'in tek kaynağıdır.
 
+Theorem worker run başında executable capability'leri ölçer ve üç ayrı snapshot saklar: `declared_tool_availability` run'ın başlangıç evrenidir, `runtime_tool_availability` mevcut makinenin ölçümüdür, `effective_tool_availability` ise güvenli kesişimdir. Resume sırasında bir araç kaybolursa effective evren daralır; sonradan kurulan yeni bir araç aynı `STOPPED` / `PAUSED_ERROR` / `INTERRUPTED` run'ı sessizce genişletemez. Yeni capability kullanmak için yeni run başlatılır. Snapshot `tool_availability.json`, trace ve `run_config.json` içinde görünür; Research Control aynı effective durumu Lean/Z3/Script/Tropical/Container rozetleriyle gösterir.
+
+Lean yalnız `LAB_ALLOW_HOST_LEAN=1` iken ve `lean` veya `lake` gerçekten PATH üzerinde bulunuyorsa LLM tool şemasına açılır. Z3 kurulumu, trusted script root'ları ve container runtime da ayrı ayrı ölçülür. Kullanılamayan bir araç prompttan çıkarılır ve dispatch tarafında fail-closed kalır. Tool yokluğu, timeout, syntax/format problemi veya infrastructure hatası matematiksel `FAIL` değildir; verifier açısından `INCONCLUSIVE` kalmalıdır.
+
 - **ScriptTool:** yalnız review edilmiş `research_tools/` ve `problem_packs/` altındaki güvenilir script yollarını çalıştırır. Contract'sız legacy projede structured evidence trailer'ı olmayan, başarılı (exit-0) checked-in script `NUMERICAL_PASS` sayılabilir; frozen contract'a bağlı projeler trailer/binding eksikliğinde fail-closed kalır.
 - **Z3Tool:** assertionsız SMT-LIB girdisini `inconclusive / no assertions` sayar; sat/unsat computation evidence için gerçek assertion gerekir.
 - **TropicalGridTool:** nonnegative ağırlıkların seçilen sonlu gridinde min-plus shortest-path **fonksiyon eşitliğini** test eder. `GRID_PASS`, simple-path provenance polynomial ile formal/monomial-level eşitlik ispatı değildir. `gate_count` yalnız internal non-edge gate sayısıdır; `edge_gate_count` ayrıca raporlanır.
@@ -291,6 +296,7 @@ pytest: Python 3.10
 pytest: Python 3.11
 pytest: Python 3.12
 pytest: Python 3.13
+Windows Python 3.14: pytest + Ruff + mypy
 Ruff
 mypy
 container-integration
