@@ -213,7 +213,18 @@ def _logical_jsonl_size(path: Path) -> int:
     return actual.stat().st_size
 
 
+def _run_is_complete(run_dir: Path) -> bool:
+    """A Trace summary is written only after the run has stopped producing events."""
+
+    return (run_dir / "summary.json").is_file()
+
+
 def live_log_offsets(run_dir: Path) -> dict[str, int]:
+    if _run_is_complete(run_dir):
+        return {
+            "trace": _logical_jsonl_size(run_dir / "trace.jsonl"),
+            "stream": 0,
+        }
     return {
         "trace": _logical_jsonl_size(run_dir / "trace.jsonl"),
         "stream": _logical_jsonl_size(run_dir / "stream.jsonl"),
@@ -224,8 +235,13 @@ def load_live_run_delta(
     run_dir: Path,
     offsets: dict[str, int],
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    """Read only newly appended trace/stream records after the previous fragment."""
+    """Read only newly appended records while a run is still live."""
 
+    if _run_is_complete(run_dir):
+        return [], {
+            "trace": int(offsets.get("trace", 0) or 0),
+            "stream": int(offsets.get("stream", 0) or 0),
+        }
     trace_events, trace_offset = read_jsonl_since(run_dir / "trace.jsonl", int(offsets.get("trace", 0) or 0))
     stream_events, stream_offset = read_jsonl_since(run_dir / "stream.jsonl", int(offsets.get("stream", 0) or 0))
     events = trace_events + stream_events
@@ -242,10 +258,11 @@ def load_run_events(run_dir: Path, *, include_stream: bool = True) -> list[dict[
 
 
 def load_live_run_events(run_dir: Path, *, stream_tail_bytes: int = 2_000_000) -> list[dict[str, Any]]:
-    """Load a live timeline without re-reading the entire streaming log."""
+    """Load live data; completed runs reconstruct cards from trace only."""
 
     events = read_jsonl(run_dir / "trace.jsonl")
-    events.extend(read_jsonl_tail(run_dir / "stream.jsonl", max_bytes=stream_tail_bytes))
+    if not _run_is_complete(run_dir):
+        events.extend(read_jsonl_tail(run_dir / "stream.jsonl", max_bytes=stream_tail_bytes))
     events.sort(key=lambda ev: str(ev.get("ts") or ""))
     return events
 
