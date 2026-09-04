@@ -100,19 +100,6 @@ with st.expander("Yerel dosya konumları", expanded=False):
     st.markdown("**Tüm run trace / stream / summary klasörleri**")
     st.code(storage["runs_root"], language=None)
 
-if experiment_method == "theorem_lab":
-    tool_snapshot = read_json(project / "tool_availability.json", {})
-    tool_rows = tool_availability_rows(tool_snapshot)
-    st.markdown("#### Araç yetenekleri")
-    if tool_rows:
-        columns = st.columns(len(tool_rows))
-        for column, row in zip(columns, tool_rows):
-            column.metric(str(row["label"]), "AÇIK" if row["available"] else "KAPALI")
-            column.caption(str(row["reason"]))
-    else:
-        st.caption("Henüz capability snapshot yok.")
-    st.caption(tool_availability_caption(tool_snapshot))
-
 
 @st.fragment(run_every=1.0)
 def live_status() -> None:
@@ -123,6 +110,19 @@ def live_status() -> None:
         st.caption(f"Worker PID: `{worker.get('pid')}` · run `{worker.get('run_id', '-')}`")
     if runtime.get("last_error"):
         st.error(str(runtime["last_error"]))
+
+    if experiment_method == "theorem_lab":
+        tool_snapshot = read_json(project / "tool_availability.json", {})
+        tool_rows = tool_availability_rows(tool_snapshot)
+        st.markdown("#### Araç yetenekleri")
+        if tool_rows:
+            columns = st.columns(len(tool_rows))
+            for column, row in zip(columns, tool_rows):
+                column.metric(str(row["label"]), "AÇIK" if row["available"] else "KAPALI")
+                column.caption(str(row["reason"]))
+        else:
+            st.caption("Henüz capability snapshot yok.")
+        st.caption(tool_availability_caption(tool_snapshot))
 
     run_dirs = runs_for_project(RUNS, selected_id, current_info.project_uuid)
     events = load_live_run_events(run_dirs[0]) if run_dirs else []
