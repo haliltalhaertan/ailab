@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from lab.trace import Trace
+from lab.ui_live import stage_timeline
 
 
 def _rows(trace: Trace) -> list[dict]:
@@ -13,8 +14,7 @@ def _rows(trace: Trace) -> list[dict]:
     return [json.loads(line) for line in trace.path.read_text(encoding="utf-8").splitlines()]
 
 
-def test_theorem_style_agent_events_get_common_stage_pair(tmp_path):
-    trace = Trace("theorem-stage", out_dir=tmp_path / "runs")
+def _theorem_context(trace: Trace) -> None:
     trace.log(
         "project_context",
         project_id="p",
@@ -22,6 +22,11 @@ def test_theorem_style_agent_events_get_common_stage_pair(tmp_path):
         experiment="Teorem Araştırması",
         experiment_method="theorem_lab",
     )
+
+
+def test_theorem_style_agent_events_get_common_stage_pair(tmp_path):
+    trace = Trace("theorem-stage", out_dir=tmp_path / "runs")
+    _theorem_context(trace)
     trace.configure_theorem_stages(iterations=2, checkpoint_every=1, has_literature_agent=True)
     trace.log(
         "agent_start",
@@ -57,7 +62,6 @@ def test_theorem_style_agent_events_get_common_stage_pair(tmp_path):
     assert stages[0]["total"] == 12
     assert stages[0]["total_is_minimum"] is True
     assert ends[0]["total"] == 12
-    assert ends[0]["total_is_minimum"] is True
     assert ends[0]["total_tokens"] == 18
     assert ends[0]["reasoning_tokens"] == 5
 
@@ -67,29 +71,13 @@ def test_theorem_style_agent_events_get_common_stage_pair(tmp_path):
     [
         ("literature:agent", "LiteratureScout", "Literatür · LiteratureScout"),
         ("iter:2:proposer", "Theorist", "Tur 2 · Theorist · öneri"),
-        (
-            "iter:2:verifier",
-            "VerificationEngineer",
-            "Tur 2 · VerificationEngineer · doğrulama",
-        ),
-        (
-            "iter:2:critic",
-            "AdversarialCritic",
-            "Tur 2 · AdversarialCritic · eleştiri",
-        ),
+        ("iter:2:verifier", "VerificationEngineer", "Tur 2 · VerificationEngineer · doğrulama"),
+        ("iter:2:critic", "AdversarialCritic", "Tur 2 · AdversarialCritic · eleştiri"),
         ("iter:2:manager", "ResearchManager", "Tur 2 · ResearchManager · karar"),
-        (
-            "iter:2:tool:plan:3",
-            "CodeExperimentAgent",
-            "Tur 2 · CodeExperimentAgent · adım 3",
-        ),
+        ("iter:2:tool:plan:3", "CodeExperimentAgent", "Tur 2 · CodeExperimentAgent · adım 3"),
         ("iter:2:checkpoint_audit", "IndependentAuditor", "Tur 2 · Denetim"),
         ("final:audit", "IndependentAuditor", "Final denetim"),
-        (
-            "iter:2:manager:json_repair",
-            "ResearchManager",
-            "Tur 2 · ResearchManager · karar · JSON onarımı",
-        ),
+        ("iter:2:manager:json_repair", "ResearchManager", "Tur 2 · ResearchManager · karar · JSON onarımı"),
     ],
 )
 def test_theorem_stage_label_map(step_key, agent, expected):
@@ -98,33 +86,24 @@ def test_theorem_stage_label_map(step_key, agent, expected):
 
 def test_theorem_stage_total_formula_two_configurations(tmp_path):
     first = Trace("theorem-total-a", out_dir=tmp_path / "runs")
-    assert first.configure_theorem_stages(
-        iterations=3,
-        checkpoint_every=2,
-        has_literature_agent=True,
-    ) == 15
+    assert first.configure_theorem_stages(iterations=3, checkpoint_every=2, has_literature_agent=True) == 15
     first.close()
-
     second = Trace("theorem-total-b", out_dir=tmp_path / "runs")
-    assert second.configure_theorem_stages(
-        iterations=4,
-        checkpoint_every=0,
-        has_literature_agent=False,
-    ) == 17
+    assert second.configure_theorem_stages(iterations=4, checkpoint_every=0, has_literature_agent=False) == 17
     second.close()
 
 
-def test_theorem_stage_index_honors_resume_offset(tmp_path):
+def test_theorem_stage_index_honors_completed_iterations_plus_reused_literature(tmp_path):
     trace = Trace("theorem-offset", out_dir=tmp_path / "runs")
-    trace.log(
-        "project_context",
-        project_id="p",
-        project_uuid="u",
-        experiment="Teorem Araştırması",
-        experiment_method="theorem_lab",
-    )
+    _theorem_context(trace)
     trace.configure_theorem_stages(iterations=6, checkpoint_every=2, has_literature_agent=True)
-    trace._stage_index = 10
+    assert trace.configure_theorem_resume_offset(completed_iterations=2, checkpoint_every=2) == 9
+    trace.log(
+        "step_reused",
+        step_key="literature:agent",
+        agent="LiteratureScout",
+        model="fake/model",
+    )
     trace.log(
         "agent_start",
         agent="Theorist",
@@ -135,15 +114,49 @@ def test_theorem_stage_index_honors_resume_offset(tmp_path):
     rows = _rows(trace)
     trace.close()
 
+    reused = next(row for row in rows if row.get("type") == "step_reused")
     stage = next(row for row in rows if row.get("type") == "stage")
+    assert reused["index"] == 10
+    assert reused["total"] == 29
     assert stage["index"] == 11
     assert stage["total"] == 29
 
 
-def test_unknown_theorem_step_key_keeps_legacy_label():
-    assert Trace._theorem_stage_label("iter:1:proposal", "Theorist") == (
-        "Theorist · iter:1:proposal"
+def test_reused_llm_steps_advance_index_but_reused_tool_does_not(tmp_path):
+    trace = Trace("theorem-partial-resume", out_dir=tmp_path / "runs")
+    _theorem_context(trace)
+    trace.configure_theorem_stages(iterations=6, checkpoint_every=2, has_literature_agent=True)
+    trace.configure_theorem_resume_offset(completed_iterations=0, checkpoint_every=2)
+    for step_key, agent in (
+        ("literature:agent", "LiteratureScout"),
+        ("iter:1:proposer", "Theorist"),
+        ("iter:1:verifier", "VerificationEngineer"),
+    ):
+        trace.log("step_reused", step_key=step_key, agent=agent, model="fake/model")
+    trace.log("step_reused", step_key="iter:1:tool", tool="script")
+    trace.log(
+        "agent_start",
+        agent="AdversarialCritic",
+        model="fake/model",
+        reasoning_effort="high",
+        step_key="iter:1:critic",
     )
+    rows = _rows(trace)
+    trace.close()
+
+    reused = [row for row in rows if row.get("type") == "step_reused"]
+    assert [row.get("index") for row in reused] == [1, 2, 3, None]
+    stage = next(row for row in rows if row.get("type") == "stage")
+    assert stage["index"] == 4
+    assert stage["total"] == 29
+    timeline = stage_timeline(rows)
+    first_cache = next(row for row in timeline if row.get("cache") and row.get("index") == 1)
+    assert first_cache["total"] == 29
+    assert first_cache["total_is_minimum"] is True
+
+
+def test_unknown_theorem_step_key_keeps_legacy_label():
+    assert Trace._theorem_stage_label("iter:1:proposal", "Theorist") == "Theorist · iter:1:proposal"
 
 
 def test_explicit_orchestrator_stage_is_not_duplicated(tmp_path):
@@ -159,13 +172,7 @@ def test_explicit_orchestrator_stage_is_not_duplicated(tmp_path):
         reasoning_effort="medium",
         step_key="pipeline:1",
     )
-    trace.log(
-        "agent_start",
-        agent="A",
-        model="fake/model",
-        reasoning_effort="medium",
-        step_key="pipeline:1",
-    )
+    trace.log("agent_start", agent="A", model="fake/model", reasoning_effort="medium", step_key="pipeline:1")
     rows = _rows(trace)
     trace.close()
     assert len([row for row in rows if row.get("type") == "stage"]) == 1

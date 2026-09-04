@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-from types import SimpleNamespace
 
 import pytest
 
@@ -12,6 +11,7 @@ from lab import TheoremResearchLab
 from lab.integrity import ProjectBusyError, ProjectRunLock, atomic_write_json
 from lab.project_manager import ProjectManager
 from lab.research_state import ResearchState
+from lab.run_controller import RunController
 
 
 class _NoopTrace:
@@ -102,9 +102,9 @@ def test_worker_json_contains_actual_in_process_pid(tmp_path, monkeypatch):
 
     class FakeLab:
         def __init__(self, trace, state, **kwargs):
-            del trace, kwargs
+            del kwargs
             self.state = state
-            self.controller = SimpleNamespace(lock=None)
+            self.controller = RunController(state.root, trace)
 
         def run(self, *args, **kwargs):
             del args, kwargs

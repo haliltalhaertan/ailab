@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import json
 from pathlib import Path
 from typing import Any
@@ -114,49 +115,86 @@ def _parse_jsonl_lines(lines: list[str]) -> list[dict[str, Any]]:
     return result
 
 
+def _resolved_jsonl_path(path: Path) -> Path:
+    if path.exists():
+        return path
+    gz_path = Path(str(path) + ".gz")
+    return gz_path if gz_path.exists() else path
+
+
+def _read_jsonl_bytes(path: Path) -> bytes:
+    actual = _resolved_jsonl_path(path)
+    if not actual.exists():
+        return b""
+    if actual.suffix == ".gz":
+        with gzip.open(actual, "rb") as handle:
+            return handle.read()
+    return actual.read_bytes()
+
+
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
-    if not path.exists():
+    raw = _read_jsonl_bytes(path)
+    if not raw:
         return []
-    with path.open("r", encoding="utf-8") as handle:
-        return _parse_jsonl_lines(handle.readlines())
+    return _parse_jsonl_lines(raw.decode("utf-8", errors="replace").splitlines())
 
 
 def read_jsonl_tail(path: Path, *, max_bytes: int = 2_000_000) -> list[dict[str, Any]]:
-    """Read only the tail of a potentially huge JSONL stream file.
+    """Read only the logical tail of a potentially huge JSONL or JSONL.GZ file."""
 
-    trace.jsonl is intentionally low-volume, but stream.jsonl can become very
-    large during long reasoning calls. The live UI only needs recent deltas;
-    completed calls already have their full output in trace.jsonl.
-    """
-
-    if not path.exists() or max_bytes <= 0:
+    if max_bytes <= 0:
         return []
-    with path.open("rb") as handle:
-        handle.seek(0, 2)
-        size = handle.tell()
-        start = max(0, size - int(max_bytes))
-        handle.seek(start)
+    actual = _resolved_jsonl_path(path)
+    if not actual.exists():
+        return []
+    if actual.suffix == ".gz":
+        raw = _read_jsonl_bytes(actual)
+        start = max(0, len(raw) - int(max_bytes))
+        raw = raw[start:]
         if start:
-            handle.readline()  # discard a possibly partial JSONL record
-        raw = handle.read()
+            newline = raw.find(b"\n")
+            raw = raw[newline + 1 :] if newline >= 0 else b""
+    else:
+        with actual.open("rb") as handle:
+            handle.seek(0, 2)
+            size = handle.tell()
+            start = max(0, size - int(max_bytes))
+            handle.seek(start)
+            if start:
+                handle.readline()
+            raw = handle.read()
     text = raw.decode("utf-8", errors="replace")
     return _parse_jsonl_lines(text.splitlines())
 
 
 def read_jsonl_since(path: Path, offset: int) -> tuple[list[dict[str, Any]], int]:
-    """Read complete JSONL records after ``offset`` without losing a partial tail."""
+    """Read complete JSONL records after an uncompressed-byte offset.
 
-    if not path.exists():
+    For ``.gz`` archives the offset refers to the logical decompressed JSONL
+    bytes, so a live raw stream can be atomically replaced by its gzip archive
+    without invalidating an existing UI offset.
+    """
+
+    actual = _resolved_jsonl_path(path)
+    if not actual.exists():
         return [], 0
-    size = path.stat().st_size
-    start = int(offset)
-    if start < 0 or start > size:
-        start = 0
-    if start == size:
+    start = max(0, int(offset))
+    if actual.suffix == ".gz":
+        all_raw = _read_jsonl_bytes(actual)
+        if start > len(all_raw):
+            start = 0
+        raw = all_raw[start:]
+    else:
+        size = actual.stat().st_size
+        if start > size:
+            start = 0
+        if start == size:
+            return [], start
+        with actual.open("rb") as handle:
+            handle.seek(start)
+            raw = handle.read()
+    if not raw:
         return [], start
-    with path.open("rb") as handle:
-        handle.seek(start)
-        raw = handle.read()
     last_newline = raw.rfind(b"\n")
     if last_newline < 0:
         return [], start
@@ -166,10 +204,30 @@ def read_jsonl_since(path: Path, offset: int) -> tuple[list[dict[str, Any]], int
     return _parse_jsonl_lines(text.splitlines()), new_offset
 
 
+def _logical_jsonl_size(path: Path) -> int:
+    actual = _resolved_jsonl_path(path)
+    if not actual.exists():
+        return 0
+    if actual.suffix == ".gz":
+        return len(_read_jsonl_bytes(actual))
+    return actual.stat().st_size
+
+
+def _run_is_complete(run_dir: Path) -> bool:
+    """A Trace summary is written only after the run has stopped producing events."""
+
+    return (run_dir / "summary.json").is_file()
+
+
 def live_log_offsets(run_dir: Path) -> dict[str, int]:
+    if _run_is_complete(run_dir):
+        return {
+            "trace": _logical_jsonl_size(run_dir / "trace.jsonl"),
+            "stream": 0,
+        }
     return {
-        "trace": (run_dir / "trace.jsonl").stat().st_size if (run_dir / "trace.jsonl").exists() else 0,
-        "stream": (run_dir / "stream.jsonl").stat().st_size if (run_dir / "stream.jsonl").exists() else 0,
+        "trace": _logical_jsonl_size(run_dir / "trace.jsonl"),
+        "stream": _logical_jsonl_size(run_dir / "stream.jsonl"),
     }
 
 
@@ -177,8 +235,13 @@ def load_live_run_delta(
     run_dir: Path,
     offsets: dict[str, int],
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    """Read only newly appended trace/stream records after the previous fragment."""
+    """Read only newly appended records while a run is still live."""
 
+    if _run_is_complete(run_dir):
+        return [], {
+            "trace": int(offsets.get("trace", 0) or 0),
+            "stream": int(offsets.get("stream", 0) or 0),
+        }
     trace_events, trace_offset = read_jsonl_since(run_dir / "trace.jsonl", int(offsets.get("trace", 0) or 0))
     stream_events, stream_offset = read_jsonl_since(run_dir / "stream.jsonl", int(offsets.get("stream", 0) or 0))
     events = trace_events + stream_events
@@ -195,10 +258,11 @@ def load_run_events(run_dir: Path, *, include_stream: bool = True) -> list[dict[
 
 
 def load_live_run_events(run_dir: Path, *, stream_tail_bytes: int = 2_000_000) -> list[dict[str, Any]]:
-    """Load a live timeline without re-reading the entire streaming log."""
+    """Load live data; completed runs reconstruct cards from trace only."""
 
     events = read_jsonl(run_dir / "trace.jsonl")
-    events.extend(read_jsonl_tail(run_dir / "stream.jsonl", max_bytes=stream_tail_bytes))
+    if not _run_is_complete(run_dir):
+        events.extend(read_jsonl_tail(run_dir / "stream.jsonl", max_bytes=stream_tail_bytes))
     events.sort(key=lambda ev: str(ev.get("ts") or ""))
     return events
 

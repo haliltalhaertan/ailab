@@ -287,3 +287,83 @@ def test_live_worker_replaces_run_action_with_stop_even_when_heartbeat_is_stale(
         assert "Durdurma isteği gönderildi…" in labels
     finally:
         lock.release()
+
+
+def test_completed_cards_render_outside_fragment_and_active_preview_is_bounded(tmp_path, monkeypatch):
+    app_path = Path(__file__).resolve().parents[1] / "app.py"
+    source = app_path.read_text(encoding="utf-8")
+    assert "@st.fragment(run_every=1.0)\ndef _render_live_fragment" in source
+    assert "@st.fragment(run_every=1.0)\ndef render_live_run" not in source
+    assert "lazy=True" in source
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    import lab.openrouter_catalog as catalog
+
+    monkeypatch.setattr(catalog, "fetch_openrouter_models", lambda: [])
+    _pm, _info, _root, lock = _prepare_live_project(tmp_path, completed_card=False)
+    run_dir = tmp_path / "runs" / "run-live-loop"
+    trace_path = run_dir / "trace.jsonl"
+    events = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+    for idx in range(3):
+        agent = f"DoneAgent{idx}"
+        step = f"done:{idx}"
+        events.extend(
+            [
+                {
+                    "ts": f"2026-09-02T17:39:2{idx}+00:00",
+                    "type": "agent_start",
+                    "agent": agent,
+                    "model": "fake/model",
+                    "step_key": step,
+                    "prompt": "done task",
+                },
+                {
+                    "ts": f"2026-09-02T17:39:3{idx}+00:00",
+                    "type": "llm_call",
+                    "agent": agent,
+                    "model": "fake/model",
+                    "output": f"DONE_SECRET_{idx}_" + ("D" * 5000),
+                    "provider_reasoning": "done reasoning",
+                    "prompt_tokens": 1,
+                    "completion_tokens": 2,
+                    "reasoning_tokens": 1,
+                    "total_tokens": 3,
+                    "latency_s": 1.0,
+                },
+            ]
+        )
+    trace_path.write_text(
+        "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    stream_event = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "type": "agent_stream",
+        "agent": "Sceptik",
+        "model": "fake/model",
+        "reasoning_effort": "medium",
+        "step_key": "loop:1:critic",
+        "channel": "reasoning",
+        "delta": "R" * 5000,
+    }
+    (run_dir / "stream.jsonl").write_text(json.dumps(stream_event) + "\n", encoding="utf-8")
+
+    try:
+        at = AppTest.from_file(str(app_path), default_timeout=10).run()
+        assert not at.exception
+        labels = [getattr(element, "label", "") for element in at.get("expander")]
+        done_labels = {label for label in labels if label.startswith("✅ DoneAgent")}
+        assert len(done_labels) == 3
+        assert any(label.startswith("⏳ Sceptik") for label in labels)
+        markdown_values = [element.value for element in at.markdown]
+        assert "R" * 4000 in markdown_values
+        assert "R" * 4001 not in "\n".join(markdown_values)
+        assert any("toplam 5,000 karakter" in caption.value for caption in at.caption)
+        assert len([button for button in at.button if button.label == "Göster"]) >= 3
+
+        show = next(button for button in at.button if button.label == "Göster")
+        at = show.click().run()
+        assert not at.exception
+    finally:
+        lock.release()

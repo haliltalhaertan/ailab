@@ -26,6 +26,7 @@ from lab.worker_runtime import WorkerRuntimeBridge
 
 AgentFactory = Callable[[str, dict[str, Any]], Agent]
 EXPERIMENT_METHODS = {"theorem_lab", "research_loop", "debate", "pipeline", "panel"}
+TERMINAL_RUNTIME_STATUSES = {"COMPLETED", "STOPPED", "PAUSED_ERROR", "INTERRUPTED"}
 
 
 def _now() -> str:
@@ -51,15 +52,9 @@ def _agent(role: str, raw: dict[str, Any]) -> Agent:
 
 
 def _write_worker(root: Path, *, pid: int, run_id: str, launched_at: str) -> None:
-    """Publish worker identity only; execution status lives in runtime.json."""
-
     atomic_write_json(
         root / "worker.json",
-        {
-            "pid": int(pid),
-            "run_id": str(run_id),
-            "launched_at": str(launched_at),
-        },
+        {"pid": int(pid), "run_id": str(run_id), "launched_at": str(launched_at)},
     )
 
 
@@ -69,21 +64,12 @@ def _mark_runtime_error(root: Path, exc: Exception) -> None:
     current = dict(current) if isinstance(current, dict) else {}
     now = _now()
     current.update(
-        {
-            "status": "PAUSED_ERROR",
-            "last_error": repr(exc),
-            "pid": os.getpid(),
-            "updated_at": now,
-            "heartbeat_at": now,
-        }
+        {"status": "PAUSED_ERROR", "last_error": repr(exc), "pid": os.getpid(), "updated_at": now, "heartbeat_at": now}
     )
     atomic_write_json(path, current)
 
 
-def _theorem_agents(
-    raw_agents: Any,
-    agent_factory: AgentFactory,
-) -> dict[str, Agent]:
+def _theorem_agents(raw_agents: Any, agent_factory: AgentFactory) -> dict[str, Agent]:
     if isinstance(raw_agents, dict):
         specs = [(str(role), raw) for role, raw in raw_agents.items() if isinstance(raw, dict)]
     elif isinstance(raw_agents, list):
@@ -97,13 +83,7 @@ def _theorem_agents(
     else:
         raise ValueError("worker request agents must be an object or ordered list")
     agents = {role: agent_factory(role, raw) for role, raw in specs}
-    required = {
-        "ResearchManager",
-        "Theorist",
-        "AdversarialCritic",
-        "VerificationEngineer",
-        "IndependentAuditor",
-    }
+    required = {"ResearchManager", "Theorist", "AdversarialCritic", "VerificationEngineer", "IndependentAuditor"}
     missing = required - set(agents)
     if missing:
         raise ValueError(f"Missing worker agents: {sorted(missing)}")
@@ -138,42 +118,20 @@ def _optional_agents(raw_optional: Any, agent_factory: AgentFactory) -> dict[str
     return agents
 
 
-def _run_orchestrator(
-    method: str,
-    request: dict[str, Any],
-    trace: Trace,
-    agent_factory: AgentFactory,
-    bridge: WorkerRuntimeBridge,
-) -> str:
+def _run_orchestrator(method: str, request: dict[str, Any], trace: Trace, agent_factory: AgentFactory, bridge: WorkerRuntimeBridge) -> str:
     prompt = str(request.get("prompt") or request.get("problem") or "")
     param = int(request.get("param", request.get("iterations", 0)) or 0)
     agents = _ordered_agents(request.get("agents"), agent_factory)
     optional = _optional_agents(request.get("optional_agents"), agent_factory)
-    orchestrator = Orchestrator(
-        trace,
-        cancel_check=bridge.cancel_check,
-        on_stage=bridge.on_stage,
-    )
-
+    orchestrator = Orchestrator(trace, cancel_check=bridge.cancel_check, on_stage=bridge.on_stage)
     if method == "research_loop":
         if len(agents) < 2:
             raise ValueError("research_loop requires proposer and critic")
-        return orchestrator.research_loop(
-            prompt,
-            agents[0],
-            agents[1],
-            iterations=max(1, param),
-            synthesizer=optional.get("Raporcu"),
-        )
+        return orchestrator.research_loop(prompt, agents[0], agents[1], iterations=max(1, param), synthesizer=optional.get("Raporcu"))
     if method == "debate":
         if not agents:
             raise ValueError("debate requires at least one debater")
-        return orchestrator.debate(
-            prompt,
-            agents,
-            rounds=max(1, param),
-            judge=optional.get("Hakem"),
-        )
+        return orchestrator.debate(prompt, agents, rounds=max(1, param), judge=optional.get("Hakem"))
     if method == "pipeline":
         if not agents:
             raise ValueError("pipeline requires at least one agent")
@@ -189,22 +147,12 @@ def run_project(project_id: str, *, agent_factory: AgentFactory = _agent) -> int
     load_dotenv()
     pm = ProjectManager()
     root = pm.project_root(project_id)
-
-    # Lock first. A losing worker must not read/overwrite the active request,
-    # config, stop flag, worker identity, project metadata or runtime state.
     lock = ProjectRunLock(root)
     try:
         lock.acquire()
     except ProjectBusyError as exc:
         try:
-            atomic_write_json(
-                root / "worker_busy.json",
-                {
-                    "pid": os.getpid(),
-                    "rejected_at": _now(),
-                    "error": str(exc),
-                },
-            )
+            atomic_write_json(root / "worker_busy.json", {"pid": os.getpid(), "rejected_at": _now(), "error": str(exc)})
         except Exception:
             pass
         return 3
@@ -217,21 +165,16 @@ def run_project(project_id: str, *, agent_factory: AgentFactory = _agent) -> int
     final_status: str | None = None
     try:
         info = pm.get(project_id)
-        request_path = root / "worker_request.json"
-        request = _read(request_path)
+        request = _read(root / "worker_request.json")
         if str(request.get("project_uuid") or "") != info.project_uuid:
             raise RuntimeError("worker request project_uuid does not match current project identity")
         method = str(request.get("experiment_method") or "theorem_lab")
         if method not in EXPERIMENT_METHODS:
             raise ValueError(f"Unsupported experiment_method: {method}")
-        experiment_name = str(
-            request.get("experiment_name")
-            or ("Teorem Araştırması" if method == "theorem_lab" else method)
-        )
+        experiment_name = str(request.get("experiment_name") or ("Teorem Araştırması" if method == "theorem_lab" else method))
 
         trace = Trace(f"worker-{method}")
-        launched_at = _now()
-        _write_worker(root, pid=os.getpid(), run_id=trace.run_id, launched_at=launched_at)
+        _write_worker(root, pid=os.getpid(), run_id=trace.run_id, launched_at=_now())
         pm.touch(project_id, experiment=experiment_name, status="RUNNING")
         trace.log(
             "project_context",
@@ -251,21 +194,19 @@ def run_project(project_id: str, *, agent_factory: AgentFactory = _agent) -> int
                 checkpoint_every=theorem_checkpoint_every,
                 has_literature_agent="LiteratureScout" in agents,
             )
-            trace._stage_index = 4 * int((_read(root / "runtime.json").get("completed_iterations", 0) or 0)) + (int((_read(root / "runtime.json").get("completed_iterations", 0) or 0)) // theorem_checkpoint_every if theorem_checkpoint_every > 0 else 0) + (1 if "LiteratureScout" in agents and int((_read(root / "runtime.json").get("completed_iterations", 0) or 0)) > 0 else 0)
+            runtime_before = _read(root / "runtime.json")
+            trace.configure_theorem_resume_offset(
+                completed_iterations=int(runtime_before.get("completed_iterations", 0) or 0),
+                checkpoint_every=theorem_checkpoint_every,
+            )
             state = ResearchState(root)
             lab = TheoremResearchLab(
                 trace,
                 state,
-                code_experiment_settings_override=(
-                    request.get("code_experiment")
-                    if isinstance(request.get("code_experiment"), dict)
-                    else None
-                ),
+                code_experiment_settings_override=request.get("code_experiment") if isinstance(request.get("code_experiment"), dict) else None,
             )
-            # Share the already-held lock with the engine. ProjectRunLock is
-            # re-entrant for this object, so nested engine contexts do not race.
             lab.controller.lock = lock
-            bridge = WorkerRuntimeBridge(lab.controller)
+            bridge = WorkerRuntimeBridge(lab.controller, background_heartbeat=True)
             trace.set_stage_listener(bridge.on_stage)
             result = lab.run(
                 str(request.get("problem") or request.get("prompt") or ""),
@@ -280,28 +221,22 @@ def run_project(project_id: str, *, agent_factory: AgentFactory = _agent) -> int
                 literature_query=request.get("literature_query"),
                 checkpoint_every=theorem_checkpoint_every,
             )
+            theorem_status = str(lab.controller.runtime().get("status") or "COMPLETED").upper()
+            if theorem_status not in TERMINAL_RUNTIME_STATUSES:
+                theorem_status = "COMPLETED"
+            bridge.close()
+            bridge.set_runtime(status=theorem_status, current_agent="")
+            final_status = theorem_status
         else:
             controller = RunController(root, trace)
             controller.lock = lock
             controller.clear_stale_stop()
             bridge = WorkerRuntimeBridge(controller, background_heartbeat=True)
-            bridge.set_runtime(
-                status="RUNNING",
-                current_step="Deney başlatılıyor",
-                current_agent="",
-                last_error="",
-            )
+            bridge.set_runtime(status="RUNNING", current_step="Deney başlatılıyor", current_agent="", last_error="")
             controller.check_stop()
             result = _run_orchestrator(method, request, trace, agent_factory, bridge)
-            # Join the heartbeat thread before publishing the final status so a
-            # stale read-modify-write heartbeat cannot overwrite COMPLETED.
             bridge.close()
-            bridge.set_runtime(
-                status="COMPLETED",
-                current_step="Tamamlandı",
-                current_agent="",
-                last_error="",
-            )
+            bridge.set_runtime(status="COMPLETED", current_step="Tamamlandı", current_agent="", last_error="")
             final_status = "COMPLETED"
     except ResearchStopped as exc:
         exit_code = 0
@@ -309,19 +244,9 @@ def run_project(project_id: str, *, agent_factory: AgentFactory = _agent) -> int
         final_status = "STOPPED"
         if bridge is not None:
             bridge.close()
-            bridge.set_runtime(
-                status="STOPPED",
-                current_step="Durduruldu",
-                current_agent="",
-                last_error="",
-            )
+            bridge.set_runtime(status="STOPPED", current_step="Durduruldu", current_agent="", last_error="")
         elif controller is not None:
-            controller.set_runtime(
-                status="STOPPED",
-                current_step="Durduruldu",
-                current_agent="",
-                last_error="",
-            )
+            controller.set_runtime(status="STOPPED", current_step="Durduruldu", current_agent="", last_error="")
         if trace is not None:
             trace.log("run_stopped", reason=str(exc))
     except Exception as exc:
@@ -348,6 +273,11 @@ def run_project(project_id: str, *, agent_factory: AgentFactory = _agent) -> int
         if trace is not None and not trace.closed:
             try:
                 trace.close()
+            except Exception:
+                pass
+        if trace is not None and trace.closed:
+            try:
+                trace.compress_stream()
             except Exception:
                 pass
         if final_status is not None:

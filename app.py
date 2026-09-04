@@ -21,7 +21,14 @@ from lab.reasoning_settings import (
     save_settings,
     settings_path,
 )
-from lab.ui_live import CardState, build_cards, merge_cards, render_now_and_timeline
+from lab.ui_live import (
+    CardState,
+    build_cards,
+    live_text_preview,
+    merge_cards,
+    render_now_and_timeline,
+    render_stage_timeline,
+)
 from lab.ui_model import (
     cost_text,
     event_summary,
@@ -410,23 +417,61 @@ def _card_header(card: CardState) -> str:
     return f"⏳ {card.agent} · {card.model} — çalışıyor · reasoning {card.effort or 'provider-default'}"
 
 
-def render_agent_card(target, card: CardState, *, expanded: bool | None = None) -> None:
+def _render_card_text(text: str, *, empty_caption: str, tail_chars: int | None, state_key: str) -> None:
+    if not text:
+        st.caption(empty_caption)
+        return
+    if tail_chars is not None and not st.session_state.get(f"{state_key}:full", False):
+        preview, truncated = live_text_preview(text, limit=tail_chars)
+        if truncated:
+            st.caption(f"… (toplam {len(text):,} karakter; son {tail_chars:,} karakter gösteriliyor)")
+            st.markdown(preview)
+            if st.button("Tamamını göster", key=f"{state_key}:show_full"):
+                st.session_state[f"{state_key}:full"] = True
+                st.rerun()
+            return
+    st.markdown(text)
+
+
+def render_agent_card(
+    target,
+    card: CardState,
+    *,
+    expanded: bool | None = None,
+    lazy: bool = False,
+    live_tail_chars: int | None = None,
+    state_prefix: str = "card",
+) -> None:
     if expanded is None:
         expanded = card.status == "running"
+    show_key = f"show_card:{state_prefix}:{card.step_key}"
     with target.expander(_card_header(card), expanded=expanded):
+        if lazy and not st.session_state.get(show_key, False):
+            st.caption("Bitmiş kartın tam metni yalnız istediğinde yüklenir.")
+            if st.button("Göster", key=f"{show_key}:button"):
+                st.session_state[show_key] = True
+                st.rerun()
+            return
         rtab, atab, ttab = st.tabs(["🧠 Reasoning", "✍️ Cevap", "📋 Görev"])
         with rtab:
             if card.reasoning:
-                st.markdown(card.reasoning)
+                _render_card_text(
+                    card.reasoning,
+                    empty_caption="Provider reasoning gönderirse burada görünecek.",
+                    tail_chars=live_tail_chars,
+                    state_key=f"{show_key}:reasoning",
+                )
             elif card.reasoning_tokens > 0:
                 st.caption(f"Sağlayıcı reasoning metnini göstermedi ({card.reasoning_tokens:,} token).")
             else:
                 st.caption("Provider reasoning gönderirse burada görünecek.")
         with atab:
-            if card.content:
-                st.markdown(card.content)
-            else:
-                st.caption("Yanıt bekleniyor…")
+            _render_card_text(
+                card.content,
+                empty_caption="Yanıt bekleniyor…",
+                tail_chars=live_tail_chars,
+                state_key=f"{show_key}:content",
+            )
         with ttab:
             if card.system_prompt:
                 st.markdown("**System prompt**")
@@ -467,8 +512,8 @@ def render_history(active: ProjectInfo) -> None:
         summary_metrics(summary)
         rows = usage_rows(summary)
         if rows:
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-    events = load_run_events(selected, include_stream=True)
+            st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+    events = load_run_events(selected, include_stream=False)
     st.subheader("Araştırma Timeline'ı")
     target = st.container(border=True)
     for card in reversed(build_cards(events)):
@@ -530,14 +575,68 @@ def _ordered_live_cards(cards: list[CardState], current_step: str) -> list[CardS
     return sorted(
         cards,
         key=lambda card: (
-            0 if card.step_key == current_step and card.status == "running" else 1 if card.status == "running" else 2,
+            0 if card.step_key == current_step and card.status == "running" else 1,
             -card.order,
         ),
     )
 
 
 @st.fragment(run_every=1.0)
+def _render_live_fragment(
+    active: ProjectInfo,
+    latest: Path | None,
+    known_done: tuple[str, ...],
+    outer_status: str,
+) -> None:
+    project_root = PROJECTS.project_root(active.project_id)
+    runtime = _read_json(project_root / "runtime.json", {})
+    worker = _read_json(project_root / "worker.json", {})
+    status = str(runtime.get("status") or worker.get("status") or active.status or "READY")
+
+    events: list[dict] = []
+    cards: list[CardState] = []
+    if latest is not None:
+        cards, events = _load_cached_live_state(latest)
+    elif status == "RUNNING":
+        st.info("Worker başladı. İlk trace event'i bekleniyor…")
+
+    done_now = {card.step_key for card in cards if card.status in {"done", "error"}}
+    if done_now.difference(known_done):
+        st.rerun(scope="app")
+
+    snapshot = render_now_and_timeline(
+        runtime,
+        events,
+        status=status,
+        cards=cards,
+        include_timeline=False,
+    )
+    active_cards = [card for card in cards if card.status == "running"]
+    if active_cards:
+        st.markdown("#### Aktif agent")
+        target = st.container(border=True)
+        current_step = str(snapshot.get("step_key") or "")
+        prefix = latest.name if latest is not None else active.project_id
+        for card in _ordered_live_cards(active_cards, current_step):
+            render_agent_card(
+                target,
+                card,
+                expanded=True,
+                live_tail_chars=4_000,
+                state_prefix=f"{prefix}:active",
+            )
+    elif status == "RUNNING":
+        st.caption("Aktif agent kartı bekleniyor…")
+
+    render_stage_timeline(events)
+
+    if status != outer_status and status in {"COMPLETED", "STOPPED", "PAUSED_ERROR", "INTERRUPTED"}:
+        st.rerun(scope="app")
+
+
 def render_live_run(active: ProjectInfo) -> None:
+    """Render stable completed cards outside the one-second live fragment."""
+
     project_root = PROJECTS.project_root(active.project_id)
     runtime = _read_json(project_root / "runtime.json", {})
     worker = _read_json(project_root / "worker.json", {})
@@ -550,25 +649,29 @@ def render_live_run(active: ProjectInfo) -> None:
         st.error(str(runtime["last_error"]))
 
     run_dirs = runs_for_project(RUNS_DIR, active.project_id, active.project_uuid)
-    events: list[dict] = []
+    latest = run_dirs[0] if run_dirs else None
     cards: list[CardState] = []
-    latest: Path | None = None
-    if run_dirs:
-        latest = run_dirs[0]
-        cards, events = _load_cached_live_state(latest)
-    elif status == "RUNNING":
-        st.info("Worker başladı. İlk trace event'i bekleniyor…")
+    if latest is not None:
+        cards, _events = _load_cached_live_state(latest)
 
-    snapshot = render_now_and_timeline(runtime, events, status=status, cards=cards)
+    done_cards = [card for card in cards if card.status in {"done", "error"}]
+    known_done = tuple(card.step_key for card in done_cards)
+    _render_live_fragment(active, latest, known_done, status)
 
-    if cards:
-        st.markdown("#### Agent kartları")
+    if done_cards:
+        st.markdown("#### Tamamlanan agent kartları")
         target = st.container(border=True)
-        current_step = str(snapshot.get("step_key") or "")
-        for card in _ordered_live_cards(cards, current_step):
-            render_agent_card(target, card, expanded=card.status == "running")
+        prefix = latest.name if latest is not None else active.project_id
+        for card in sorted(done_cards, key=lambda item: item.order, reverse=True):
+            render_agent_card(
+                target,
+                card,
+                expanded=False,
+                lazy=True,
+                state_prefix=f"{prefix}:done",
+            )
 
-    if st.button("Research Control", use_container_width=True, key="live_control"):
+    if st.button("Research Control", width="stretch", key="live_control"):
         st.switch_page("pages/3_Research_Control.py")
 
     result_path = project_root / "worker_result.md"
@@ -634,7 +737,7 @@ def active_project_header(active: ProjectInfo) -> None:
             f"`{active.project_id}` · durum **{active.status}** · {active.run_count} run · ${active.total_cost_usd:.4f}"
         )
         c1.caption(f"💾 Bu proje bu bilgisayara otomatik kaydediliyor · `{storage['project_root']}`")
-        if c2.button("Projeyi Değiştir", use_container_width=True):
+        if c2.button("Projeyi Değiştir", width="stretch"):
             st.switch_page("pages/1_Projeler.py")
         if active.status in {"RUNNING", "PAUSED_ERROR", "STOPPED", "PAUSED", "STALE_RUNNING"}:
             if st.button("Araştırma Kontrolü", type="primary"):
@@ -654,17 +757,17 @@ def main() -> None:
     if active is None:
         st.info("Araştırma başlatmak için önce bir proje oluştur veya mevcut projeyi aç.")
         c1, c2 = st.columns(2)
-        if c1.button("＋ Yeni Proje Oluştur", type="primary", use_container_width=True):
+        if c1.button("＋ Yeni Proje Oluştur", type="primary", width="stretch"):
             st.session_state["show_create_project"] = True
             st.switch_page("pages/1_Projeler.py")
-        if c2.button("Projeleri Aç", use_container_width=True):
+        if c2.button("Projeleri Aç", width="stretch"):
             st.switch_page("pages/1_Projeler.py")
         st.stop()
 
     active_project_header(active)
     st.sidebar.header("Deney Ayarları")
     st.sidebar.caption(f"Aktif proje: **{active.title}** · `{active.project_id}`")
-    if st.sidebar.button("Projeleri Aç", use_container_width=True):
+    if st.sidebar.button("Projeleri Aç", width="stretch"):
         st.switch_page("pages/1_Projeler.py")
 
     api_ok = bool(os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY"))
@@ -698,7 +801,7 @@ def main() -> None:
                 stop_label,
                 type="primary",
                 disabled=stop_requested,
-                use_container_width=True,
+                width="stretch",
                 key="run_stop",
             ):
                 _request_stop(project_root)
@@ -708,7 +811,7 @@ def main() -> None:
                 st.rerun()
             if c2.button(
                 "ZORLA DURDUR · HEMEN",
-                use_container_width=True,
+                width="stretch",
                 key="run_force_stop",
                 help="Worker process'ini hemen sonlandırır. Son agent çağrısının partial çıktısı eksik kalabilir.",
             ):
@@ -722,7 +825,7 @@ def main() -> None:
             "Deneyi Çalıştır",
             type="primary",
             disabled=not api_ok,
-            use_container_width=True,
+            width="stretch",
             key="run_start",
         ):
             if not prompt.strip():

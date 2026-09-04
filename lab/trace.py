@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import gzip
 import json
 import re
+import shutil
 import time
 import uuid
 from collections import defaultdict
@@ -23,13 +25,7 @@ def get_active_trace() -> "Trace | None":
 
 
 class Trace:
-    """Append-only run trace with a separate buffered streaming channel.
-
-    ``stage`` / ``stage_end`` are the common live-run lifecycle. Callers such as
-    Orchestrator may emit them explicitly. Legacy/theorem callers that already
-    emit ``agent_start`` + ``llm_call`` are adapted here so the UI has one event
-    contract without changing evidence/contract/ledger code.
-    """
+    """Append-only run trace with a separate buffered streaming channel."""
 
     STREAM_FLUSH_S = 0.20
     STREAM_FLUSH_CHARS = 4096
@@ -74,22 +70,36 @@ class Trace:
         checkpoint_every: int,
         has_literature_agent: bool,
     ) -> int:
-        """Configure the predictable minimum number of theorem LLM calls.
-
-        Code-experiment planning calls and JSON-repair calls are data dependent,
-        so they are intentionally excluded and the published total is a minimum.
-        """
-
         count = max(0, int(iterations)) * 4
         if has_literature_agent:
             count += 1
         every = int(checkpoint_every)
         if every > 0:
             count += max(0, int(iterations)) // every
-        count += 1  # final independent audit
+        count += 1
         self._theorem_stage_total = count
         self._theorem_stage_total_is_minimum = True
         return count
+
+    def configure_theorem_resume_offset(
+        self,
+        *,
+        completed_iterations: int,
+        checkpoint_every: int,
+    ) -> int:
+        """Seed only structurally completed theorem calls before cache replay.
+
+        Literature and partial-iteration LLM calls are deliberately not guessed:
+        each real ``step_reused(agent=...)`` advances the index when replayed.
+        """
+
+        completed = max(0, int(completed_iterations))
+        every = int(checkpoint_every)
+        offset = 4 * completed
+        if every > 0:
+            offset += completed // every
+        self._stage_index = offset
+        return offset
 
     @staticmethod
     def _theorem_stage_label(step_key: str, agent: str) -> str:
@@ -142,11 +152,7 @@ class Trace:
             self._stage_listener(dict(event))
 
     def _write_stage(self, event_type: str, data: dict[str, Any]) -> dict[str, Any]:
-        event = {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "type": event_type,
-            **data,
-        }
+        event = {"ts": datetime.now(timezone.utc).isoformat(), "type": event_type, **data}
         self._write_trace(event)
         self._notify_stage(event)
         return event
@@ -210,15 +216,10 @@ class Trace:
                 return
         for payload in list(self._stream_buffers.values()):
             event = {
-                "ts": payload["ts"],
-                "type": "agent_stream",
-                "agent": payload["agent"],
-                "model": payload["model"],
-                "reasoning_effort": payload.get("reasoning_effort"),
-                "step_key": payload["step_key"],
-                "channel": payload["channel"],
-                "delta": payload["delta"],
-                "batch_parts": payload["parts"],
+                "ts": payload["ts"], "type": "agent_stream", "agent": payload["agent"],
+                "model": payload["model"], "reasoning_effort": payload.get("reasoning_effort"),
+                "step_key": payload["step_key"], "channel": payload["channel"],
+                "delta": payload["delta"], "batch_parts": payload["parts"],
             }
             self._stream_handle.write(json.dumps(event, ensure_ascii=False) + "\n")
         self._stream_handle.flush()
@@ -228,37 +229,19 @@ class Trace:
     def _buffer_stream(self, data: dict[str, Any]) -> None:
         channel = str(data.get("channel") or "")
         delta = data.get("delta")
-        # Structured reasoning details are not safely concatenable; write them as
-        # one stream event immediately rather than inflating trace.jsonl.
         if not isinstance(delta, str):
             self._flush_stream(force=True)
-            event = {
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "type": "agent_stream",
-                **data,
-                "batch_parts": 1,
-            }
+            event = {"ts": datetime.now(timezone.utc).isoformat(), "type": "agent_stream", **data, "batch_parts": 1}
             self._stream_handle.write(json.dumps(event, ensure_ascii=False) + "\n")
             self._stream_handle.flush()
             return
-        key = (
-            str(data.get("agent") or ""),
-            str(data.get("model") or ""),
-            str(data.get("step_key") or ""),
-            channel,
-        )
+        key = (str(data.get("agent") or ""), str(data.get("model") or ""), str(data.get("step_key") or ""), channel)
         payload = self._stream_buffers.get(key)
         if payload is None:
             payload = {
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "agent": key[0],
-                "model": key[1],
-                "step_key": key[2],
-                "channel": channel,
-                "reasoning_effort": data.get("reasoning_effort"),
-                "delta": "",
-                "parts": 0,
-                "chars": 0,
+                "ts": datetime.now(timezone.utc).isoformat(), "agent": key[0], "model": key[1],
+                "step_key": key[2], "channel": channel, "reasoning_effort": data.get("reasoning_effort"),
+                "delta": "", "parts": 0, "chars": 0,
             }
             self._stream_buffers[key] = payload
         payload["delta"] += delta
@@ -293,11 +276,25 @@ class Trace:
         if event_type == "agent_start":
             self._auto_stage_for_agent_start(data)
 
-        event = {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "type": event_type,
-            **data,
-        }
+        if (
+            event_type == "step_reused"
+            and self.experiment_method == "theorem_lab"
+            and str(data.get("agent") or "").strip()
+        ):
+            self._stage_index += 1
+            data = dict(data)
+            agent = str(data.get("agent") or "Agent")
+            step_key = str(data.get("step_key") or "")
+            data.update(
+                {
+                    "index": self._stage_index,
+                    "total": self._theorem_stage_total,
+                    "total_is_minimum": self._theorem_stage_total_is_minimum,
+                    "label": self._theorem_stage_label(step_key, agent),
+                }
+            )
+
+        event = {"ts": datetime.now(timezone.utc).isoformat(), "type": event_type, **data}
         self._write_trace(event)
         if event_type == "project_context":
             self.project_id = str(data.get("project_id") or "") or None
@@ -311,11 +308,8 @@ class Trace:
                     has_literature_agent=bool(data.get("has_literature_agent")),
                 )
             self._index(
-                "run_context",
-                project_id=self.project_id,
-                project_uuid=self.project_uuid,
-                title=data.get("title"),
-                experiment=data.get("experiment"),
+                "run_context", project_id=self.project_id, project_uuid=self.project_uuid,
+                title=data.get("title"), experiment=data.get("experiment"),
             )
         elif event_type == "llm_call":
             self._auto_stage_end_for_llm_call(data)
@@ -323,22 +317,16 @@ class Trace:
     def agent_call(self, agent: str, model: str, temperature: float, messages: list[dict], response) -> None:
         exact_messages = getattr(response, "request_messages", None) or messages
         self.log(
-            "llm_call",
-            agent=agent,
-            model=model,
-            temperature=temperature,
+            "llm_call", agent=agent, model=model, temperature=temperature,
             reasoning_effort=getattr(response, "requested_reasoning_effort", None),
-            messages=exact_messages,
-            output=response.content,
+            messages=exact_messages, output=response.content,
             provider_reasoning=getattr(response, "provider_reasoning", ""),
             reasoning_details=getattr(response, "reasoning_details", None),
-            prompt_tokens=response.prompt_tokens,
-            completion_tokens=response.completion_tokens,
+            prompt_tokens=response.prompt_tokens, completion_tokens=response.completion_tokens,
             reasoning_tokens=getattr(response, "reasoning_tokens", 0),
             cached_tokens=getattr(response, "cached_tokens", 0),
             total_tokens=response.prompt_tokens + response.completion_tokens,
-            cost_usd=getattr(response, "cost_usd", None),
-            latency_s=response.latency_s,
+            cost_usd=getattr(response, "cost_usd", None), latency_s=response.latency_s,
         )
 
     def close(self) -> Path:
@@ -349,17 +337,9 @@ class Trace:
 
         def new_total() -> dict[str, Any]:
             return {
-                "calls": 0,
-                "models": [],
-                "reasoning_efforts": [],
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "reasoning_tokens": 0,
-                "cached_tokens": 0,
-                "total_tokens": 0,
-                "cost_usd": 0.0,
-                "cost_available_calls": 0,
-                "latency_s": 0.0,
+                "calls": 0, "models": [], "reasoning_efforts": [], "prompt_tokens": 0,
+                "completion_tokens": 0, "reasoning_tokens": 0, "cached_tokens": 0,
+                "total_tokens": 0, "cost_usd": 0.0, "cost_available_calls": 0, "latency_s": 0.0,
             }
 
         totals: dict[str, dict[str, Any]] = defaultdict(new_total)
@@ -380,13 +360,7 @@ class Trace:
                 effort = ev.get("reasoning_effort")
                 if effort is not None and effort not in t["reasoning_efforts"]:
                     t["reasoning_efforts"].append(effort)
-                for key in (
-                    "prompt_tokens",
-                    "completion_tokens",
-                    "reasoning_tokens",
-                    "cached_tokens",
-                    "total_tokens",
-                ):
+                for key in ("prompt_tokens", "completion_tokens", "reasoning_tokens", "cached_tokens", "total_tokens"):
                     t[key] += int(ev.get(key, 0) or 0)
                 if ev.get("cost_usd") is not None:
                     t["cost_usd"] += float(ev["cost_usd"])
@@ -408,21 +382,13 @@ class Trace:
             t["latency_s"] = round(t["latency_s"], 3)
             t["cost_complete"] = t["cost_available_calls"] == t["calls"]
         summary = {
-            "run_id": self.run_id,
-            "project_id": self.project_id,
-            "project_uuid": self.project_uuid,
-            "started_at": self.started_at,
-            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "run_id": self.run_id, "project_id": self.project_id, "project_uuid": self.project_uuid,
+            "started_at": self.started_at, "finished_at": datetime.now(timezone.utc).isoformat(),
             "wall_time_s": round(time.perf_counter() - self._started_perf, 3),
-            "llm_latency_s": round(llm_latency, 3),
-            "agents": agents,
-            "total_calls": total_calls,
-            "total_prompt_tokens": total_prompt,
-            "total_completion_tokens": total_completion,
-            "total_reasoning_tokens": total_reasoning,
-            "total_cached_tokens": total_cached,
-            "total_tokens": total_tokens,
-            "total_cost_usd": round(total_cost, 8),
+            "llm_latency_s": round(llm_latency, 3), "agents": agents, "total_calls": total_calls,
+            "total_prompt_tokens": total_prompt, "total_completion_tokens": total_completion,
+            "total_reasoning_tokens": total_reasoning, "total_cached_tokens": total_cached,
+            "total_tokens": total_tokens, "total_cost_usd": round(total_cost, 8),
             "cost_available_calls": cost_available_calls,
             "cost_complete": cost_available_calls == total_calls if total_calls else True,
             "event_count": event_count,
@@ -431,14 +397,27 @@ class Trace:
         out = self.run_dir / "summary.json"
         out.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
         self._index(
-            "run_finished",
-            project_id=self.project_id,
-            project_uuid=self.project_uuid,
-            summary=str(out),
-            total_tokens=total_tokens,
-            total_cost_usd=round(total_cost, 8),
+            "run_finished", project_id=self.project_id, project_uuid=self.project_uuid,
+            summary=str(out), total_tokens=total_tokens, total_cost_usd=round(total_cost, 8),
         )
         self.closed = True
         self._trace_handle.close()
         self._stream_handle.close()
         return out
+
+    def compress_stream(self) -> Path | None:
+        if not self.closed:
+            raise RuntimeError("Trace must be closed before stream compression")
+        raw = self.stream_path
+        gz_path = Path(str(raw) + ".gz")
+        if not raw.exists():
+            return gz_path if gz_path.exists() else None
+        tmp = Path(str(gz_path) + ".tmp")
+        try:
+            with raw.open("rb") as source, gzip.open(tmp, "wb", compresslevel=6) as target:
+                shutil.copyfileobj(source, target)
+            tmp.replace(gz_path)
+            raw.unlink()
+        finally:
+            tmp.unlink(missing_ok=True)
+        return gz_path

@@ -111,15 +111,19 @@ def _apply_card_events(cards: list[CardState], events: list[dict[str, Any]]) -> 
 
 
 def build_cards(events: list[dict[str, Any]]) -> list[CardState]:
-    """Reduce raw agent events to one final render state per step key."""
-
     return _apply_card_events([], events)
 
 
 def merge_cards(cards: list[CardState], events: list[dict[str, Any]]) -> list[CardState]:
-    """Apply only newly appended events to cached card states."""
-
     return _apply_card_events(cards, events)
+
+
+def live_text_preview(text: str, *, limit: int = 4_000) -> tuple[str, bool]:
+    value = str(text or "")
+    cap = max(1, int(limit))
+    if len(value) <= cap:
+        return value, False
+    return value[-cap:], True
 
 
 def parse_ts(value: Any) -> datetime | None:
@@ -144,8 +148,6 @@ def elapsed_seconds(start: Any, end: Any | None = None) -> float:
 
 
 def stage_timeline(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Pair stage/stage_end records and expose cache reuse rows."""
-
     starts: dict[str, dict[str, Any]] = {}
     rows: list[dict[str, Any]] = []
     for event in events:
@@ -170,9 +172,7 @@ def stage_timeline(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "cost_usd": event.get("cost_usd"),
                     "index": start.get("index", event.get("index")),
                     "total": start.get("total", event.get("total")),
-                    "total_is_minimum": bool(
-                        start.get("total_is_minimum", event.get("total_is_minimum", False))
-                    ),
+                    "total_is_minimum": bool(start.get("total_is_minimum", event.get("total_is_minimum", False))),
                     "cache": False,
                 }
             )
@@ -180,7 +180,7 @@ def stage_timeline(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
             rows.append(
                 {
                     "step_key": step_key,
-                    "label": step_key,
+                    "label": str(event.get("label") or step_key),
                     "agent": str(event.get("agent") or ""),
                     "started_at": event.get("ts"),
                     "finished_at": event.get("ts"),
@@ -188,9 +188,9 @@ def stage_timeline(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "total_tokens": 0,
                     "reasoning_tokens": 0,
                     "cost_usd": None,
-                    "index": None,
-                    "total": None,
-                    "total_is_minimum": False,
+                    "index": event.get("index"),
+                    "total": event.get("total"),
+                    "total_is_minimum": bool(event.get("total_is_minimum", False)),
                     "cache": True,
                 }
             )
@@ -204,12 +204,6 @@ def live_stage_snapshot(
     now: datetime | None = None,
     cards: list[CardState] | None = None,
 ) -> dict[str, Any]:
-    """Return the current/last stage, progress and live token estimate.
-
-    During a streaming call token count is deliberately marked as an estimate
-    based on visible characters/4. Once stage_end exists, provider totals win.
-    """
-
     now = now or datetime.now(timezone.utc)
     stages = [event for event in events if event.get("type") == "stage"]
     if not stages:
@@ -232,11 +226,7 @@ def live_stage_snapshot(
     stage = stages[-1]
     step_key = str(stage.get("step_key") or "")
     end = next(
-        (
-            event
-            for event in reversed(events)
-            if event.get("type") == "stage_end" and str(event.get("step_key") or "") == step_key
-        ),
+        (event for event in reversed(events) if event.get("type") == "stage_end" and str(event.get("step_key") or "") == step_key),
         None,
     )
     if end is not None:
@@ -253,9 +243,7 @@ def live_stage_snapshot(
             visible_chars = 0
             reasoning_chars = 0
             for event in events:
-                if event.get("type") != "agent_stream":
-                    continue
-                if str(event.get("step_key") or "") != step_key:
+                if event.get("type") != "agent_stream" or str(event.get("step_key") or "") != step_key:
                     continue
                 delta = event.get("delta")
                 if not isinstance(delta, str):
@@ -308,15 +296,43 @@ def _clock(value: Any) -> str:
     return parsed.astimezone().strftime("%H:%M:%S") if parsed else "--:--:--"
 
 
+def render_stage_timeline(events: list[dict[str, Any]]) -> None:
+    import streamlit as st
+
+    rows = stage_timeline(events)
+    st.markdown("#### Zaman çizelgesi")
+    if not rows:
+        st.caption("Tamamlanan aşama henüz yok.")
+        return
+    for row in rows[-30:]:
+        if row.get("cache"):
+            index = row.get("index")
+            total = row.get("total")
+            progress = ""
+            if isinstance(index, int) and isinstance(total, int) and total > 0:
+                total_label = f"en az {total}" if row.get("total_is_minimum") else str(total)
+                progress = f"{index}/{total_label} · "
+            st.caption(
+                f"{_clock(row.get('started_at'))} · ♻️ {progress}`{row.get('step_key')}` · cache"
+            )
+            continue
+        cost = row.get("cost_usd")
+        cost_label = f"${float(cost):.4f}" if cost is not None else "ücret N/A"
+        st.caption(
+            f"{_clock(row.get('started_at'))} → {_clock(row.get('finished_at'))} · "
+            f"{row.get('label') or row.get('agent')} · {float(row.get('duration_s', 0.0)):.1f} sn · "
+            f"{int(row.get('total_tokens', 0) or 0):,} token · {cost_label}"
+        )
+
+
 def render_now_and_timeline(
     runtime: dict[str, Any],
     events: list[dict[str, Any]],
     *,
     status: str,
     cards: list[CardState] | None = None,
+    include_timeline: bool = True,
 ) -> dict[str, Any]:
-    """Shared Streamlit component used by the home page and Research Control."""
-
     import streamlit as st
 
     snapshot = live_stage_snapshot(runtime, events, cards=cards)
@@ -349,28 +365,11 @@ def render_now_and_timeline(
     total = snapshot.get("total")
     if isinstance(index, int) and isinstance(total, int) and total > 0:
         progress = min(1.0, max(0.0, index / total))
-        if snapshot.get("total_is_minimum"):
-            progress_text = f"İlerleme · {index}/en az {total}"
-        else:
-            progress_text = f"İlerleme · {index}/{total}"
+        progress_text = f"İlerleme · {index}/en az {total}" if snapshot.get("total_is_minimum") else f"İlerleme · {index}/{total}"
         st.progress(progress, text=progress_text)
     elif status == "RUNNING":
         st.caption("İlerleme · toplam çağrı sayısı bu workflow için önceden kesin değil.")
 
-    rows = stage_timeline(events)
-    st.markdown("#### Zaman çizelgesi")
-    if not rows:
-        st.caption("Tamamlanan aşama henüz yok.")
-    else:
-        for row in rows[-30:]:
-            if row.get("cache"):
-                st.caption(f"{_clock(row.get('started_at'))} · ♻️ `{row.get('step_key')}` · cache")
-                continue
-            cost = row.get("cost_usd")
-            cost_label = f"${float(cost):.4f}" if cost is not None else "ücret N/A"
-            st.caption(
-                f"{_clock(row.get('started_at'))} → {_clock(row.get('finished_at'))} · "
-                f"{row.get('label') or row.get('agent')} · {float(row.get('duration_s', 0.0)):.1f} sn · "
-                f"{int(row.get('total_tokens', 0) or 0):,} token · {cost_label}"
-            )
+    if include_timeline:
+        render_stage_timeline(events)
     return snapshot

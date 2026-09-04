@@ -76,7 +76,7 @@ for role in ROLES:
         "provider default" if api_value is None else f"OpenRouter: reasoning.effort={api_value}"
     )
 
-if st.button("Reasoning ayarlarını kaydet", type="primary", use_container_width=True):
+if st.button("Reasoning ayarlarını kaydet", type="primary", width="stretch"):
     settings["agents"] = edited
     path = save_settings(settings)
     st.success(f"Kaydedildi: {path}")
