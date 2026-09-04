@@ -244,7 +244,10 @@ def cached_openrouter_models(
         _MEMORY_CACHE = (current, (), "unavailable")
         return [], "unavailable"
 
-    _write_disk_cache(path, loaded_models, current)
+    try:
+        _write_disk_cache(path, loaded_models, current)
+    except OSError:
+        pass
     _MEMORY_CACHE = (current, tuple(loaded_models), "network")
     return loaded_models, "network"
 
