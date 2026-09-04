@@ -10,14 +10,22 @@ from typing import Any
 
 from lab.agent import Agent
 from lab.client import next_lower_supported_effort
-from lab.code_experiment import CODE_EXPERIMENT_SYSTEM_PROMPT, CodeExperimentRunner, GuardedExperimentWorkspace, WorkspaceActionResult
+from lab.code_experiment import (
+    CODE_EXPERIMENT_SYSTEM_PROMPT,
+    CodeExperimentRunner,
+    GuardedExperimentWorkspace,
+    WorkspaceActionResult,
+    infrastructure_failure,
+)
 from lab.code_experiment_settings import load_code_experiment_settings, load_code_experiment_settings_from_dict
 from lab.evidence import evidence_from_tool_result, validate_evidence_binding
 from lab.integrity import content_fingerprint, sha256_file
+from lab.iteration_control import consume_iteration_restart
 from lab.json_io import StructuredOutputError, parse_json_object, parse_truncated_object_prefix, repair_instruction
 from lab.literature import LiteratureClient, LiteratureSearchEmpty, Paper
 from lab.prompts import checkpoint_prompt, critic_prompt, literature_prompt, manager_prompt, proposal_prompt, verifier_prompt
 from lab.research_contract import ResearchContract
+from lab.reasoning_settings import get_reasoning_effort
 from lab.research_protocol import (
     evaluate_manager_target_proposal,
     ledger_records,
@@ -65,6 +73,7 @@ def _response_meta(response: Any, content: str) -> dict[str, Any]:
         "reasoning_effort_sent": getattr(response, "reasoning_effort_sent", None),
         "effort_resolution": getattr(response, "effort_resolution", "provider_default"),
         "reasoning_max_tokens_sent": getattr(response, "reasoning_max_tokens_sent", None),
+        "model_default_reasoning_effort": getattr(response, "model_default_reasoning_effort", None),
         "prompt_tokens": int(getattr(response, "prompt_tokens", 0) or 0),
         "completion_tokens": int(getattr(response, "completion_tokens", 0) or 0),
         "reasoning_tokens": int(getattr(response, "reasoning_tokens", 0) or 0),
@@ -90,6 +99,7 @@ def _cached_meta(cached: dict[str, Any]) -> dict[str, Any]:
         "reasoning_effort_sent": cached.get("reasoning_effort_sent"),
         "effort_resolution": cached.get("effort_resolution", "legacy_unknown"),
         "reasoning_max_tokens_sent": cached.get("reasoning_max_tokens_sent"),
+        "model_default_reasoning_effort": cached.get("model_default_reasoning_effort"),
         "prompt_tokens": int(cached.get("prompt_tokens", 0) or 0),
         "completion_tokens": int(cached.get("completion_tokens", 0) or 0),
         "reasoning_tokens": int(cached.get("reasoning_tokens", 0) or 0),
@@ -114,6 +124,7 @@ def _retry_event_payload(meta: dict[str, Any]) -> dict[str, Any]:
         "model_max_completion_tokens",
         "max_tokens_source",
         "catalog_source",
+        "model_default_reasoning_effort",
     )
     return {key: meta.get(key) for key in keys}
 
@@ -523,6 +534,7 @@ class TheoremResearchLab:
                         "reasoning_effort_sent": meta["reasoning_effort_sent"],
                         "effort_resolution": meta["effort_resolution"],
                         "reasoning_max_tokens_sent": meta["reasoning_max_tokens_sent"],
+                        "model_default_reasoning_effort": meta["model_default_reasoning_effort"],
                         "call_meta": meta,
                         "completed_at": now_iso(),
                         "soft_resumed": bool(partial),
@@ -747,46 +759,58 @@ class TheoremResearchLab:
             raw = dict(raw_value) if isinstance(raw_value, dict) else {}
             metadata = dict(raw.get("metadata") or {})
             action_name = str(action.get("action") or "").strip().lower()
-            hash_field = {"run_python": "script_sha256", "read_file": "sha256"}.get(action_name)
-            if hash_field is not None:
-                relative_path = str(action.get("path") or "")
-                expected_sha = str(metadata.get(hash_field) or "")
-                current_sha = ""
-                try:
-                    target = self.code_workspace._resolve(relative_path, must_exist=True)
-                    current_sha = sha256_file(target)
-                except (FileNotFoundError, OSError, ValueError):
+            raw_result = WorkspaceActionResult(
+                bool(raw.get("ok")),
+                str(raw.get("action") or "unknown"),
+                str(raw.get("output") or ""),
+                str(raw.get("error") or ""),
+                metadata,
+            )
+            if infrastructure_failure(raw_result):
+                self.trace.log(
+                    "legacy_infrastructure_cache_invalidated",
+                    step_key=cache_key,
+                    kind="workspace_action",
+                    action=action_name,
+                )
+                self._cache_delete(cache_key)
+            else:
+                hash_field = {"run_python": "script_sha256", "read_file": "sha256"}.get(action_name)
+                if hash_field is not None:
+                    relative_path = str(action.get("path") or "")
+                    expected_sha = str(metadata.get(hash_field) or "")
                     current_sha = ""
-                if not expected_sha or current_sha != expected_sha:
-                    self.trace.log(
-                        "cache_sha_miss",
-                        step_key=cache_key,
-                        action=action_name,
-                        path=relative_path,
-                        expected_sha256=expected_sha or None,
-                        current_sha256=current_sha or None,
-                    )
-                    self._cache_delete(cache_key)
+                    try:
+                        target = self.code_workspace._resolve(relative_path, must_exist=True)
+                        current_sha = sha256_file(target)
+                    except (FileNotFoundError, OSError, ValueError):
+                        current_sha = ""
+                    if not expected_sha or current_sha != expected_sha:
+                        self.trace.log(
+                            "cache_sha_miss",
+                            step_key=cache_key,
+                            action=action_name,
+                            path=relative_path,
+                            expected_sha256=expected_sha or None,
+                            current_sha256=current_sha or None,
+                        )
+                        self._cache_delete(cache_key)
+                    else:
+                        self.trace.log("step_reused", step_key=cache_key, tool="code_experiment_action")
+                        return raw_result
                 else:
                     self.trace.log("step_reused", step_key=cache_key, tool="code_experiment_action")
-                    return WorkspaceActionResult(
-                        bool(raw.get("ok")),
-                        str(raw.get("action") or "unknown"),
-                        str(raw.get("output") or ""),
-                        str(raw.get("error") or ""),
-                        metadata,
-                    )
-            else:
-                self.trace.log("step_reused", step_key=cache_key, tool="code_experiment_action")
-                return WorkspaceActionResult(
-                    bool(raw.get("ok")),
-                    str(raw.get("action") or "unknown"),
-                    str(raw.get("output") or ""),
-                    str(raw.get("error") or ""),
-                    metadata,
-                )
+                    return raw_result
         result = self.code_workspace.execute(action)
-        self._cache_put(cache_key, {"status": "COMPLETE", "fingerprint": fingerprint, "result": result.as_dict(), "completed_at": now_iso()})
+        self._cache_put(
+            cache_key,
+            {
+                "status": "INFRA_FAILED" if infrastructure_failure(result) else "COMPLETE",
+                "fingerprint": fingerprint,
+                "result": result.as_dict(),
+                "completed_at": now_iso(),
+            },
+        )
         return result
 
     def _run_code_experiment(self, request: dict[str, Any], step_key: str) -> ToolResult:
@@ -919,23 +943,59 @@ class TheoremResearchLab:
         if isinstance(cached, dict) and cached.get("status") == "COMPLETE" and cached.get("fingerprint") == fingerprint:
             raw = cached.get("result")
             if isinstance(raw, dict):
-                self.trace.log("step_reused", step_key=step_key, tool=raw.get("tool"))
-                cached_result = ToolResult(bool(raw.get("ok")), str(raw.get("tool") or "unknown"), str(raw.get("output") or ""), str(raw.get("error") or ""), dict(raw.get("metadata") or {}))
-                return self._normalize_structural_counterexample(cached_result)
-            return None
+                cached_result = ToolResult(
+                    bool(raw.get("ok")),
+                    str(raw.get("tool") or "unknown"),
+                    str(raw.get("output") or ""),
+                    str(raw.get("error") or ""),
+                    dict(raw.get("metadata") or {}),
+                )
+                if infrastructure_failure(cached_result):
+                    self.trace.log(
+                        "legacy_infrastructure_cache_invalidated",
+                        step_key=step_key,
+                        kind="tool",
+                        tool=cached_result.tool,
+                    )
+                    self._cache_delete(step_key)
+                else:
+                    self.trace.log("step_reused", step_key=step_key, tool=raw.get("tool"))
+                    return self._normalize_structural_counterexample(cached_result)
+            else:
+                return None
         self._check_stop()
         self._set_runtime(current_step=step_key)
         if name not in {"", "none"}:
             self.trace.log("tool_start", request=request, step_key=step_key)
-        tool_result: ToolResult | None = self._run_code_experiment(request or {}, step_key) if name == "code_experiment" else self.registry.execute(request)
+        tool_result: ToolResult | None = (
+            self._run_code_experiment(request or {}, step_key)
+            if name == "code_experiment"
+            else self.registry.execute(request)
+        )
         tool_result = self._normalize_structural_counterexample(tool_result)
         if tool_result:
             self.trace.log("tool_result", step_key=step_key, **tool_result.as_dict())
-        self._cache_put(step_key, {"status": "COMPLETE", "fingerprint": fingerprint, "result": tool_result.as_dict() if tool_result else None, "completed_at": now_iso()})
+        self._cache_put(
+            step_key,
+            {
+                "status": (
+                    "INFRA_FAILED"
+                    if tool_result is not None and infrastructure_failure(tool_result)
+                    else "COMPLETE"
+                ),
+                "fingerprint": fingerprint,
+                "result": tool_result.as_dict() if tool_result else None,
+                "completed_at": now_iso(),
+            },
+        )
         return tool_result
 
     def _iteration_item(self, iteration: int):
-        candidates = [item for item in self.state.list_items(kind="conjecture") if int(item.metadata.get("iteration", -1)) == iteration]
+        candidates = [
+            item
+            for item in self.state.list_items(kind="conjecture")
+            if int(item.metadata.get("iteration", -1)) == iteration and item.status != "DROPPED"
+        ]
         return candidates[-1] if candidates else None
 
     def _iteration_snapshot(self, iteration: int, next_task: str) -> dict[str, Any]:
@@ -947,6 +1007,43 @@ class TheoremResearchLab:
         self.step_store.put_iteration_snapshot(iteration, ledger_revision=revision, ledger_context=context, payload={"next_task": next_task})
         self.trace.log("iteration_snapshot_frozen", iteration=iteration, ledger_revision=revision, ledger_context_chars=len(context))
         return self.step_store.get_iteration_snapshot(iteration) or {}
+
+    def _proposal_for_iteration(
+        self,
+        iteration: int,
+        snapshot: dict[str, Any],
+        proposer: Agent,
+        prompt: str,
+        step_key: str,
+    ) -> tuple[dict[str, Any], Any | None]:
+        item = self._iteration_item(iteration)
+        if item is None:
+            return self._call_json(proposer, prompt, step_key), None
+
+        proposal = snapshot.get("proposal")
+        snapshot_hash = str(snapshot.get("proposal_hash") or "")
+        item_hash = str(item.metadata.get("proposal_hash") or "")
+        computed_hash = content_fingerprint("proposal:v1", proposal) if isinstance(proposal, dict) else ""
+        if (
+            not isinstance(proposal, dict)
+            or not snapshot_hash
+            or not item_hash
+            or snapshot_hash != item_hash
+            or computed_hash != item_hash
+        ):
+            raise ResearchPaused(
+                f"Bu koşu tur {iteration} ortasında durmuş ve öneri kaydı eksik veya ledger ile uyuşmuyor. "
+                "Farklı bir iddiaya kanıt bağlanmayacak. "
+                f'Research Control\'daki "Tur {iteration}\'i yeniden başlat" seçeneğini kullan ya da yeni proje aç.'
+            )
+        self.trace.log(
+            "proposal_reused_from_ledger",
+            iteration=iteration,
+            item_id=item.id,
+            reason="iteration item already bound",
+            proposal_hash=item_hash,
+        )
+        return dict(proposal), item
 
     def _ensure_item_matches_proposal(self, iteration: int, proposal: dict[str, Any], snapshot: dict[str, Any]):
         claim = str(proposal.get("claim") or "Boş iddia")
@@ -1169,17 +1266,27 @@ class TheoremResearchLab:
             with self.controller.lock:
                 self.trace.log("project_lock_acquired", project_root=str(self.state.root), pid=os.getpid())
                 try:
+                    restart_marker = consume_iteration_restart(self.state.root)
+                    if restart_marker is not None:
+                        self.trace.log("iteration_restarted", **restart_marker)
                     if code_agent is None:
+                        configured_code_effort = self.code_settings.get("reasoning_effort")
+                        if configured_code_effort in (None, ""):
+                            configured_code_effort = get_reasoning_effort("CodeExperimentAgent")
+                        if configured_code_effort is None:
+                            configured_code_effort = "low"
                         code_agent = Agent(
                             name="CodeExperimentAgent",
                             system_prompt=CODE_EXPERIMENT_SYSTEM_PROMPT,
                             model=str(self.code_settings.get("model") or os.environ.get("LAB_CODE_EXPERIMENT_MODEL") or proposer.model),
                             temperature=0.2,
                             max_tokens=proposer.max_tokens,
+                            reasoning_effort=str(configured_code_effort) if configured_code_effort else None,
                         )
                     elif not code_agent.system_prompt.strip():
                         code_agent.system_prompt = CODE_EXPERIMENT_SYSTEM_PROMPT
                     self.code_agent = code_agent
+                    self.code_settings["reasoning_effort"] = code_agent.reasoning_effort
                     agents = {
                         "ResearchManager": manager,
                         "Theorist": proposer,
@@ -1322,23 +1429,63 @@ class TheoremResearchLab:
             if contract is not None:
                 self.controller.set_research_phase("DISCOVERY")
             proposer_step = f"iter:{iteration}:proposer"
-            proposal = self._call_json(
+            current_proposal_prompt = proposal_prompt(
+                problem,
+                literature_context,
+                ledger_context,
+                frozen_next_task,
+                self.registry,
+                contract_block=contract_block,
+                pilot_block=pilot_block,
+            )
+            proposal, bound_item = self._proposal_for_iteration(
+                iteration,
+                snapshot,
                 proposer,
-                proposal_prompt(
-                    problem,
-                    literature_context,
-                    ledger_context,
-                    frozen_next_task,
-                    self.registry,
-                    contract_block=contract_block,
-                    pilot_block=pilot_block,
-                ),
+                current_proposal_prompt,
                 proposer_step,
             )
-            proposal_incomplete = bool(self._llm_step_meta.get(proposer_step, {}).get("truncated"))
-            if proposal_incomplete and (not str(proposal.get("title") or "").strip() or not str(proposal.get("claim") or "").strip()):
-                raise ResearchPaused("Kesilmiş Theorist çıktısında tamamlanmış title ve claim yok; yük taşıyan candidate oluşturulmadı.")
-            if proposal_incomplete:
+            proposal_incomplete = bool(
+                (
+                    bound_item is not None
+                    and (
+                        bound_item.metadata.get("truncated")
+                        or bound_item.metadata.get("completion") == "INCOMPLETE_OUTPUT"
+                    )
+                )
+                or (
+                    bound_item is None
+                    and self._llm_step_meta.get(proposer_step, {}).get("truncated")
+                )
+            )
+            if proposal_incomplete and (
+                not str(proposal.get("title") or "").strip()
+                or not str(proposal.get("claim") or "").strip()
+            ):
+                raise ResearchPaused(
+                    "Kesilmiş Theorist çıktısında tamamlanmış title ve claim yok; yük taşıyan candidate oluşturulmadı."
+                )
+            if bound_item is not None:
+                if proposal_incomplete:
+                    target_id = self._incomplete_target(
+                        proposal,
+                        contract=contract,
+                        selectable_ids=selectable_ids,
+                        iteration=iteration,
+                    )
+                elif contract is None:
+                    target_id = None
+                else:
+                    target_id = str(
+                        bound_item.metadata.get("target_id") or proposal.get("target_id") or ""
+                    ).strip() or None
+                    if target_id is None or target_id not in selectable_ids:
+                        raise ResearchPaused(
+                            f"Tur {iteration} için ledger'a bağlanmış önerinin target_id değeri artık seçilebilir frozen hedeflerle uyuşmuyor. "
+                            "Kanonik öneri sessizce değiştirilmeyecek."
+                        )
+                    contract.target(target_id, require_open=True)
+            elif proposal_incomplete:
                 target_id = self._incomplete_target(
                     proposal,
                     contract=contract,

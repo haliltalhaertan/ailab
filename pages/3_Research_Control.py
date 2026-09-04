@@ -6,6 +6,7 @@ from pathlib import Path
 import streamlit as st
 
 from lab.integrity import project_lock_is_live
+from lab.iteration_control import restart_iteration, resume_iteration_limit
 from lab.openrouter_catalog import fetch_openrouter_models
 from lab.project_manager import ProjectManager
 from lab.runtime_health import cleanup_stale_run
@@ -218,6 +219,35 @@ if experiment_method != "theorem_lab":
             st.rerun()
 else:
     st.subheader("Kaldığı yerden devam et")
+    runtime_now = read_json(runtime_path, {})
+    restart_number = int(runtime_now.get("current_iteration", 0) or 0)
+    completed_number = int(runtime_now.get("completed_iterations", 0) or 0)
+    if restart_number > completed_number and not running:
+        with st.expander(f"Tur {restart_number}'i yeniden başlat", expanded=False):
+            st.warning(
+                "Bu işlem mevcut turun ledger item'ını DROPPED yapar ve yalnız o turun snapshot/step cache/partial kayıtlarını temizler. "
+                "Mevcut evidence silinmez. Sonraki devamda Theorist bu tur için yeni öneri üretir."
+            )
+            confirmation = f"TUR {restart_number} YENIDEN BASLAT"
+            typed = st.text_input(
+                f"Onay için `{confirmation}` yaz",
+                key=f"restart_confirmation_{selected_id}_{restart_number}",
+            ).strip()
+            if st.button(
+                f"Tur {restart_number}'i yeniden başlat",
+                width="stretch",
+                disabled=typed != confirmation,
+                key=f"restart_iteration_{selected_id}_{restart_number}",
+            ):
+                try:
+                    detail = restart_iteration(project, restart_number)
+                except Exception as exc:
+                    st.exception(exc)
+                else:
+                    st.success(
+                        f"Tur {restart_number} resetlendi; `{detail['item_id']}` DROPPED. Evidence korundu. Şimdi 'ŞİMDİ DEVAM ET' kullanabilirsin."
+                    )
+                    st.rerun()
     if not config:
         st.warning("Bu proje için run_config.json yok. Ana sayfada ilk theorem run'ını başlat.")
     else:
@@ -272,6 +302,29 @@ else:
                 "Model override: " + ", ".join(changed_models) + ". Tamamlanmış adımlar korunacak; override yalnız incomplete/partial adımlarda etkili."
             )
 
+        configured_iterations = int(config.get("iterations", 5))
+        only_one_iteration = st.checkbox(
+            "Bu devamda yalnız bir tur ilerle",
+            value=True,
+            help=(
+                "Açıkken worker yalnız mevcut/sonraki turu tamamlar ve durur. "
+                "Kaydedilmiş run_config içindeki toplam tur hedefi değiştirilmez."
+            ),
+        )
+        resume_iterations = resume_iteration_limit(
+            configured_iterations,
+            completed_number,
+            restart_number,
+            only_one_iteration=only_one_iteration,
+        )
+        if only_one_iteration:
+            st.info(
+                f"Güvenli resume açık: bu worker en fazla Tur {resume_iterations} sonuna kadar ilerleyecek; "
+                f"asıl toplam hedef {configured_iterations} tur olarak korunacak."
+            )
+        else:
+            st.caption(f"Tam resume: worker kayıtlı toplam hedef olan Tur {configured_iterations}'e kadar ilerleyebilir.")
+
         running = project_lock_is_live(project)
         if st.button("ŞİMDİ DEVAM ET", type="primary", width="stretch", disabled=running):
             stop_path.unlink(missing_ok=True)
@@ -284,8 +337,8 @@ else:
                 "experiment_name": "Teorem Araştırması",
                 "problem": str(config.get("problem") or frozen.get("problem") or ""),
                 "prompt": str(config.get("problem") or frozen.get("problem") or ""),
-                "iterations": int(config.get("iterations", 5)),
-                "param": int(config.get("iterations", 5)),
+                "iterations": resume_iterations,
+                "param": resume_iterations,
                 "literature_query": config.get("literature_query"),
                 "checkpoint_every": int(config.get("checkpoint_every", 2)),
                 "agents": edited_agents,

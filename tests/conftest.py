@@ -84,6 +84,19 @@ def fake_container_runtime(monkeypatch):
         def kill(self):
             self.returncode = -9
 
+    real_run = code_experiment.subprocess.run
+
+    def fake_run(command, *args, **kwargs):
+        cmd = [str(x) for x in command]
+        if len(cmd) >= 2 and cmd[0] in {"docker", "podman"} and cmd[1] == "info":
+            return code_experiment.subprocess.CompletedProcess(
+                cmd, 0, stdout="Server Version: 27.0.0\n", stderr=""
+            )
+        if len(cmd) >= 2 and cmd[0] in {"docker", "podman"} and cmd[1:3] == ["rm", "-f"]:
+            return code_experiment.subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        return real_run(command, *args, **kwargs)
+
     monkeypatch.setattr(code_experiment.shutil, "which", fake_which)
+    monkeypatch.setattr(code_experiment.subprocess, "run", fake_run)
     monkeypatch.setattr(code_experiment.subprocess, "Popen", FakePopen)
     return commands

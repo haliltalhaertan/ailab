@@ -4,10 +4,13 @@ import json
 from pathlib import Path
 from typing import Any
 
+from lab.reasoning_settings import normalize_effort
+
 
 SETTINGS_PATH = Path("code_experiment_settings.json")
 DEFAULTS: dict[str, Any] = {
     "model": "",
+    "reasoning_effort": None,
     "max_steps": 8,
     "timeout_s": 60,
     "memory_limit_mb": 768,
@@ -47,6 +50,10 @@ def load_code_experiment_settings(path: str | Path = SETTINGS_PATH) -> dict[str,
     except Exception:
         merged["cpu_limit"] = 1.0
     merged["model"] = str(merged.get("model") or "").strip()
+    try:
+        merged["reasoning_effort"] = normalize_effort(merged.get("reasoning_effort"))
+    except ValueError:
+        merged["reasoning_effort"] = None
     merged["container_engine"] = str(merged.get("container_engine") or "").strip()
     merged["container_image"] = str(merged.get("container_image") or DEFAULTS["container_image"]).strip()
     return merged
@@ -88,6 +95,10 @@ def load_code_experiment_settings_from_dict(value: dict[str, Any]) -> dict[str, 
     except Exception:
         merged["cpu_limit"] = 1.0
     merged["model"] = str(merged.get("model") or "").strip()
+    try:
+        merged["reasoning_effort"] = normalize_effort(merged.get("reasoning_effort"))
+    except ValueError:
+        merged["reasoning_effort"] = None
     merged["container_engine"] = str(merged.get("container_engine") or "").strip()
     merged["container_image"] = str(merged.get("container_image") or DEFAULTS["container_image"]).strip()
     return merged
