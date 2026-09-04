@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 from lab.tool_registry import EFFECTIVE_AVAILABILITY_ENV, ToolRegistry
 from lab.worker import (
+    _bind_special_tool_guards,
     _persist_tool_availability_in_run_config,
     _tool_availability_for_run,
     _trace_tool_availability,
@@ -160,3 +161,44 @@ def test_registry_defaults_can_receive_worker_effective_universe(tmp_path, monke
 
     assert registry.is_available("lean_draft") is False
     assert registry.is_available("tropical_grid") is True
+
+
+def test_special_engine_paths_are_fail_closed_when_effective_snapshot_closes_them():
+    lab = SimpleNamespace(
+        toolbox=SimpleNamespace(lean=object()),
+        code_runner=object(),
+    )
+    snapshot = {
+        "effective_tool_availability": {
+            "lean_draft": _row(False, "frozen Lean off"),
+            "code_experiment": _row(False, "frozen container off"),
+        }
+    }
+
+    _bind_special_tool_guards(lab, snapshot)
+
+    lean_result = lab.toolbox.lean.draft_source("x.lean", "theorem x : True := by trivial")
+    code_result = lab.code_runner.run(agent=None, task="x", step_key="x")
+    assert lean_result.ok is False
+    assert lean_result.metadata["tool_unavailable"] is True
+    assert "frozen Lean off" in lean_result.error
+    assert code_result.ok is False
+    assert code_result.metadata["tool_unavailable"] is True
+    assert "frozen container off" in code_result.error
+
+
+def test_special_engine_paths_remain_unchanged_when_effective_snapshot_is_open():
+    lean = object()
+    runner = object()
+    lab = SimpleNamespace(toolbox=SimpleNamespace(lean=lean), code_runner=runner)
+    snapshot = {
+        "effective_tool_availability": {
+            "lean_draft": _row(True, "open"),
+            "code_experiment": _row(True, "open"),
+        }
+    }
+
+    _bind_special_tool_guards(lab, snapshot)
+
+    assert lab.toolbox.lean is lean
+    assert lab.code_runner is runner
