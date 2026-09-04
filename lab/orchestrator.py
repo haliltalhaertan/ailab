@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from lab.agent import Agent
+from lab.budget import budget_snapshot
 from lab.run_controller import ResearchStopped
 from lab.trace import Trace
 
@@ -99,6 +100,10 @@ class Orchestrator:
             )
             raise
         self.trace.agent_call(agent.name, response.model, agent.temperature, messages, response)
+        total_tokens = int(getattr(response, "prompt_tokens", 0) or 0) + int(
+            getattr(response, "completion_tokens", 0) or 0
+        )
+        finish_reason = getattr(response, "finish_reason", None)
         stage_end = {
             "method": method,
             "label": label,
@@ -106,11 +111,14 @@ class Orchestrator:
             "total": total,
             "agent": agent.name,
             "step_key": step_key,
-            "total_tokens": int(getattr(response, "prompt_tokens", 0) or 0)
-            + int(getattr(response, "completion_tokens", 0) or 0),
+            "total_tokens": total_tokens,
             "reasoning_tokens": int(getattr(response, "reasoning_tokens", 0) or 0),
             "cost_usd": getattr(response, "cost_usd", None),
             "latency_s": float(getattr(response, "latency_s", 0.0) or 0.0),
+            "finish_reason": finish_reason,
+            "truncated": str(finish_reason or "").lower() == "length",
+            "requested_max_tokens": getattr(response, "requested_max_tokens", None),
+            "budget": budget_snapshot(agent.name, response.model, total_tokens),
         }
         self._emit_stage("stage_end", stage_end)
         return content, response
