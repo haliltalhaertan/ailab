@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 from datetime import datetime, timezone
@@ -20,6 +21,7 @@ from lab.integrity import (
 from lab.project_manager import ProjectManager
 from lab.research_state import ResearchState
 from lab.run_controller import ResearchStopped, RunController
+from lab.tool_registry import EFFECTIVE_AVAILABILITY_ENV
 from lab.trace import Trace
 from lab.worker_runtime import WorkerRuntimeBridge
 
@@ -27,6 +29,8 @@ from lab.worker_runtime import WorkerRuntimeBridge
 AgentFactory = Callable[[str, dict[str, Any]], Agent]
 EXPERIMENT_METHODS = {"theorem_lab", "research_loop", "debate", "pipeline", "panel"}
 TERMINAL_RUNTIME_STATUSES = {"COMPLETED", "STOPPED", "PAUSED_ERROR", "INTERRUPTED"}
+RESUMABLE_TOOL_SNAPSHOT_STATUSES = {"RUNNING", "STOPPED", "PAUSED_ERROR", "INTERRUPTED"}
+TOOL_AVAILABILITY_FILE = "tool_availability.json"
 
 
 def _now() -> str:
@@ -67,6 +71,117 @@ def _mark_runtime_error(root: Path, exc: Exception) -> None:
         {"status": "PAUSED_ERROR", "last_error": repr(exc), "pid": os.getpid(), "updated_at": now, "heartbeat_at": now}
     )
     atomic_write_json(path, current)
+
+
+def _availability_row(available: bool, reason: str) -> dict[str, Any]:
+    return {"available": bool(available), "reason": str(reason)}
+
+
+def _tool_availability_for_run(root: Path, lab: TheoremResearchLab, runtime_before: dict[str, Any]) -> dict[str, Any]:
+    """Freeze run capabilities and only allow resume-time narrowing.
+
+    A newly installed tool never widens a paused/stopped run. Start a new run to
+    acquire new capabilities. A tool that disappears on resume is removed from
+    the effective universe immediately.
+    """
+
+    runtime = lab.registry.availability()
+    runtime["code_experiment"] = _availability_row(
+        bool(lab.code_workspace.execution_available),
+        (
+            f"container engine kullanılabilir: {lab.code_workspace.container_engine}"
+            if lab.code_workspace.execution_available
+            else "container engine kullanılamıyor"
+        ),
+    )
+    path = root / TOOL_AVAILABILITY_FILE
+    previous = read_json_tolerant(path, {})
+    previous = dict(previous) if isinstance(previous, dict) else {}
+    previous_declared = previous.get("declared_tool_availability")
+    status_before = str(runtime_before.get("status") or "NEW").upper()
+    resume = status_before in RESUMABLE_TOOL_SNAPSHOT_STATUSES and isinstance(previous_declared, dict)
+    declared = dict(previous_declared) if resume else {name: dict(raw) for name, raw in runtime.items()}
+
+    effective: dict[str, dict[str, Any]] = {}
+    for name in sorted(set(declared) | set(runtime)):
+        drow = declared.get(name) if isinstance(declared.get(name), dict) else {}
+        rrow = runtime.get(name) if isinstance(runtime.get(name), dict) else {}
+        declared_open = bool(drow.get("available"))
+        runtime_open = bool(rrow.get("available"))
+        if not declared_open:
+            reason = f"run başında kapalı: {drow.get('reason') or 'capability yok'}"
+            effective[name] = _availability_row(False, reason)
+        elif not runtime_open:
+            reason = f"runtime daralması: {rrow.get('reason') or 'capability kayboldu'}"
+            effective[name] = _availability_row(False, reason)
+        else:
+            effective[name] = _availability_row(True, str(rrow.get("reason") or drow.get("reason") or "available"))
+
+    snapshot = {
+        "availability_version": 1,
+        "declared_tool_availability": declared,
+        "runtime_tool_availability": runtime,
+        "effective_tool_availability": effective,
+        "resumed_snapshot": bool(resume),
+        "captured_at": _now(),
+    }
+    atomic_write_json(path, snapshot)
+    lab.registry.set_effective_availability(effective)
+    return snapshot
+
+
+def _persist_tool_availability_in_run_config(root: Path, snapshot: dict[str, Any]) -> None:
+    path = root / "run_config.json"
+    raw = read_json_tolerant(path, {})
+    if not isinstance(raw, dict) or not raw:
+        return
+    config = dict(raw)
+    config["config_version"] = max(4, int(config.get("config_version", 0) or 0))
+    for key in (
+        "declared_tool_availability",
+        "runtime_tool_availability",
+        "effective_tool_availability",
+    ):
+        config[key] = snapshot.get(key, {})
+    atomic_write_json(path, config)
+
+
+def _trace_tool_availability(trace: Trace, snapshot: dict[str, Any]) -> None:
+    declared = snapshot.get("declared_tool_availability") or {}
+    runtime = snapshot.get("runtime_tool_availability") or {}
+    effective = snapshot.get("effective_tool_availability") or {}
+    trace.log(
+        "tool_availability",
+        declared_tool_availability=declared,
+        runtime_tool_availability=runtime,
+        effective_tool_availability=effective,
+        resumed_snapshot=bool(snapshot.get("resumed_snapshot")),
+    )
+    for name, raw in declared.items():
+        if not isinstance(raw, dict) or not raw.get("available"):
+            continue
+        current = runtime.get(name) if isinstance(runtime.get(name), dict) else {}
+        if not current.get("available"):
+            trace.log(
+                "tool_availability_narrowed",
+                tool=name,
+                declared=raw,
+                runtime=current,
+                effective=effective.get(name),
+            )
+    for name, raw in runtime.items():
+        if not isinstance(raw, dict) or not raw.get("available"):
+            continue
+        original = declared.get(name) if isinstance(declared.get(name), dict) else {}
+        if original and not original.get("available"):
+            trace.log(
+                "tool_availability_not_widened",
+                tool=name,
+                declared=original,
+                runtime=raw,
+                effective=effective.get(name),
+                reason="Yeni capability aynı resumable run içinde sessizce açılamaz; yeni run gerekir.",
+            )
 
 
 def _theorem_agents(raw_agents: Any, agent_factory: AgentFactory) -> dict[str, Agent]:
@@ -163,9 +278,13 @@ def run_project(project_id: str, *, agent_factory: AgentFactory = _agent) -> int
     result = ""
     exit_code = 0
     final_status: str | None = None
+    tool_snapshot: dict[str, Any] | None = None
+    previous_effective_env = os.environ.get(EFFECTIVE_AVAILABILITY_ENV)
     try:
         info = pm.get(project_id)
         request = _read(root / "worker_request.json")
+        runtime_prelaunch_raw = read_json_tolerant(root / "runtime.json", {})
+        runtime_prelaunch = dict(runtime_prelaunch_raw) if isinstance(runtime_prelaunch_raw, dict) else {}
         if str(request.get("project_uuid") or "") != info.project_uuid:
             raise RuntimeError("worker request project_uuid does not match current project identity")
         method = str(request.get("experiment_method") or "theorem_lab")
@@ -205,6 +324,13 @@ def run_project(project_id: str, *, agent_factory: AgentFactory = _agent) -> int
                 state,
                 code_experiment_settings_override=request.get("code_experiment") if isinstance(request.get("code_experiment"), dict) else None,
             )
+            tool_snapshot = _tool_availability_for_run(root, lab, runtime_prelaunch)
+            _trace_tool_availability(trace, tool_snapshot)
+            os.environ[EFFECTIVE_AVAILABILITY_ENV] = json.dumps(
+                tool_snapshot["effective_tool_availability"],
+                ensure_ascii=False,
+                sort_keys=True,
+            )
             lab.controller.lock = lock
             bridge = WorkerRuntimeBridge(lab.controller, background_heartbeat=True)
             trace.set_stage_listener(bridge.on_stage)
@@ -221,6 +347,7 @@ def run_project(project_id: str, *, agent_factory: AgentFactory = _agent) -> int
                 literature_query=request.get("literature_query"),
                 checkpoint_every=theorem_checkpoint_every,
             )
+            _persist_tool_availability_in_run_config(root, tool_snapshot)
             theorem_status = str(lab.controller.runtime().get("status") or "COMPLETED").upper()
             if theorem_status not in TERMINAL_RUNTIME_STATUSES:
                 theorem_status = "COMPLETED"
@@ -262,6 +389,15 @@ def run_project(project_id: str, *, agent_factory: AgentFactory = _agent) -> int
         if trace is not None:
             trace.log("worker_error", error=repr(exc))
     finally:
+        if tool_snapshot is not None:
+            try:
+                _persist_tool_availability_in_run_config(root, tool_snapshot)
+            except Exception:
+                pass
+        if previous_effective_env is None:
+            os.environ.pop(EFFECTIVE_AVAILABILITY_ENV, None)
+        else:
+            os.environ[EFFECTIVE_AVAILABILITY_ENV] = previous_effective_env
         if bridge is not None:
             bridge.close()
         if trace is not None:
