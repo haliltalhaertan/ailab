@@ -16,29 +16,61 @@ PILOT_EVIDENCE_KINDS = {
 PILOT_SOURCE_ORIGINS = {"BUILTIN", "CHECKED_IN"}
 
 
-def ledger_records(state: ResearchState) -> list[dict[str, Any]]:
+def ledger_records(
+    state: ResearchState,
+    contract: ResearchContract | None = None,
+) -> list[dict[str, Any]]:
     """Return machine-authored records used by target transition gates.
 
-    Conjectures retain their code-assigned ``claim_role``. Deterministic pilot
-    experiments are included without fabricating one; the contract evaluator
-    may treat full-scope experiment evidence as target-resolution evidence for
-    COMPUTE/OPTIMIZE targets.
+    Conjectures contribute one record per append-only revision. Historical
+    evidence therefore remains attached to the exact claim/status that produced
+    it. When a contract is supplied, claim_role is recomputed from the revision
+    claim instead of trusting mutable ledger metadata.
     """
 
     records: list[dict[str, Any]] = []
-    for kind in ("conjecture", "experiment"):
-        for item in state.list_items(kind=kind):
-            raw_evidence = item.metadata.get("evidence")
+    for item in state.list_items(kind="conjecture"):
+        for revision in item.revisions:
+            raw_evidence = revision.get("evidence")
+            target_id = str(revision.get("target_id") or "")
+            claim = str(revision.get("claim") or "")
+            claim_role = str(revision.get("claim_role") or "")
+            if contract is not None and target_id:
+                try:
+                    claim_role = contract.claim_role(target_id, claim)
+                except KeyError:
+                    claim_role = ""
             records.append(
                 {
                     "item_id": item.id,
-                    "record_kind": kind,
-                    "claim_role": str(item.metadata.get("claim_role") or ""),
-                    "status": item.status,
-                    "pilot": bool(item.metadata.get("pilot")),
+                    "revision": int(revision.get("revision", 1) or 1),
+                    "record_kind": "conjecture",
+                    "claim": claim,
+                    "claim_hash": str(revision.get("claim_hash") or ""),
+                    "target_id": target_id,
+                    "claim_role": claim_role,
+                    "status": str(revision.get("status") or "OPEN"),
+                    "pilot": False,
                     "evidence": dict(raw_evidence) if isinstance(raw_evidence, dict) else None,
                 }
             )
+
+    for item in state.list_items(kind="experiment"):
+        raw_evidence = item.metadata.get("evidence")
+        records.append(
+            {
+                "item_id": item.id,
+                "revision": item.current_revision,
+                "record_kind": "experiment",
+                "claim": item.claim,
+                "claim_hash": "",
+                "target_id": str(item.metadata.get("target_id") or ""),
+                "claim_role": str(item.metadata.get("claim_role") or ""),
+                "status": item.status,
+                "pilot": bool(item.metadata.get("pilot")),
+                "evidence": dict(raw_evidence) if isinstance(raw_evidence, dict) else None,
+            }
+        )
     return records
 
 
@@ -147,7 +179,7 @@ def evaluate_manager_target_proposal(
         }
 
     try:
-        transition = contract.evaluate_target_transition(target_id, ledger_records(state))
+        transition = contract.evaluate_target_transition(target_id, ledger_records(state, contract))
     except (KeyError, ValueError) as exc:
         return False, str(exc), dict(raw)
     if transition is None:
@@ -173,7 +205,11 @@ def human_close_discover_target(
     target = contract.target(target_id, require_open=True)
     if target.target_type != "DISCOVER":
         raise ValueError("human close helper is only for DISCOVER targets")
-    transition = contract.evaluate_target_transition(target_id, ledger_records(state), human_approved=True)
+    transition = contract.evaluate_target_transition(
+        target_id,
+        ledger_records(state, contract),
+        human_approved=True,
+    )
     if transition is None:
         raise ValueError("DISCOVER target could not be closed")
     contract.apply_target_transition(target_id, transition)
