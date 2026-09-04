@@ -16,6 +16,28 @@ ROLE_LIBRARY = {
 }
 
 
+def tool_environment_block(registry: ToolRegistry | None) -> str:
+    registry = registry or ToolRegistry()
+    availability = registry.effective_availability()
+    rows = []
+    for name in sorted(availability):
+        raw = availability[name]
+        label = "AÇIK" if raw.get("available") else "KAPALI"
+        rows.append(f"- {name}: {label} — {raw.get('reason', '')}")
+    lean_open = bool((availability.get("lean_draft") or {}).get("available"))
+    if lean_open:
+        lean_rule = (
+            "Lean bu koşuda kullanılabilir. lean_draft kullanırsan dosyada tam olarak BİR top-level theorem/lemma declaration olsun; "
+            "yardımcı lemma gerekiyorsa aynı theorem içinde `have` kullan. İkinci bir `theorem`/`lemma` satırı yazma."
+        )
+    else:
+        lean_rule = (
+            "Bu koşuda formal doğrulama (Lean) YOK; PROVEN bu araç evreninde ulaşılamaz. "
+            "Lean taslağı yazma ve lean_draft isteme. Deterministic Z3/script/checker evidence veya deterministic counterexample hedefle."
+        )
+    return "TOOL AVAILABILITY (run-scoped effective universe):\n" + "\n".join(rows) + "\n" + lean_rule
+
+
 def proposal_schema(registry: ToolRegistry | None = None) -> dict[str, Any]:
     registry = registry or ToolRegistry()
     return {
@@ -25,7 +47,7 @@ def proposal_schema(registry: ToolRegistry | None = None) -> dict[str, Any]:
         "strategy": "...",
         "evidence_needed": ["..."],
         "tool_request": {
-            "tool": registry.schema_string(),
+            "tool": registry.schema_string(available_only=True),
             "name": "",
             "args": [],
             "smt2": "",
@@ -63,17 +85,20 @@ def proposal_prompt(
     contract_block: str = "",
     pilot_block: str = "",
 ) -> str:
+    registry = registry or ToolRegistry()
+    tools = tool_environment_block(registry)
     return (
         f"PROBLEM (frozen):\n{problem}\n\n"
         f"LITERATURE SCREEN:\n{literature}\n\n"
         f"RESEARCH LEDGER SNAPSHOT (frozen for this iteration):\n{ledger}\n\n"
         f"CURRENT TASK:\n{next_task}\n"
-        f"{contract_block}{pilot_block}\n\n"
+        f"{contract_block}{pilot_block}\n\n{tools}\n\n"
         "Produce exactly one research candidate. Do not reopen a FAIL/DROPPED idea listed in the ledger. "
         "When a frozen research contract is present, target_id MUST be one of the OPEN TARGETS shown in the contract block; "
         "do not invent claim_role because code assigns SUBCLAIM/TARGET_RESOLUTION. "
         "A REFUTATION_CANDIDATE is still active: when relevant, prioritize checking its claimed counterexample with a deterministic tool instead of treating it as settled. "
-        "Separate proved facts from assumptions. If computation/formal checking is useful, request one tool. "
+        "Separate proved facts from assumptions. If computation/formal checking is useful, request ONE tool from the available tool schema only. "
+        "Do not describe your own candidate as verified/proven before deterministic evidence exists; call it an aday/candidate. "
         "For lean_draft, theorem_name and theorem_type are mandatory and must describe the exact single theorem/lemma in source; "
         "the engine will ignore your filename, bind the source to this iteration's ledger item, and check that exact SHA immediately. "
         "Return ONLY this JSON schema:\n"
@@ -81,12 +106,24 @@ def proposal_prompt(
     )
 
 
-def verifier_prompt(problem: str, item_id: str, proposal: dict, tool_result: dict | None) -> str:
+def verifier_prompt(
+    problem: str,
+    item_id: str,
+    proposal: dict,
+    tool_result: dict | None,
+    registry: ToolRegistry | None = None,
+) -> str:
+    tools = tool_environment_block(registry)
     return (
         f"Frozen problem:\n{problem}\n\nCandidate {item_id}:\n"
         f"{json.dumps(proposal, ensure_ascii=False, indent=2)}\n\n"
         f"Deterministic tool result:\n{json.dumps(tool_result, ensure_ascii=False, indent=2)}\n\n"
-        "Review as a verification engineer. LLM opinion is not proof. Distinguish tool failure from a mathematical counterexample. "
+        f"{tools}\n\n"
+        "Review as a verification engineer. LLM opinion is not proof. Use these verdicts exactly: "
+        "PASS = deterministic evidence actually verifies the candidate claim; "
+        "FAIL = deterministic counterexample/refutation establishes that the candidate claim is false; "
+        "INCONCLUSIVE = tool unavailable, timeout, syntax/format error, infrastructure failure, or evidence insufficient. "
+        "A tool failure is NEVER by itself a mathematical FAIL. "
         "A tropical_grid GRID_PASS establishes only finite-grid functional equality on the tested nonnegative weights; it does NOT establish formal monomial-level provenance polynomial equality. "
         "If a formal tool result is present, verify that theorem_type is a faithful formalization of the candidate claim; a compiled unrelated tautology is not evidence for this claim. "
         "Return ONLY JSON: "
@@ -125,13 +162,22 @@ def manager_prompt(
     critique: dict,
     *,
     contract_block: str = "",
+    registry: ToolRegistry | None = None,
 ) -> str:
+    registry = registry or ToolRegistry()
+    tools = tool_environment_block(registry)
+    lean_open = registry.is_available("lean_draft")
+    lean_manager = (
+        "Lean açıktır; PROOF_CANDIDATE/PROVEN yine yalnız gerçek bound formal evidence ile istenebilir."
+        if lean_open
+        else "Lean kapalıdır: PROOF_CANDIDATE/PROVEN isteme. Formal yükümlülük varsa next_task içinde 'Lean ortamı gerektirir' diye açıkça etiketle."
+    )
     return (
         f"Frozen problem:\n{problem}\n\nCandidate {item_id}: {claim}\n\n"
         f"Tool:\n{json.dumps(tool_result, ensure_ascii=False, indent=2)}\n"
         f"Verifier:\n{json.dumps(verification, ensure_ascii=False, indent=2)}\n"
         f"Critic:\n{json.dumps(critique, ensure_ascii=False, indent=2)}\n"
-        f"{contract_block}\n\n"
+        f"{contract_block}\n\n{tools}\n{lean_manager}\n\n"
         "Choose research direction. Status and target transitions are REQUESTS only; code-side evidence guards may downgrade or reject them. "
         "An LLM-written counterexample is only a REFUTATION_CANDIDATE until a deterministic tool verifies it; make deterministic verification the next task rather than treating the claim as dead. "
         "Do not claim PROVEN unless a successful same-item bound formal checker result is explicitly present. "
