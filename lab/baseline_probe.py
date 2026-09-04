@@ -16,7 +16,7 @@ from lab.agent import Agent
 from lab.literature import LiteratureClient
 from lab.prompts import ROLE_LIBRARY
 from lab.research_state import ResearchState
-from lab.trace import Trace
+from lab.trace_completion import Trace
 
 
 TOY_PROBLEM = (
@@ -45,6 +45,8 @@ EVENT_COUNTERS = (
     "step_reused",
     "unusually_expensive_call",
     "incomplete_output_not_promotable",
+    "truncated_retry",
+    "effort_coerced",
 )
 
 
@@ -107,6 +109,11 @@ def _iteration_from_step(step_key: str) -> int | None:
         return None
 
 
+def _bump(mapping: dict[str, int], value: Any) -> None:
+    key = str(value or "unknown")
+    mapping[key] = mapping.get(key, 0) + 1
+
+
 def _agent_dict(agent_config: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
     if not isinstance(agent_config, dict):
         return {}
@@ -160,13 +167,6 @@ def resolve_agent_config(
 
 
 def verified_progress_from_events(events: list[dict[str, Any]]) -> int:
-    """Return the code-observable 0–4 progress scale used by fair probes.
-
-    The generic probe only awards levels that are visible in trace evidence. A
-    domain-specific fixture may emit ``verified_progress_claim_match`` after it
-    independently checks that the candidate copied the exact result.
-    """
-
     progress = 0
     for event in events:
         kind = str(event.get("type") or "")
@@ -199,6 +199,11 @@ def summarize_probe(trace_path: Path, summary_path: Path) -> dict[str, Any]:
     iteration_usage: dict[int, dict[str, Any]] = {}
     active_step_by_agent: dict[str, str] = {}
     probe_config: dict[str, Any] = {}
+    retry_recovered = 0
+    retry_failed = 0
+    max_tokens_sources: dict[str, int] = {}
+    catalog_sources: dict[str, int] = {}
+    effort_resolutions: dict[str, int] = {}
 
     for event in events:
         event_type = str(event.get("type") or "")
@@ -206,6 +211,12 @@ def summarize_probe(trace_path: Path, summary_path: Path) -> dict[str, Any]:
             counts[event_type] += 1
         if event_type == "baseline_probe_config":
             probe_config = dict(event)
+        elif event_type == "truncated_retry":
+            outcome = str(event.get("outcome") or "")
+            if outcome == "recovered":
+                retry_recovered += 1
+            elif outcome == "failed":
+                retry_failed += 1
         elif event_type == "stage":
             agent = str(event.get("agent") or "")
             step_key = str(event.get("step_key") or "")
@@ -248,13 +259,18 @@ def summarize_probe(trace_path: Path, summary_path: Path) -> dict[str, Any]:
             agent = str(event.get("agent") or "Agent")
             step_key = active_step_by_agent.get(agent, "")
             budget = event.get("budget") or {}
+            completion_tokens = int(event.get("completion_tokens", 0) or 0)
+            reasoning_tokens = int(event.get("reasoning_tokens", 0) or 0)
+            reasoning_ratio = reasoning_tokens / completion_tokens if completion_tokens > 0 else None
             call = {
                 "agent": agent,
                 "step_key": step_key,
                 "model": event.get("model"),
                 "prompt_tokens": event.get("prompt_tokens", 0),
-                "completion_tokens": event.get("completion_tokens", 0),
-                "reasoning_tokens": event.get("reasoning_tokens", 0),
+                "completion_tokens": completion_tokens,
+                "reasoning_tokens": reasoning_tokens,
+                "reasoning_completion_ratio": reasoning_ratio,
+                "answer_chars": int(event.get("answer_chars", len(str(event.get("output") or ""))) or 0),
                 "cached_tokens": event.get("cached_tokens", 0),
                 "total_tokens": event.get("total_tokens", 0),
                 "cost_usd": event.get("cost_usd"),
@@ -262,10 +278,20 @@ def summarize_probe(trace_path: Path, summary_path: Path) -> dict[str, Any]:
                 "finish_reason": event.get("finish_reason"),
                 "truncated": bool(event.get("truncated")),
                 "requested_max_tokens": event.get("requested_max_tokens"),
+                "model_max_completion_tokens": event.get("model_max_completion_tokens"),
+                "max_tokens_source": event.get("max_tokens_source"),
+                "catalog_source": event.get("catalog_source"),
+                "reasoning_effort_requested": event.get("reasoning_effort_requested"),
+                "reasoning_effort_sent": event.get("reasoning_effort_sent"),
+                "effort_resolution": event.get("effort_resolution"),
+                "reasoning_max_tokens_sent": event.get("reasoning_max_tokens_sent"),
                 "budget": budget,
                 "output_preview": _preview(event.get("output")),
             }
             llm_calls.append(call)
+            _bump(max_tokens_sources, call["max_tokens_source"])
+            _bump(catalog_sources, call["catalog_source"])
+            _bump(effort_resolutions, call["effort_resolution"])
             role_outputs.setdefault(agent, []).append(
                 {
                     "step_key": step_key,
@@ -351,6 +377,11 @@ def summarize_probe(trace_path: Path, summary_path: Path) -> dict[str, Any]:
         "total_cost_usd": run_summary.get("total_cost_usd", 0.0),
         "cost_complete": run_summary.get("cost_complete", False),
         "event_counts": counts,
+        "retry_recovered": retry_recovered,
+        "retry_failed": retry_failed,
+        "max_tokens_source_distribution": max_tokens_sources,
+        "catalog_source_distribution": catalog_sources,
+        "effort_resolution_distribution": effort_resolutions,
         "verified_progress": verified_progress_from_events(events),
         "iterations": iterations,
         "per_iteration": per_iteration,
@@ -382,9 +413,17 @@ def _markdown_report(report: dict[str, Any]) -> str:
         f"- JSON repairs completed: **{counts['structured_output_repaired']}**",
         f"- JSON repair failures: **{counts['structured_output_repair_failed']}**",
         f"- incomplete outputs blocked from promotion: **{counts.get('incomplete_output_not_promotable', 0)}**",
+        f"- truncated calls: **{sum(int(row.get('truncated_calls', 0)) for row in report.get('role_budget', {}).values())}**",
+        f"- truncation retries recovered/failed: **{report.get('retry_recovered', 0)}/{report.get('retry_failed', 0)}**",
+        f"- effort coercion events: **{counts.get('effort_coerced', 0)}**",
         f"- unusually expensive calls: **{counts.get('unusually_expensive_call', 0)}**",
         f"- guard downgrades: **{counts['status_downgraded_by_guard']}**",
         f"- agent retries: **{counts['agent_retry']}**",
+        "",
+        "## Completion policy distributions",
+        f"- max_tokens_source: `{json.dumps(report.get('max_tokens_source_distribution', {}), sort_keys=True)}`",
+        f"- catalog_source: `{json.dumps(report.get('catalog_source_distribution', {}), sort_keys=True)}`",
+        f"- effort_resolution: `{json.dumps(report.get('effort_resolution_distribution', {}), sort_keys=True)}`",
         "",
         "## Agent configuration",
     ]
@@ -393,7 +432,7 @@ def _markdown_report(report: dict[str, Any]) -> str:
         for role, spec in agent_config.items():
             if not isinstance(spec, dict):
                 continue
-            max_label = spec.get("max_tokens") if spec.get("max_tokens") is not None else "provider/default (no role cap)"
+            max_label = spec.get("max_tokens") if spec.get("max_tokens") is not None else "catalog/provider capacity (no role cap)"
             lines.append(
                 f"- `{role}`: `{spec.get('model')}` / effort=`{spec.get('reasoning_effort') or 'provider-default'}` / "
                 f"max_tokens={max_label}"
@@ -469,12 +508,16 @@ def _markdown_report(report: dict[str, Any]) -> str:
 
     lines += ["", "## Per-call usage"]
     for index, call in enumerate(report["llm_calls"], 1):
-        budget = call.get("budget") or {}
+        ratio = call.get("reasoning_completion_ratio")
+        ratio_label = "N/A" if ratio is None else f"{float(ratio):.4f}"
         lines.append(
             f"- {index}. `{call['agent']}` / `{call['model']}` / `{call.get('step_key') or '-'}`: "
-            f"{call['total_tokens']} tokens, cost={call['cost_usd']}, latency={call['latency_s']}s, "
+            f"completion={call['completion_tokens']}, reasoning={call['reasoning_tokens']}, answer_chars={call['answer_chars']}, "
+            f"ratio={ratio_label}, total={call['total_tokens']}, cost={call['cost_usd']}, latency={call['latency_s']}s, "
             f"finish={call.get('finish_reason')}, truncated={call.get('truncated')}, "
-            f"requested_max_tokens={call.get('requested_max_tokens')}, expected_max={budget.get('expected_max')}"
+            f"requested_max={call.get('requested_max_tokens')}, model_max={call.get('model_max_completion_tokens')}, "
+            f"max_source={call.get('max_tokens_source')}, catalog_source={call.get('catalog_source')}, "
+            f"effort={call.get('reasoning_effort_requested')}→{call.get('reasoning_effort_sent')} ({call.get('effort_resolution')})"
         )
     return "\n".join(lines) + "\n"
 
@@ -599,7 +642,7 @@ def parse_args() -> argparse.Namespace:
         "--max-tokens",
         type=int,
         default=None,
-        help="Optional explicit cap for a special probe. Default: no role cap; LAB_EMERGENCY_MAX_TOKENS remains a separate global safety ceiling.",
+        help="Optional explicit cap for a special probe. Default: use catalog model capacity when known; LAB_EMERGENCY_MAX_TOKENS remains a separate global safety ceiling.",
     )
     parser.add_argument("--reasoning-effort", default=os.environ.get("LAB_BASELINE_REASONING_EFFORT", "low"))
     parser.add_argument(
