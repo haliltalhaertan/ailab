@@ -13,7 +13,7 @@ from urllib.request import Request, urlopen
 MODELS_URL = "https://openrouter.ai/api/v1/models?sort=most-popular"
 CATALOG_CACHE_TTL_S = 6 * 60 * 60
 CATALOG_CACHE_SCHEMA_VERSION = 1
-_ALL_GATEWAY_REASONING_EFFORTS = ("max", "xhigh", "high", "medium", "low", "minimal", "none")
+_ALL_GATEWAY_REASONING_EFFORTS: tuple[str, ...] = ("max", "xhigh", "high", "medium", "low", "minimal", "none")
 
 
 @dataclass(frozen=True)
