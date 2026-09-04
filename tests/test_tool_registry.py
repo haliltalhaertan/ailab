@@ -26,8 +26,9 @@ def test_lean_is_hidden_when_host_execution_is_disabled(tmp_path, monkeypatch):
     assert "lean_draft" not in registry.names(available_only=True)
     assert "lean_draft" not in proposal_schema(registry)["tool_request"]["tool"].split("|")
     prompt = proposal_prompt("P", "L", "ledger", "task", registry)
-    assert "formal doğrulama (Lean) YOK" in prompt
-    assert "Lean taslağı yazma" in prompt
+    assert "YENİ formal doğrulama (Lean) çalıştırılamaz" in prompt
+    assert "yeni lean_draft isteme" in prompt
+    assert "daha önce tamamlanmış" in prompt
 
 
 def test_lean_is_exposed_only_when_enabled_and_binary_exists(tmp_path, monkeypatch):
@@ -123,9 +124,10 @@ def test_verifier_prompt_defines_tool_failures_as_inconclusive(tmp_path, monkeyp
     assert "FAIL = deterministic counterexample/refutation" in prompt
     assert "INCONCLUSIVE = tool unavailable, timeout, syntax/format error" in prompt
     assert "tool failure is NEVER" in prompt
+    assert "previously completed claim-bound formal result" in prompt
 
 
-def test_manager_does_not_request_formal_promotion_when_lean_is_closed(tmp_path, monkeypatch):
+def test_manager_blocks_new_formal_work_but_allows_existing_bound_evidence(tmp_path, monkeypatch):
     monkeypatch.delenv("LAB_ALLOW_HOST_LEAN", raising=False)
     registry = _registry(tmp_path)
     prompt = manager_prompt(
@@ -138,5 +140,6 @@ def test_manager_does_not_request_formal_promotion_when_lean_is_closed(tmp_path,
         registry=registry,
     )
 
-    assert "PROOF_CANDIDATE/PROVEN isteme" in prompt
-    assert "Lean ortamı gerektirir" in prompt
+    assert "Yeni Lean çalıştırması kapalıdır" in prompt
+    assert "same-item/same-iteration/same-claim bound formal evidence" in prompt
+    assert "aksi halde PROVEN isteme" in prompt
