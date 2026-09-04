@@ -12,9 +12,28 @@ class StructuredOutputError(ValueError):
 class IncompleteJSONObject(dict[str, Any]):
     """A parseable prefix from a provider-truncated structured response.
 
-    The mapping preserves the fields that were completely observed, while
-    downstream evidence gates can distinguish it from a complete JSON object.
+    Complete descriptive fields are preserved, but load-bearing decision fields
+    resolve to conservative values. The raw provider text remains in trace.jsonl,
+    so this safety normalization does not erase provenance.
     """
+
+    _SAFE_DECISIONS: dict[str, Any] = {
+        "status": "OPEN",
+        "decision": "REVISE",
+        "verdict": "INCONCLUSIVE",
+        "counterexample": "",
+        "target_proposal": {},
+    }
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if key in self._SAFE_DECISIONS:
+            return self._SAFE_DECISIONS[key]
+        return super().get(key, default)
+
+    def __getitem__(self, key: str) -> Any:
+        if key in self._SAFE_DECISIONS:
+            return self._SAFE_DECISIONS[key]
+        return super().__getitem__(key)
 
 
 def strip_code_fence(text: str) -> str:
