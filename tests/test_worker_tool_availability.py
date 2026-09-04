@@ -152,6 +152,7 @@ def test_registry_defaults_can_receive_worker_effective_universe(tmp_path, monke
         "z3": _row(False, "frozen off"),
         "script": _row(False, "frozen off"),
         "tropical_grid": _row(True, "built-in"),
+        "code_experiment": _row(True, "container available"),
     }
     monkeypatch.setenv(EFFECTIVE_AVAILABILITY_ENV, json.dumps(snapshot))
     monkeypatch.setattr("lab.tool_registry.shutil.which", lambda _name: "fake")
@@ -161,6 +162,13 @@ def test_registry_defaults_can_receive_worker_effective_universe(tmp_path, monke
 
     assert registry.is_available("lean_draft") is False
     assert registry.is_available("tropical_grid") is True
+    assert registry.is_available("code_experiment") is True
+    assert "code_experiment" in registry.names(available_only=True)
+    result = registry.execute({"tool": "code_experiment", "task": "x"})
+    assert result is not None
+    assert result.ok is False
+    assert result.metadata["tool_unavailable"] is True
+    assert "theorem-run context" in result.error
 
 
 def test_special_engine_paths_are_fail_closed_when_effective_snapshot_closes_them():
