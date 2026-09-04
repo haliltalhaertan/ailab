@@ -22,6 +22,7 @@ from lab.project_manager import ProjectManager
 from lab.research_state import ResearchState
 from lab.run_controller import ResearchStopped, RunController
 from lab.tool_registry import EFFECTIVE_AVAILABILITY_ENV, ToolRegistry
+from lab.tools import ToolResult
 from lab.trace import Trace
 from lab.worker_runtime import WorkerRuntimeBridge
 
@@ -85,6 +86,71 @@ def _availability_map(value: Any) -> dict[str, dict[str, Any]]:
         if isinstance(raw, dict):
             rows[str(name)] = dict(raw)
     return rows
+
+
+class _UnavailableLeanTool:
+    def __init__(self, reason: str):
+        self.reason = str(reason)
+
+    def _result(self) -> ToolResult:
+        return ToolResult(
+            False,
+            "lean",
+            error=f"Tool bu koşuda kullanılamıyor: {self.reason}",
+            metadata={"tool_unavailable": True, "availability_reason": self.reason},
+        )
+
+    def draft_source(self, *_args: Any, **_kwargs: Any) -> ToolResult:
+        return self._result()
+
+    def check_file(self, *_args: Any, **_kwargs: Any) -> ToolResult:
+        return self._result()
+
+
+class _UnavailableCodeRunner:
+    def __init__(self, reason: str):
+        self.reason = str(reason)
+
+    def run(self, **_kwargs: Any) -> ToolResult:
+        return ToolResult(
+            False,
+            "code_experiment",
+            error=f"Tool bu koşuda kullanılamıyor: {self.reason}",
+            metadata={
+                "tool_unavailable": True,
+                "availability_reason": self.reason,
+                "evidence_level": "COMPUTATION_ONLY",
+            },
+        )
+
+
+def _bind_special_tool_guards(lab: Any, snapshot: dict[str, Any]) -> None:
+    """Guard theorem-engine special dispatch paths with the effective snapshot.
+
+    ``lean_draft`` and ``code_experiment`` have engine-specific execution paths
+    rather than ordinary registry dispatch. Bind fail-closed stand-ins when the
+    run-scoped effective universe marks either capability closed.
+    """
+
+    effective = _availability_map(snapshot.get("effective_tool_availability"))
+
+    lean_row = effective.get("lean_draft", {})
+    if not bool(lean_row.get("available")):
+        toolbox = getattr(lab, "toolbox", None)
+        if toolbox is not None and hasattr(toolbox, "lean"):
+            setattr(
+                toolbox,
+                "lean",
+                _UnavailableLeanTool(str(lean_row.get("reason") or "Lean bu run'da kapalı")),
+            )
+
+    code_row = effective.get("code_experiment", {})
+    if not bool(code_row.get("available")) and hasattr(lab, "code_runner"):
+        setattr(
+            lab,
+            "code_runner",
+            _UnavailableCodeRunner(str(code_row.get("reason") or "Container bu run'da kapalı")),
+        )
 
 
 def _tool_availability_for_run(root: Path, lab: Any, runtime_before: dict[str, Any]) -> dict[str, Any]:
@@ -348,6 +414,7 @@ def run_project(project_id: str, *, agent_factory: AgentFactory = _agent) -> int
             )
             tool_snapshot = _tool_availability_for_run(root, lab, runtime_prelaunch)
             _trace_tool_availability(trace, tool_snapshot)
+            _bind_special_tool_guards(lab, tool_snapshot)
             os.environ[EFFECTIVE_AVAILABILITY_ENV] = json.dumps(
                 tool_snapshot["effective_tool_availability"],
                 ensure_ascii=False,
