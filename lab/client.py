@@ -10,10 +10,21 @@ from typing import Any, Callable
 import httpx
 from openai import OpenAI
 
+from lab.openrouter_catalog import OpenRouterModel, lookup_openrouter_model
 from lab.reasoning_settings import normalize_effort
 
 DEFAULT_MODEL = "openai/gpt-4o-mini"
+FINAL_ANSWER_RESERVE = 8192
 StreamCallback = Callable[[str, Any], None]
+
+_EFFORT_ORDER = {
+    "minimal": 0,
+    "low": 1,
+    "medium": 2,
+    "high": 3,
+    "xhigh": 4,
+    "max": 5,
+}
 
 
 @dataclass
@@ -32,10 +43,28 @@ class LLMResponse:
     requested_reasoning_effort: str | None = None
     finish_reason: str | None = None
     requested_max_tokens: int | None = None
+    model_max_completion_tokens: int | None = None
+    max_tokens_source: str = "provider_default"
+    catalog_source: str = "unavailable"
+    reasoning_effort_sent: str | None = None
+    effort_resolution: str = "provider_default"
+    reasoning_max_tokens_sent: int | None = None
 
     @property
     def total_tokens(self) -> int:
         return self.prompt_tokens + self.completion_tokens
+
+
+@dataclass(frozen=True)
+class _RequestPolicy:
+    requested_max_tokens: int | None
+    model_max_completion_tokens: int | None
+    max_tokens_source: str
+    catalog_source: str
+    reasoning_effort_requested: str | None
+    reasoning_effort_sent: str | None
+    effort_resolution: str
+    reasoning_max_tokens_sent: int | None
 
 
 def _extra(obj: Any, name: str, default: Any = None) -> Any:
@@ -95,8 +124,8 @@ def _usage_values(usage: Any) -> tuple[int, int, int, int, float | None]:
 def _emergency_max_tokens() -> int | None:
     """Return the optional global runaway-cost ceiling.
 
-    This is intentionally not a role budget and is never shown to agents.  It is
-    a single operator safety ceiling that defaults to disabled.
+    The value can only narrow an already-known request. It never manufactures a
+    completion limit for a model whose capacity is unknown.
     """
 
     raw = str(os.environ.get("LAB_EMERGENCY_MAX_TOKENS") or "").strip()
@@ -111,23 +140,127 @@ def _emergency_max_tokens() -> int | None:
     return value
 
 
-def _requested_max_tokens(explicit: int | None) -> int | None:
+def _requested_max_tokens(
+    explicit: int | None,
+    model_max_completion_tokens: int | None = None,
+) -> tuple[int | None, str]:
+    """Resolve an effective completion request without inventing model capacity."""
+
+    requested: int | None
+    source: str
+    explicit_value: int | None = None
+    if explicit is not None:
+        candidate = int(explicit)
+        if candidate > 0:
+            explicit_value = candidate
+
+    if explicit_value is not None:
+        requested = explicit_value
+        source = "explicit"
+    elif model_max_completion_tokens is not None and int(model_max_completion_tokens) > 0:
+        requested = int(model_max_completion_tokens)
+        source = "catalog"
+    else:
+        requested = None
+        source = "provider_default"
+
+    if (
+        requested is not None
+        and model_max_completion_tokens is not None
+        and requested > int(model_max_completion_tokens)
+    ):
+        requested = int(model_max_completion_tokens)
+        source += "+model_clamp"
+
     emergency = _emergency_max_tokens()
-    if explicit is None:
-        return emergency
-    value = int(explicit)
-    if value <= 0:
-        return emergency
-    return min(value, emergency) if emergency is not None else value
+    if emergency is not None and requested is not None:
+        requested = min(requested, emergency)
+        source += "+emergency"
+    return requested, source
+
+
+def _supported_parameter(model: OpenRouterModel | None, name: str) -> bool:
+    if model is None:
+        return False
+    wanted = name.casefold()
+    return any(str(value).casefold() == wanted for value in model.supported_parameters)
+
+
+def _resolve_reasoning_effort(
+    requested: str | None,
+    model: OpenRouterModel | None,
+) -> tuple[str | None, str]:
+    if requested in {None, ""}:
+        return None, "provider_default"
+    requested = str(requested).casefold()
+    if model is None:
+        return None, "catalog_unknown"
+
+    supported = tuple(str(value).casefold() for value in model.reasoning_supported_efforts)
+    if supported:
+        if requested in supported:
+            return requested, "exact"
+        requested_rank = _EFFORT_ORDER.get(requested)
+        if requested_rank is None:
+            return None, "unsupported"
+        lower = [
+            value
+            for value in supported
+            if value in _EFFORT_ORDER and _EFFORT_ORDER[value] < requested_rank
+        ]
+        if not lower:
+            return None, "unsupported_no_lower"
+        return max(lower, key=lambda value: _EFFORT_ORDER[value]), "lower_supported"
+
+    if _supported_parameter(model, "reasoning_effort"):
+        return requested, "parameter_support_no_effort_list"
+    return None, "catalog_unknown"
+
+
+def _reasoning_request(
+    model: OpenRouterModel | None,
+    requested_max_tokens: int | None,
+    reasoning_effort: str | None,
+) -> tuple[dict[str, Any], str | None, str, int | None]:
+    """Build one OpenRouter reasoning control without mixing effort and token budget."""
+
+    if (
+        model is not None
+        and model.reasoning_supports_max_tokens
+        and requested_max_tokens is not None
+        and requested_max_tokens >= FINAL_ANSWER_RESERVE + 1024
+    ):
+        reasoning_max = max(requested_max_tokens - FINAL_ANSWER_RESERVE, 1024)
+        return {"max_tokens": reasoning_max, "exclude": False}, None, "reasoning_max_tokens", reasoning_max
+
+    effort_sent, resolution = _resolve_reasoning_effort(reasoning_effort, model)
+    if effort_sent is not None:
+        return {"effort": effort_sent, "exclude": False}, effort_sent, resolution, None
+    return {"exclude": False}, None, resolution, None
+
+
+def next_lower_supported_effort(model_id: str | None, current_effort: str | None) -> str | None:
+    """Return the next lower catalog-supported effort, otherwise preserve current."""
+
+    current = str(current_effort or "").casefold()
+    if not current or current not in _EFFORT_ORDER or not model_id:
+        return current_effort
+    model, _source = lookup_openrouter_model(str(model_id))
+    if model is None or not model.reasoning_supported_efforts:
+        return current_effort
+    supported = [
+        str(value).casefold()
+        for value in model.reasoning_supported_efforts
+        if str(value).casefold() in _EFFORT_ORDER
+    ]
+    lower = [value for value in supported if _EFFORT_ORDER[value] < _EFFORT_ORDER[current]]
+    if not lower:
+        return current_effort
+    return max(lower, key=lambda value: _EFFORT_ORDER[value])
 
 
 class LLMClient:
-    """OpenAI-compatible client with *no hidden SDK retry layer*.
-
-    Retry/backoff belongs to RunController/TheoremResearchLab where every retry is
-    traceable. Setting OpenAI(max_retries=0) prevents the SDK from silently making
-    extra requests that the research ledger cannot account for.
-    """
+    """OpenAI-compatible client with *no hidden SDK retry layer*."""
 
     def __init__(
         self,
@@ -162,7 +295,34 @@ class LLMClient:
     ) -> LLMResponse:
         model = model or os.environ.get("LAB_MODEL", DEFAULT_MODEL)
         reasoning_effort = normalize_effort(reasoning_effort)
-        requested_max_tokens = _requested_max_tokens(max_tokens)
+
+        catalog_model: OpenRouterModel | None = None
+        catalog_source = "unavailable"
+        if self.is_openrouter:
+            catalog_model, catalog_source = lookup_openrouter_model(model)
+        model_max = catalog_model.max_completion_tokens if catalog_model is not None else None
+        requested_max_tokens, max_tokens_source = _requested_max_tokens(max_tokens, model_max)
+        reasoning: dict[str, Any] = {}
+        effort_sent: str | None = None
+        effort_resolution = "not_openrouter"
+        reasoning_max_tokens_sent: int | None = None
+        if self.is_openrouter:
+            reasoning, effort_sent, effort_resolution, reasoning_max_tokens_sent = _reasoning_request(
+                catalog_model,
+                requested_max_tokens,
+                reasoning_effort,
+            )
+
+        policy = _RequestPolicy(
+            requested_max_tokens=requested_max_tokens,
+            model_max_completion_tokens=model_max,
+            max_tokens_source=max_tokens_source,
+            catalog_source=catalog_source,
+            reasoning_effort_requested=reasoning_effort,
+            reasoning_effort_sent=effort_sent,
+            effort_resolution=effort_resolution,
+            reasoning_max_tokens_sent=reasoning_max_tokens_sent,
+        )
         kwargs: dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -171,38 +331,34 @@ class LLMClient:
         if requested_max_tokens is not None:
             kwargs["max_tokens"] = requested_max_tokens
         if self.is_openrouter:
-            reasoning: dict[str, Any] = {"exclude": False}
-            if reasoning_effort is not None:
-                reasoning["effort"] = reasoning_effort
             kwargs["extra_body"] = {
                 "usage": {"include": True},
                 "reasoning": reasoning,
             }
 
         if stream_callback is None:
-            return self._complete_once(
-                kwargs,
-                messages,
-                model,
-                reasoning_effort,
-                requested_max_tokens,
-            )
-        return self._complete_stream(
-            kwargs,
-            messages,
-            model,
-            reasoning_effort,
-            requested_max_tokens,
-            stream_callback,
-        )
+            return self._complete_once(kwargs, messages, model, policy)
+        return self._complete_stream(kwargs, messages, model, policy, stream_callback)
+
+    @staticmethod
+    def _response_kwargs(policy: _RequestPolicy) -> dict[str, Any]:
+        return {
+            "requested_reasoning_effort": policy.reasoning_effort_requested,
+            "requested_max_tokens": policy.requested_max_tokens,
+            "model_max_completion_tokens": policy.model_max_completion_tokens,
+            "max_tokens_source": policy.max_tokens_source,
+            "catalog_source": policy.catalog_source,
+            "reasoning_effort_sent": policy.reasoning_effort_sent,
+            "effort_resolution": policy.effort_resolution,
+            "reasoning_max_tokens_sent": policy.reasoning_max_tokens_sent,
+        }
 
     def _complete_once(
         self,
         kwargs: dict[str, Any],
         messages: list[dict],
         model: str,
-        reasoning_effort: str | None,
-        requested_max_tokens: int | None,
+        policy: _RequestPolicy,
     ) -> LLMResponse:
         start = time.perf_counter()
         resp = self._client.chat.completions.create(**kwargs)
@@ -226,9 +382,8 @@ class LLMClient:
             provider_reasoning=str(provider_reasoning),
             reasoning_details=reasoning_details,
             request_messages=[dict(m) for m in messages],
-            requested_reasoning_effort=reasoning_effort,
             finish_reason=str(finish_reason_raw) if finish_reason_raw is not None else None,
-            requested_max_tokens=requested_max_tokens,
+            **self._response_kwargs(policy),
         )
 
     def _complete_stream(
@@ -236,8 +391,7 @@ class LLMClient:
         kwargs: dict[str, Any],
         messages: list[dict],
         model: str,
-        reasoning_effort: str | None,
-        requested_max_tokens: int | None,
+        policy: _RequestPolicy,
         stream_callback: StreamCallback,
     ) -> LLMResponse:
         stream_kwargs = dict(kwargs)
@@ -280,9 +434,6 @@ class LLMClient:
                 reasoning_parts.append(text)
                 stream_callback("reasoning", text)
 
-            # Keep structured reasoning details for the final LLMResponse (and
-            # therefore trace.jsonl / provider-resume), but do not duplicate
-            # every detail delta into the high-volume live stream channel.
             detail_delta = _jsonable(_extra(delta, "reasoning_details"))
             if detail_delta:
                 if isinstance(detail_delta, list):
@@ -304,18 +455,11 @@ class LLMClient:
             provider_reasoning="".join(reasoning_parts),
             reasoning_details=reasoning_details or None,
             request_messages=[dict(m) for m in messages],
-            requested_reasoning_effort=reasoning_effort,
             finish_reason=finish_reason,
-            requested_max_tokens=requested_max_tokens,
+            **self._response_kwargs(policy),
         )
 
 
 @lru_cache(maxsize=4)
 def get_default_client(base_url: str | None = None) -> LLMClient:
-    """Lazily create and share a connection pool per base URL.
-
-    Importing/constructing Agent objects is now safe in offline tests; the API key
-    is required only when an agent actually makes its first network call.
-    """
-
     return LLMClient(base_url=base_url)
