@@ -146,7 +146,7 @@ def resolve_agent_config(
         role_effort_value = raw.get("reasoning_effort", reasoning_effort)
         role_effort = None if role_effort_value in {None, "", "none"} else str(role_effort_value)
         raw_max = raw.get("max_tokens") if "max_tokens" in raw else max_tokens
-        role_max_tokens = int(raw_max) if raw_max not in {None, ""} else None
+        role_max_tokens = int(str(raw_max)) if raw_max not in {None, ""} else None
         if not role_model:
             raise ValueError(f"Missing model for baseline role {role}")
         if role_max_tokens is not None and role_max_tokens < 128:
@@ -381,8 +381,8 @@ def _markdown_report(report: dict[str, Any]) -> str:
         f"- JSON parse failures: **{counts['structured_output_parse_failed']}**",
         f"- JSON repairs completed: **{counts['structured_output_repaired']}**",
         f"- JSON repair failures: **{counts['structured_output_repair_failed']}**",
-        f"- incomplete outputs blocked from promotion: **{counts['incomplete_output_not_promotable']}**",
-        f"- unusually expensive calls: **{counts['unusually_expensive_call']}**",
+        f"- incomplete outputs blocked from promotion: **{counts.get('incomplete_output_not_promotable', 0)}**",
+        f"- unusually expensive calls: **{counts.get('unusually_expensive_call', 0)}**",
         f"- guard downgrades: **{counts['status_downgraded_by_guard']}**",
         f"- agent retries: **{counts['agent_retry']}**",
         "",
