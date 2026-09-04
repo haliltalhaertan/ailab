@@ -73,3 +73,30 @@ def test_proven_revision_stays_historical_after_claim_revision(tmp_path: Path):
     assert revised.revisions[0]["claim_hash"] != revised.revisions[1]["claim_hash"]
     assert "proof_seal" not in revised.metadata
     assert "formal_verified" not in revised.metadata
+
+
+def test_proposal_tool_source_is_persisted_as_hashed_artifact(tmp_path: Path):
+    state = ResearchState(tmp_path / "state")
+    smt2 = "(set-logic QF_LIA)\n(assert (= 1 1))\n(check-sat)\n"
+    item = state.add_item(
+        "conjecture",
+        "Z3 candidate",
+        "The solver query is satisfiable",
+        metadata={
+            "iteration": 1,
+            "proposal": {
+                "title": "Z3 candidate",
+                "claim": "The solver query is satisfiable",
+                "strategy": "ask an exact solver",
+                "evidence_needed": ["solver result"],
+                "tool_request": {"tool": "z3", "smt2": smt2},
+            },
+        },
+    )
+
+    summary = item.metadata["tool_request_summary"]
+    artifact = state.root / summary["artifact_path"]
+    assert summary["artifact_path"] == f"formal/{item.id}/r1.smt2"
+    assert artifact.read_text(encoding="utf-8") == smt2
+    assert summary["sha256"] == sha256_file(artifact)
+    assert "smt2" not in item.metadata["proposal"]["tool_request"]
