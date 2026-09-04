@@ -13,7 +13,7 @@ from lab.code_experiment import CODE_EXPERIMENT_SYSTEM_PROMPT, CodeExperimentRun
 from lab.code_experiment_settings import load_code_experiment_settings, load_code_experiment_settings_from_dict
 from lab.evidence import evidence_from_tool_result, validate_evidence_binding
 from lab.integrity import content_fingerprint, sha256_file
-from lab.json_io import StructuredOutputError, parse_json_object, repair_instruction
+from lab.json_io import StructuredOutputError, parse_json_object, parse_truncated_object_prefix, repair_instruction
 from lab.literature import LiteratureClient, LiteratureSearchEmpty, Paper
 from lab.prompts import checkpoint_prompt, critic_prompt, literature_prompt, manager_prompt, proposal_prompt, verifier_prompt
 from lab.research_contract import ResearchContract
@@ -105,6 +105,7 @@ class TheoremResearchLab:
         self._active_item_id = ""
         self._active_claim_hash = ""
         self._active_claim_sha256 = ""
+        self._llm_step_meta: dict[str, dict[str, Any]] = {}
 
     @property
     def runtime_path(self):
@@ -302,6 +303,11 @@ class TheoremResearchLab:
                 self._partial_clear(step_key)
                 if cached.get("model") and cached.get("model") != agent.model:
                     self.trace.log("model_override_reused_completed_step", step_key=step_key, cached_model=cached.get("model"), current_model=agent.model)
+                self._llm_step_meta[step_key] = {
+                    "finish_reason": cached.get("finish_reason"),
+                    "truncated": bool(cached.get("truncated")),
+                    "requested_max_tokens": cached.get("requested_max_tokens"),
+                }
                 self.trace.log("step_reused", step_key=step_key, agent=agent.name, model=cached.get("model"), fingerprint=fingerprint)
                 return str(cached.get("content", ""))
             self.trace.log("cache_fingerprint_miss", step_key=step_key, kind="llm")
@@ -352,6 +358,14 @@ class TheoremResearchLab:
             try:
                 content, response = agent.respond(messages, stream_callback=self._stream_callback(agent, step_key, prompt, fingerprint, buffers, attempt))
                 self.trace.agent_call(agent.name, response.model, agent.temperature, messages, response)
+                finish_reason = getattr(response, "finish_reason", None)
+                truncated = str(finish_reason or "").lower() == "length"
+                requested_max_tokens = getattr(response, "requested_max_tokens", None)
+                self._llm_step_meta[step_key] = {
+                    "finish_reason": finish_reason,
+                    "truncated": truncated,
+                    "requested_max_tokens": requested_max_tokens,
+                }
                 self._cache_put(
                     step_key,
                     {
@@ -360,6 +374,9 @@ class TheoremResearchLab:
                         "content": content,
                         "model": response.model,
                         "reasoning_effort": agent.reasoning_effort,
+                        "finish_reason": finish_reason,
+                        "truncated": truncated,
+                        "requested_max_tokens": requested_max_tokens,
                         "completed_at": now_iso(),
                         "soft_resumed": bool(partial),
                     },
@@ -383,10 +400,37 @@ class TheoremResearchLab:
 
     def _call_json(self, agent: Agent, prompt: str, step_key: str) -> dict[str, Any]:
         raw = self._call(agent, prompt, step_key)
+        truncated = bool(self._llm_step_meta.get(step_key, {}).get("truncated"))
         try:
             return parse_json_object(raw)
         except StructuredOutputError as first:
-            self.trace.log("structured_output_parse_failed", step_key=step_key, agent=agent.name, error=str(first))
+            self.trace.log(
+                "structured_output_parse_failed",
+                step_key=step_key,
+                agent=agent.name,
+                truncated=truncated,
+                error=str(first),
+            )
+        if truncated:
+            try:
+                recovered = parse_truncated_object_prefix(raw)
+            except StructuredOutputError as exc:
+                self.trace.log(
+                    "structured_output_truncated_recovery_failed",
+                    step_key=step_key,
+                    agent=agent.name,
+                    error=str(exc),
+                )
+                raise ResearchPaused(
+                    f"{agent.name} çıktısı token sınırında kesildi ve güvenli JSON prefix'i kurtarılamadı: {exc}"
+                ) from exc
+            self.trace.log(
+                "structured_output_truncated_prefix_recovered",
+                step_key=step_key,
+                agent=agent.name,
+                recovered_keys=sorted(recovered),
+            )
+            return recovered
         repair_raw = self._call(agent, repair_instruction(raw), f"{step_key}:json_repair")
         try:
             repaired = parse_json_object(repair_raw)
@@ -722,6 +766,34 @@ class TheoremResearchLab:
             raise ResearchPaused("Theorist geçerli bir open target seçemedi")
         return repaired, target_id
 
+    def _incomplete_target(
+        self,
+        proposal: dict[str, Any],
+        *,
+        contract: ResearchContract | None,
+        selectable_ids: list[str],
+        iteration: int,
+    ) -> str | None:
+        if contract is None:
+            return None
+        target_id = str(proposal.get("target_id") or "").strip()
+        if target_id in selectable_ids:
+            try:
+                contract.target(target_id, require_open=True)
+            except (KeyError, ValueError):
+                pass
+            else:
+                return target_id
+        self.trace.log(
+            "proposal_target_rejected",
+            iteration=iteration,
+            selected=target_id,
+            valid_target_ids=selectable_ids,
+            incomplete_output=True,
+            repair_skipped=True,
+        )
+        return None
+
     def _pilot_gate(
         self,
         contract: ResearchContract | None,
@@ -982,6 +1054,7 @@ class TheoremResearchLab:
 
             if contract is not None:
                 self.controller.set_research_phase("DISCOVERY")
+            proposer_step = f"iter:{iteration}:proposer"
             proposal = self._call_json(
                 proposer,
                 proposal_prompt(
@@ -993,16 +1066,33 @@ class TheoremResearchLab:
                     contract_block=contract_block,
                     pilot_block=pilot_block,
                 ),
-                f"iter:{iteration}:proposer",
+                proposer_step,
             )
-            proposal, target_id = self._validate_proposal_target(
-                proposer,
-                proposal,
-                contract=contract,
-                selectable_ids=selectable_ids,
-                iteration=iteration,
-            )
+            proposal_incomplete = bool(self._llm_step_meta.get(proposer_step, {}).get("truncated"))
+            if proposal_incomplete and (not str(proposal.get("title") or "").strip() or not str(proposal.get("claim") or "").strip()):
+                raise ResearchPaused("Kesilmiş Theorist çıktısında tamamlanmış title ve claim yok; yük taşıyan candidate oluşturulmadı.")
+            if proposal_incomplete:
+                target_id = self._incomplete_target(
+                    proposal,
+                    contract=contract,
+                    selectable_ids=selectable_ids,
+                    iteration=iteration,
+                )
+            else:
+                proposal, target_id = self._validate_proposal_target(
+                    proposer,
+                    proposal,
+                    contract=contract,
+                    selectable_ids=selectable_ids,
+                    iteration=iteration,
+                )
             item = self._ensure_item_matches_proposal(iteration, proposal, snapshot)
+            if proposal_incomplete:
+                self.state.update_item(
+                    item.id,
+                    status="OPEN",
+                    metadata={"truncated": True, "completion": "INCOMPLETE_OUTPUT"},
+                )
             claim = item.claim
             if contract is not None and target_id is not None:
                 target = contract.target(target_id, require_open=True)
@@ -1026,8 +1116,8 @@ class TheoremResearchLab:
                 )
 
             request = proposal.get("tool_request")
-            tool_request = request if isinstance(request, dict) else None
-            tool_result = self._tool(tool_request, f"iter:{iteration}:tool")
+            tool_request = request if isinstance(request, dict) and not proposal_incomplete else None
+            tool_result = None if proposal_incomplete else self._tool(tool_request, f"iter:{iteration}:tool")
             bound_evidence = None
             if tool_result is not None:
                 try:
@@ -1061,7 +1151,7 @@ class TheoremResearchLab:
 
             verification = self._call_json(
                 verifier,
-                verifier_prompt(problem, item.id, proposal, tool_result.as_dict() if tool_result else None),
+                verifier_prompt(problem, item.id, proposal, tool_result.as_dict() if tool_result else None, self.registry),
                 f"iter:{iteration}:verifier",
             )
             critique = self._call_json(
@@ -1079,6 +1169,8 @@ class TheoremResearchLab:
                     verification,
                     critique,
                     contract_block=contract.prompt_block() if contract is not None else "",
+                    registry=self.registry,
+                    candidate_incomplete=proposal_incomplete,
                 ),
                 f"iter:{iteration}:manager",
             )
@@ -1087,30 +1179,49 @@ class TheoremResearchLab:
             if tool_result and tool_result.tool == "lean" and tool_result.ok and (tool_result.metadata or {}).get("formal_verified"):
                 requested_status = "PROVEN"
             expected_claim_hash = content_fingerprint("claim:v1", item.claim)
-            guard = choose_status(
-                requested_status,
-                tool_result=tool_result,
-                verifier=verification,
-                critic=critique,
-                expected_item_id=item.id,
-                expected_iteration=iteration,
-                expected_claim_hash=expected_claim_hash,
-                evidence=bound_evidence,
-                contract=contract,
-            )
-            status = guard.granted
-            if status in {"PROOF_CANDIDATE", "PROVEN"}:
-                self.controller.set_research_phase("PROOF")
-            if guard.downgraded:
+            if proposal_incomplete:
+                status = "OPEN"
+                status_reason = "INCOMPLETE_OUTPUT cannot be promoted; provider ended the proposer response at a token limit."
+                status_metadata: dict[str, Any] = {
+                    "truncated": True,
+                    "completion": "INCOMPLETE_OUTPUT",
+                    "requested_status_ignored": requested_status,
+                }
                 self.trace.log(
-                    "status_downgraded_by_guard",
+                    "incomplete_output_not_promotable",
                     iteration=iteration,
                     item_id=item.id,
                     requested=requested_status,
-                    granted=status,
-                    reason=guard.reason,
-                    guard=guard.metadata,
+                    granted="OPEN",
+                    finish_reason=self._llm_step_meta.get(proposer_step, {}).get("finish_reason"),
                 )
+            else:
+                guard = choose_status(
+                    requested_status,
+                    tool_result=tool_result,
+                    verifier=verification,
+                    critic=critique,
+                    expected_item_id=item.id,
+                    expected_iteration=iteration,
+                    expected_claim_hash=expected_claim_hash,
+                    evidence=bound_evidence,
+                    contract=contract,
+                )
+                status = guard.granted
+                status_reason = guard.reason
+                status_metadata = guard.metadata
+                if status in {"PROOF_CANDIDATE", "PROVEN"}:
+                    self.controller.set_research_phase("PROOF")
+                if guard.downgraded:
+                    self.trace.log(
+                        "status_downgraded_by_guard",
+                        iteration=iteration,
+                        item_id=item.id,
+                        requested=requested_status,
+                        granted=status,
+                        reason=guard.reason,
+                        guard=guard.metadata,
+                    )
 
             counterexample = str(verification.get("counterexample") or critique.get("counterexample") or "").strip()
             deterministic_tool_counterexample = bool(
@@ -1136,14 +1247,16 @@ class TheoremResearchLab:
                     "Verifier: " + json.dumps(verification, ensure_ascii=False),
                     "Critic: " + json.dumps(critique, ensure_ascii=False),
                     "Manager: " + json.dumps(manager_decision, ensure_ascii=False),
-                    "StatusGuard: " + guard.reason,
+                    "StatusGuard: " + status_reason,
                 ]
                 if tool_result:
                     evidence.append("Tool: " + json.dumps(tool_result.as_dict(), ensure_ascii=False))
                 metadata: dict[str, Any] = {
-                    "status_guard": guard.metadata,
+                    "status_guard": status_metadata,
                     "proposal_hash": item.metadata.get("proposal_hash"),
                 }
+                if proposal_incomplete:
+                    metadata.update({"truncated": True, "completion": "INCOMPLETE_OUTPUT"})
                 if bound_evidence is not None:
                     metadata["evidence"] = bound_evidence.as_dict()
                 if status == "PROVEN" and tool_result and tool_result.tool == "lean":
@@ -1162,28 +1275,37 @@ class TheoremResearchLab:
                         item_id=item.id,
                         proposal=target_proposal,
                     )
-                    applied, transition_reason, transition_detail = evaluate_manager_target_proposal(
-                        contract,
-                        self.state,
-                        manager_decision,
-                    )
-                    self.trace.log(
-                        "target_transition_applied" if applied else "target_transition_rejected",
-                        iteration=iteration,
-                        item_id=item.id,
-                        reason=transition_reason,
-                        detail=transition_detail,
-                    )
-                    if applied:
-                        contract = ResearchContract.load(self.state.root)
-                        pilot_groups = pilot_evidence_by_target(contract, self.state)
-                        selectable_ids = selectable_target_ids(
-                            contract,
-                            pilot_groups,
-                            allow_discovery_without_pilot=gate_overridden,
+                    if proposal_incomplete:
+                        self.trace.log(
+                            "target_transition_rejected",
+                            iteration=iteration,
+                            item_id=item.id,
+                            reason="INCOMPLETE_OUTPUT cannot drive a target transition",
+                            detail=target_proposal,
                         )
-                        contract_block = contract.prompt_block(target_ids=selectable_ids)
-                        pilot_block = pilot_prompt_block(contract, pilot_groups)
+                    else:
+                        applied, transition_reason, transition_detail = evaluate_manager_target_proposal(
+                            contract,
+                            self.state,
+                            manager_decision,
+                        )
+                        self.trace.log(
+                            "target_transition_applied" if applied else "target_transition_rejected",
+                            iteration=iteration,
+                            item_id=item.id,
+                            reason=transition_reason,
+                            detail=transition_detail,
+                        )
+                        if applied:
+                            contract = ResearchContract.load(self.state.root)
+                            pilot_groups = pilot_evidence_by_target(contract, self.state)
+                            selectable_ids = selectable_target_ids(
+                                contract,
+                                pilot_groups,
+                                allow_discovery_without_pilot=gate_overridden,
+                            )
+                            contract_block = contract.prompt_block(target_ids=selectable_ids)
+                            pilot_block = pilot_prompt_block(contract, pilot_groups)
 
             old_status = item.status
             self.trace.log("state_change", action="status", item_id=item.id, kind="conjecture", old_status=old_status, new_status=status, decision=decision, reason=str(manager_decision.get("reason") or ""))
