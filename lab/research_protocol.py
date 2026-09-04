@@ -16,6 +16,24 @@ PILOT_EVIDENCE_KINDS = {
 PILOT_SOURCE_ORIGINS = {"BUILTIN", "CHECKED_IN"}
 
 
+def _revision_evidence(revision: dict[str, Any]) -> dict[str, Any] | None:
+    raw = revision.get("evidence")
+    if not isinstance(raw, dict):
+        return None
+    evidence = dict(raw)
+    expected_hash = str(revision.get("claim_hash") or "")
+    expected_revision = int(revision.get("revision", 1) or 1)
+    if str(evidence.get("claim_hash") or "") != expected_hash:
+        return None
+    try:
+        evidence_revision = int(evidence.get("revision"))
+    except (TypeError, ValueError):
+        return None
+    if evidence_revision != expected_revision:
+        return None
+    return evidence
+
+
 def ledger_records(
     state: ResearchState,
     contract: ResearchContract | None = None,
@@ -25,13 +43,13 @@ def ledger_records(
     Conjectures contribute one record per append-only revision. Historical
     evidence therefore remains attached to the exact claim/status that produced
     it. When a contract is supplied, claim_role is recomputed from the revision
-    claim instead of trusting mutable ledger metadata.
+    claim instead of trusting mutable ledger metadata. Evidence with a stale
+    claim_hash/revision binding is omitted from machine transition records.
     """
 
     records: list[dict[str, Any]] = []
     for item in state.list_items(kind="conjecture"):
         for revision in item.revisions:
-            raw_evidence = revision.get("evidence")
             target_id = str(revision.get("target_id") or "")
             claim = str(revision.get("claim") or "")
             claim_role = str(revision.get("claim_role") or "")
@@ -51,7 +69,7 @@ def ledger_records(
                     "claim_role": claim_role,
                     "status": str(revision.get("status") or "OPEN"),
                     "pilot": False,
-                    "evidence": dict(raw_evidence) if isinstance(raw_evidence, dict) else None,
+                    "evidence": _revision_evidence(revision),
                 }
             )
 
