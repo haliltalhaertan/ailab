@@ -95,6 +95,64 @@ def test_history_trace_only_loader_does_not_touch_stream_and_keeps_full_cards(tm
     assert cards[0].content == "FULL ANSWER"
 
 
+def test_completed_live_run_never_reopens_stream_or_polls_delta(tmp_path, monkeypatch):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    trace_event = {
+        "ts": "2026-01-01T00:00:00+00:00",
+        "type": "llm_call",
+        "agent": "Theorist",
+        "model": "fake/model",
+        "output": "FINAL",
+        "provider_reasoning": "FINAL REASONING",
+        "total_tokens": 3,
+    }
+    (run_dir / "trace.jsonl").write_text(_line(trace_event), encoding="utf-8")
+    raw_stream = run_dir / "stream.jsonl"
+    with gzip.open(str(raw_stream) + ".gz", "wb") as handle:
+        handle.write(_line({"type": "agent_stream", "delta": "ARCHIVED"}).encode("utf-8"))
+    (run_dir / "summary.json").write_text("{}", encoding="utf-8")
+
+    def forbidden_gzip_open(*_args, **_kwargs):
+        raise AssertionError("completed live panel must not reopen gzip stream")
+
+    def forbidden_since(*_args, **_kwargs):
+        raise AssertionError("completed live panel must not poll JSONL deltas")
+
+    monkeypatch.setattr(ui_model.gzip, "open", forbidden_gzip_open)
+    monkeypatch.setattr(ui_model, "read_jsonl_since", forbidden_since)
+
+    events = ui_model.load_live_run_events(run_dir)
+    offsets = ui_model.live_log_offsets(run_dir)
+    assert events == [trace_event]
+    assert offsets["stream"] == 0
+    assert ui_model.load_live_run_delta(run_dir, offsets) == ([], offsets)
+    assert ui_model.load_live_run_delta(run_dir, offsets) == ([], offsets)
+
+
+def test_live_run_still_polls_trace_and_stream_deltas(tmp_path, monkeypatch):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "trace.jsonl").write_text(_line({"type": "stage", "step_key": "a"}), encoding="utf-8")
+    (run_dir / "stream.jsonl").write_text(
+        _line({"type": "agent_stream", "step_key": "a", "channel": "reasoning", "delta": "x"}),
+        encoding="utf-8",
+    )
+    calls = []
+    original = ui_model.read_jsonl_since
+
+    def spy(path, offset):
+        calls.append(path.name)
+        return original(path, offset)
+
+    monkeypatch.setattr(ui_model, "read_jsonl_since", spy)
+    offsets = {"trace": 0, "stream": 0}
+    events, _new_offsets = ui_model.load_live_run_delta(run_dir, offsets)
+
+    assert calls == ["trace.jsonl", "stream.jsonl"]
+    assert len(events) == 2
+
+
 def test_app_history_explicitly_disables_stream_loading():
     from pathlib import Path
 
