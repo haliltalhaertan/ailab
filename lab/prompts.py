@@ -88,6 +88,16 @@ def proposal_prompt(
 ) -> str:
     registry = registry or ToolRegistry()
     tools = tool_environment_block(registry)
+    contract_rule = (
+        "When a frozen research contract is present, target_id MUST be one of the OPEN TARGETS shown in the contract block; "
+        "do not invent claim_role because code assigns SUBCLAIM/TARGET_RESOLUTION. "
+        if contract_block.strip()
+        else ""
+    )
+    computation_rule = (
+        "Numerical trajectories, exhaustive searches, long arithmetic, stopping-time calculations, enumeration, or repetitive symbolic computation "
+        "must not be performed manually in reasoning. Specify the computation and delegate it to script/code_experiment or another available deterministic tool. "
+    )
     return (
         f"PROBLEM (frozen):\n{problem}\n\n"
         f"LITERATURE SCREEN:\n{literature}\n\n"
@@ -95,9 +105,9 @@ def proposal_prompt(
         f"CURRENT TASK:\n{next_task}\n"
         f"{contract_block}{pilot_block}\n\n{tools}\n\n"
         "Produce exactly one research candidate. Do not reopen a FAIL/DROPPED idea listed in the ledger. "
-        "When a frozen research contract is present, target_id MUST be one of the OPEN TARGETS shown in the contract block; "
-        "do not invent claim_role because code assigns SUBCLAIM/TARGET_RESOLUTION. "
+        f"{contract_rule}"
         "A REFUTATION_CANDIDATE is still active: when relevant, prioritize checking its claimed counterexample with a deterministic tool instead of treating it as settled. "
+        f"{computation_rule}"
         "Separate proved facts from assumptions. If computation/formal checking is useful, request ONE tool from the available tool schema only. "
         "Do not describe your own candidate as verified/proven before deterministic evidence exists; call it an aday/candidate. "
         "For lean_draft, theorem_name and theorem_type are mandatory and must describe the exact single theorem/lemma in source; "
