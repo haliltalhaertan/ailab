@@ -9,6 +9,14 @@ class StructuredOutputError(ValueError):
     """Raised when an LLM response cannot be converted to the required JSON object."""
 
 
+class IncompleteJSONObject(dict[str, Any]):
+    """A parseable prefix from a provider-truncated structured response.
+
+    The mapping preserves the fields that were completely observed, while
+    downstream evidence gates can distinguish it from a complete JSON object.
+    """
+
+
 def strip_code_fence(text: str) -> str:
     raw = str(text or "").strip().lstrip("\ufeff")
     if raw.startswith("```"):
@@ -107,11 +115,13 @@ def parse_json_object(text: str) -> dict[str, Any]:
     raise StructuredOutputError(f"Could not parse required JSON object.{detail}")
 
 
-def parse_truncated_object_prefix(text: str) -> dict[str, Any]:
+def parse_truncated_object_prefix(text: str) -> IncompleteJSONObject:
     """Recover only complete top-level fields already present in a cut-off object.
 
     The function closes the object immediately before an already-observed
-    top-level comma. It never synthesizes a missing key, value or verdict.
+    top-level comma. It never synthesizes a missing key, value or verdict. The
+    result has a distinct type so evidence gates cannot mistake a parseable
+    prefix for a complete structured decision.
     """
 
     raw = strip_code_fence(text)
@@ -151,7 +161,7 @@ def parse_truncated_object_prefix(text: str) -> dict[str, Any]:
         except json.JSONDecodeError:
             continue
         if isinstance(value, dict) and value:
-            return value
+            return IncompleteJSONObject(value)
     raise StructuredOutputError("No complete top-level JSON fields could be recovered from truncated output.")
 
 
