@@ -133,6 +133,23 @@ def test_catalog_network_failure_uses_stale_disk_then_unavailable(tmp_path: Path
     assert source == "unavailable"
 
 
+def test_catalog_disk_write_failure_is_fail_open(tmp_path: Path, monkeypatch):
+    clear_catalog_memory_cache()
+    monkeypatch.setattr(
+        "lab.openrouter_catalog._write_disk_cache",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("read-only cache")),
+    )
+
+    models, source = cached_openrouter_models(
+        cache_path=tmp_path / "catalog.json",
+        fetcher=lambda **kwargs: [_model()],
+        now=1000,
+    )
+
+    assert source == "network"
+    assert models[0].id == "test/model"
+
+
 def test_catalog_cache_is_atomic_json_and_lookup_is_exact(tmp_path: Path):
     clear_catalog_memory_cache()
     path = tmp_path / "catalog.json"
