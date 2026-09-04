@@ -38,6 +38,13 @@ class ToolRegistry:
             except json.JSONDecodeError:
                 parsed = None
             if isinstance(parsed, dict):
+                # Manager/verifier helpers may construct a prompt-only registry
+                # rather than the live theorem registry. Preserve the worker's
+                # measured code-experiment capability in that view, while its
+                # context-only handler still refuses execution outside the real
+                # theorem-run dispatch path.
+                if "code_experiment" in parsed:
+                    self._handlers.setdefault("code_experiment", self._context_only_code_experiment)
                 self.set_effective_availability(parsed)
 
     def register(self, name: str, handler: ToolHandler) -> None:
@@ -49,6 +56,15 @@ class ToolRegistry:
     @staticmethod
     def _row(available: bool, reason: str) -> dict[str, Any]:
         return {"available": bool(available), "reason": str(reason)}
+
+    @staticmethod
+    def _context_only_code_experiment(_request: dict[str, Any]) -> ToolResult:
+        return ToolResult(
+            False,
+            "code_experiment",
+            error="code_experiment execution requires the live theorem-run context",
+            metadata={"tool_unavailable": True, "availability_reason": "theorem-run context required"},
+        )
 
     @staticmethod
     def _z3_importable() -> bool:
