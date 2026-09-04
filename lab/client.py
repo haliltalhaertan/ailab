@@ -179,13 +179,6 @@ def _requested_max_tokens(
     return requested, source
 
 
-def _supported_parameter(model: OpenRouterModel | None, name: str) -> bool:
-    if model is None:
-        return False
-    wanted = name.casefold()
-    return any(str(value).casefold() == wanted for value in model.supported_parameters)
-
-
 def _resolve_reasoning_effort(
     requested: str | None,
     model: OpenRouterModel | None,
@@ -197,24 +190,21 @@ def _resolve_reasoning_effort(
         return None, "catalog_unknown"
 
     supported = tuple(str(value).casefold() for value in model.reasoning_supported_efforts)
-    if supported:
-        if requested in supported:
-            return requested, "exact"
-        requested_rank = _EFFORT_ORDER.get(requested)
-        if requested_rank is None:
-            return None, "unsupported"
-        lower = [
-            value
-            for value in supported
-            if value in _EFFORT_ORDER and _EFFORT_ORDER[value] < requested_rank
-        ]
-        if not lower:
-            return None, "unsupported_no_lower"
-        return max(lower, key=lambda value: _EFFORT_ORDER[value]), "lower_supported"
-
-    if _supported_parameter(model, "reasoning_effort"):
-        return requested, "parameter_support_no_effort_list"
-    return None, "catalog_unknown"
+    if not supported:
+        return None, "catalog_unknown"
+    if requested in supported:
+        return requested, "exact"
+    requested_rank = _EFFORT_ORDER.get(requested)
+    if requested_rank is None:
+        return None, "unsupported"
+    lower = [
+        value
+        for value in supported
+        if value in _EFFORT_ORDER and _EFFORT_ORDER[value] < requested_rank
+    ]
+    if not lower:
+        return None, "unsupported_no_lower"
+    return max(lower, key=lambda value: _EFFORT_ORDER[value]), "lower_supported"
 
 
 def _reasoning_request(
