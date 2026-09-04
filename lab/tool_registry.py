@@ -65,7 +65,8 @@ class ToolRegistry:
                 available = importlib.util.find_spec("z3") is not None
                 rows[name] = self._row(available, "z3-solver kullanılabilir" if available else "z3-solver kurulu değil")
             elif name == "script":
-                roots = tuple(getattr(self.toolbox.scripts, "trusted_roots", ()))
+                scripts = getattr(self.toolbox, "scripts", None)
+                roots = tuple(getattr(scripts, "trusted_roots", ())) if scripts is not None else ()
                 available = any(root.is_dir() for root in roots)
                 rows[name] = self._row(available, "trusted script root mevcut" if available else "trusted script root bulunamadı")
             elif name == "tropical_grid":
