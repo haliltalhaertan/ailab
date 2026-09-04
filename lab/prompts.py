@@ -23,7 +23,21 @@ def tool_environment_block(registry: ToolRegistry | None) -> str:
     for name in sorted(availability):
         raw = availability[name]
         label = "AÇIK" if raw.get("available") else "KAPALI"
-        rows.append(f"- {name}: {label} — {raw.get('reason', '')}")
+        reason = str(raw.get("reason") or "")
+        if name == "script" and raw.get("available"):
+            scripts = getattr(registry.toolbox, "scripts", None)
+            available_scripts = (
+                scripts.available_scripts()
+                if scripts is not None and hasattr(scripts, "available_scripts")
+                else ()
+            )
+            listed = ", ".join(available_scripts) if available_scripts else "(yok)"
+            reason += f"; checked-in .py dosyaları: {listed}."
+            if registry.is_available("code_experiment"):
+                reason += " Kendi yazdığın/yeni kod için `script` değil `code_experiment` kullan."
+            else:
+                reason += " `script` yeni source kabul etmez; yalnız listedeki checked-in dosyaları çalıştırır."
+        rows.append(f"- {name}: {label} — {reason}")
     lean_open = bool((availability.get("lean_draft") or {}).get("available"))
     if lean_open:
         lean_rule = (
