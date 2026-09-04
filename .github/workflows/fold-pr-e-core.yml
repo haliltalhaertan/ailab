@@ -64,14 +64,12 @@ jobs:
                       start = offsets[node.lineno - 1]
                       end = offsets[node.end_lineno]
                       spans.append((start, end, replacements[node.name]))
-              if set(name for name in replacements) != {
+              present = {
                   node.name for node in cls.body
                   if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in replacements
-              }:
-                  missing = set(replacements) - {
-                      node.name for node in cls.body
-                      if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                  }
+              }
+              if set(replacements) != present:
+                  missing = set(replacements) - present
                   raise RuntimeError(f'missing methods in {class_name}: {sorted(missing)}')
               for start, end, replacement in sorted(spans, reverse=True):
                   source = source[:start] + replacement.rstrip('\n') + '\n' + source[end:]
@@ -94,12 +92,10 @@ jobs:
               '_cached_meta',
               '_retry_event_payload',
           ]
-          helper_nodes = []
-          for name in helper_names:
-              helper_nodes.append(next(
-                  node for node in recovery_tree.body
-                  if isinstance(node, ast.FunctionDef) and node.name == name
-              ))
+          helper_nodes = [
+              next(node for node in recovery_tree.body if isinstance(node, ast.FunctionDef) and node.name == name)
+              for name in helper_names
+          ]
           helper_block = '\n\n'.join(
               [node_text(recovery, retry_assign)] + [node_text(recovery, node) for node in helper_nodes]
           )
@@ -184,7 +180,16 @@ jobs:
           if leftovers:
               raise RuntimeError(f'shim references remain: {leftovers}')
 
-          # Core identity and label checks before the full suite.
+          # Syntax-level validation before dependency installation.
+          ast.parse(engine_path.read_text(encoding='utf-8'))
+          ast.parse(trace_path.read_text(encoding='utf-8'))
+          PY
+      - name: Install
+        run: python -m pip install -e '.[dev]'
+      - name: Core identity smoke
+        shell: bash
+        run: |
+          python - <<'PY'
           import lab
           from lab.theorem_engine import TheoremResearchLab as EngineLab
           from lab.trace import Trace as CoreTrace
@@ -194,8 +199,6 @@ jobs:
               'Tur 2 · Theorist · öneri (kesilme sonrası tekrar)'
           )
           PY
-      - name: Install
-        run: python -m pip install -e '.[dev]'
       - name: Focused recovery tests
         run: python -m pytest tests/test_completion_recovery.py tests/test_budget_telemetry.py tests/test_ui_live_cards.py -q -p no:cacheprovider
       - name: Full offline suite
