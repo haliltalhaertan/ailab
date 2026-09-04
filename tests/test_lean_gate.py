@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import subprocess
 
+from lab.evidence import evidence_from_tool_result
 from lab.integrity import content_fingerprint
 from lab.status_guard import choose_status
 from lab.tools import LeanTool, ToolResult
@@ -83,6 +84,14 @@ def _formal_result(claim_hash: str) -> ToolResult:
     )
 
 
+def _bound_formal_evidence(result: ToolResult, claim_hash: str, revision: int = 1):
+    return evidence_from_tool_result(
+        result,
+        claim_hash=claim_hash,
+        revision=revision,
+    )
+
+
 def test_claim_hash_mismatch_cannot_be_proven():
     expected = content_fingerprint("claim:v1", "the actual claim")
     result = _formal_result(content_fingerprint("claim:v1", "a different claim"))
@@ -94,21 +103,49 @@ def test_claim_hash_mismatch_cannot_be_proven():
         expected_item_id="C-test",
         expected_iteration=1,
         expected_claim_hash=expected,
+        expected_revision=1,
+        evidence=_bound_formal_evidence(result, expected, 1),
     )
     assert decision.granted == "OPEN"
     assert decision.metadata["claim_hash_matches"] is False
 
 
-def test_matching_claim_hash_with_pass_and_keep_is_proven():
+def test_unbound_evidence_is_not_bound_by_guard():
     expected = content_fingerprint("claim:v1", "the actual claim")
+    result = _formal_result(expected)
+    unbound = evidence_from_tool_result(result)
+
     decision = choose_status(
         "PROVEN",
-        tool_result=_formal_result(expected),
+        tool_result=result,
         verifier={"verdict": "PASS"},
         critic={"verdict": "KEEP"},
         expected_item_id="C-test",
         expected_iteration=1,
         expected_claim_hash=expected,
+        expected_revision=1,
+        evidence=unbound,
+    )
+
+    assert decision.granted == "OPEN"
+    assert decision.metadata["evidence_kind"] == "INCONCLUSIVE"
+    assert decision.metadata["actual_evidence_revision"] is None
+
+
+def test_matching_claim_hash_revision_with_pass_and_keep_is_proven():
+    expected = content_fingerprint("claim:v1", "the actual claim")
+    result = _formal_result(expected)
+    decision = choose_status(
+        "PROVEN",
+        tool_result=result,
+        verifier={"verdict": "PASS"},
+        critic={"verdict": "KEEP"},
+        expected_item_id="C-test",
+        expected_iteration=1,
+        expected_claim_hash=expected,
+        expected_revision=1,
+        evidence=_bound_formal_evidence(result, expected, 1),
     )
     assert decision.granted == "PROVEN"
     assert decision.metadata["claim_hash_matches"] is True
+    assert decision.metadata["actual_evidence_revision"] == 1
