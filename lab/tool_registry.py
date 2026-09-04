@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import shutil
 from typing import Any, Callable
@@ -10,6 +11,7 @@ from lab.tools import ResearchToolbox, ToolResult
 
 ToolHandler = Callable[[dict[str, Any]], ToolResult | None]
 ToolAvailability = dict[str, dict[str, Any]]
+EFFECTIVE_AVAILABILITY_ENV = "AILAB_EFFECTIVE_TOOL_AVAILABILITY"
 
 
 class ToolRegistry:
@@ -29,6 +31,14 @@ class ToolRegistry:
         self.toolbox = toolbox or ResearchToolbox()
         self._handlers: dict[str, ToolHandler] = {name: self._builtin for name in self.BUILTIN_NAMES}
         self._effective_availability: ToolAvailability | None = None
+        raw = str(os.environ.get(EFFECTIVE_AVAILABILITY_ENV) or "").strip()
+        if raw:
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, dict):
+                self.set_effective_availability(parsed)
 
     def register(self, name: str, handler: ToolHandler) -> None:
         key = str(name).strip().lower()
