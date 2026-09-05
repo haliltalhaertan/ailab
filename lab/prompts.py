@@ -61,6 +61,9 @@ def proposal_schema(registry: ToolRegistry | None = None) -> dict[str, Any]:
         "target_id": "",
         "strategy": "...",
         "evidence_needed": ["..."],
+        "definitions": {
+            "symbol": "def symbol(...):\n    ...",
+        },
         "tool_request": {
             "tool": registry.schema_string(available_only=True),
             "name": "",
@@ -112,6 +115,12 @@ def proposal_prompt(
         "Numerical trajectories, exhaustive searches, long arithmetic, stopping-time calculations, enumeration, or repetitive symbolic computation "
         "must not be performed manually in reasoning. Specify the computation and delegate it to script/code_experiment or another available deterministic tool. "
     )
+    definitions_rule = (
+        "Every nontrivial or overloaded symbol used by the candidate or code experiment MUST appear in top-level `definitions` as short, pure, executable Python. "
+        "The mapping key is the exact symbol name and its value must bind that exact Python name. "
+        "CodeExperimentAgent will use the generated definitions.py verbatim and must not reinterpret or redefine these symbols. "
+        "When tool_request.source is present, write source that uses these definitions rather than duplicating their semantics. "
+    )
     return (
         f"PROBLEM (frozen):\n{problem}\n\n"
         f"LITERATURE SCREEN:\n{literature}\n\n"
@@ -122,6 +131,7 @@ def proposal_prompt(
         f"{contract_rule}"
         "A REFUTATION_CANDIDATE is still active: when relevant, prioritize checking its claimed counterexample with a deterministic tool instead of treating it as settled. "
         f"{computation_rule}"
+        f"{definitions_rule}"
         "Separate proved facts from assumptions. If computation/formal checking is useful, request ONE tool from the available tool schema only. "
         "Do not describe your own candidate as verified/proven before deterministic evidence exists; call it an aday/candidate. "
         "For lean_draft, theorem_name and theorem_type are mandatory and must describe the exact single theorem/lemma in source; "
@@ -149,6 +159,9 @@ def verifier_prompt(
         "FAIL = deterministic counterexample/refutation establishes that the candidate claim is false; "
         "INCONCLUSIVE = tool unavailable, timeout, syntax/format error, infrastructure failure, or evidence insufficient. "
         "A tool failure is NEVER by itself a mathematical FAIL. "
+        "For code_experiment, `tool_result.output` is the canonical raw stdout evidence. "
+        "`tool_result.metadata.agent_summary` is an LLM-written convenience summary and is NOT evidence; judge the raw stdout, script hashes, and any parsed AILAB_* trailer instead. "
+        "If the summary conflicts with stdout, trust stdout and report the mismatch. "
         "A tropical_grid GRID_PASS establishes only finite-grid functional equality on the tested nonnegative weights; it does NOT establish formal monomial-level provenance polynomial equality. "
         "If a formal tool result is present, verify that theorem_type is a faithful formalization of the candidate claim; a compiled unrelated tautology is not evidence for this claim. "
         "A previously completed claim-bound formal result may remain valid when current Lean execution is unavailable; judge the supplied evidence itself. "
@@ -190,6 +203,7 @@ def manager_prompt(
     contract_block: str = "",
     registry: ToolRegistry | None = None,
     candidate_incomplete: bool = False,
+    repeat_warning: str = "",
 ) -> str:
     registry = registry or ToolRegistry()
     tools = tool_environment_block(registry)
@@ -208,12 +222,17 @@ def manager_prompt(
         if candidate_incomplete
         else ""
     )
+    repetition_rule = (
+        "REPETITION BRAKE: " + repeat_warning.strip() + "\n"
+        if repeat_warning.strip()
+        else ""
+    )
     return (
         f"Frozen problem:\n{problem}\n\nCandidate {item_id}: {claim}\n\n"
         f"Tool:\n{json.dumps(tool_result, ensure_ascii=False, indent=2)}\n"
         f"Verifier:\n{json.dumps(verification, ensure_ascii=False, indent=2)}\n"
         f"Critic:\n{json.dumps(critique, ensure_ascii=False, indent=2)}\n"
-        f"{contract_block}\n\n{tools}\n{lean_manager}\n{incomplete_rule}\n"
+        f"{contract_block}\n\n{tools}\n{lean_manager}\n{incomplete_rule}\n{repetition_rule}"
         "Choose research direction. Status and target transitions are REQUESTS only; code-side evidence guards may downgrade or reject them. "
         "An LLM-written counterexample is only a REFUTATION_CANDIDATE until a deterministic tool verifies it; make deterministic verification the next task rather than treating the claim as dead. "
         "Do not claim PROVEN unless a successful same-item bound formal checker result is explicitly present. "
