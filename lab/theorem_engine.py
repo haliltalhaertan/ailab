@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -16,6 +17,7 @@ from lab.code_experiment import (
     GuardedExperimentWorkspace,
     WorkspaceActionResult,
     infrastructure_failure,
+    top_level_bound_names,
 )
 from lab.code_experiment_settings import load_code_experiment_settings, load_code_experiment_settings_from_dict
 from lab.evidence import evidence_from_tool_result, validate_evidence_binding
@@ -775,7 +777,12 @@ class TheoremResearchLab:
                 )
                 self._cache_delete(cache_key)
             else:
-                hash_field = {"run_python": "script_sha256", "read_file": "sha256"}.get(action_name)
+                hash_field = {
+                        "run_python": "script_sha256",
+                        "read_file": "sha256",
+                        "write_file": "sha256",
+                        "patch_file": "sha256",
+                    }.get(action_name)
                 if hash_field is not None:
                     relative_path = str(action.get("path") or "")
                     expected_sha = str(metadata.get(hash_field) or "")
@@ -813,11 +820,159 @@ class TheoremResearchLab:
         )
         return result
 
+    @staticmethod
+    def _task_jaccard(left: str, right: str) -> float:
+        left_tokens = set(re.findall(r"\w+", str(left or "").casefold()))
+        right_tokens = set(re.findall(r"\w+", str(right or "").casefold()))
+        if not left_tokens or not right_tokens:
+            return 0.0
+        return len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
+
+    def _repeated_next_task_warning(
+        self,
+        *,
+        current_item_id: str,
+        current_task: str,
+        target_id: str | None,
+    ) -> str:
+        previous_items = [
+            item
+            for item in self.state.list_items(kind="conjecture")
+            if item.id != current_item_id and item.status != "DROPPED"
+        ]
+        if not previous_items:
+            return ""
+        previous = previous_items[-1]
+        metadata = dict(previous.metadata or {})
+        if str(metadata.get("manager_decision") or "").upper() != "REVISE":
+            return ""
+        previous_target = str(metadata.get("target_id") or "").strip()
+        if target_id and previous_target and previous_target != target_id:
+            return ""
+        input_task = str(metadata.get("input_next_task") or "").strip()
+        manager_task = str(metadata.get("manager_next_task") or "").strip()
+        if not input_task or not manager_task:
+            return ""
+        first_similarity = self._task_jaccard(input_task, manager_task)
+        second_similarity = self._task_jaccard(manager_task, current_task)
+        similarity = min(first_similarity, second_similarity)
+        if similarity < 0.80:
+            return ""
+        warning = "bu görev iki turdur tekrarlıyor; ya farklı bir aday iste ya da DROPPED öner"
+        self.trace.log(
+            "repeated_next_task",
+            item_id=current_item_id,
+            previous_item_id=previous.id,
+            target_id=target_id,
+            similarity=similarity,
+            previous_input_task=input_task,
+            previous_next_task=manager_task,
+            current_task=current_task,
+        )
+        return warning
+
+    def _bind_code_definitions(
+        self,
+        *,
+        proposal: dict[str, Any],
+        item_id: str,
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        if str(request.get("tool") or "").strip().lower() != "code_experiment":
+            return request
+        raw_definitions = proposal.get("definitions")
+        definitions = raw_definitions if isinstance(raw_definitions, dict) else {}
+        if not definitions:
+            return request
+        symbols: list[str] = []
+        snippets: list[str] = []
+        for raw_symbol, raw_source in definitions.items():
+            symbol = str(raw_symbol or "").strip()
+            source = str(raw_source or "").strip()
+            if not symbol or not symbol.isidentifier() or symbol.startswith("__"):
+                return {
+                    **request,
+                    "_definitions_error": f"Geçersiz definitions sembol adı: {symbol!r}",
+                }
+            if not source:
+                return {
+                    **request,
+                    "_definitions_error": f"definitions[{symbol!r}] boş olamaz.",
+                }
+            symbols.append(symbol)
+            snippets.append(source)
+        bundle = "\n\n".join(snippets).strip() + "\n"
+        try:
+            bound_names = top_level_bound_names(bundle)
+        except SyntaxError as exc:
+            return {**request, "_definitions_error": f"definitions Python syntax error: {exc}"}
+        missing = [symbol for symbol in symbols if symbol not in bound_names]
+        if missing:
+            return {
+                **request,
+                "_definitions_error": "definitions anahtarı kendi Python adını bağlamıyor: " + ", ".join(missing),
+            }
+        written = self.code_workspace.write_file("definitions.py", bundle)
+        if not written.ok:
+            self.trace.log(
+                "definitions_rejected",
+                item_id=item_id,
+                error=written.error,
+                symbols=symbols,
+            )
+            return {**request, "_definitions_error": str(written.error or "definitions policy rejected")}
+        metadata = dict(written.metadata or {})
+        definitions_sha256 = str(metadata.get("sha256") or "")
+        self.state.update_item(
+            item_id,
+            metadata={
+                "definitions_file": "definitions.py",
+                "definitions_sha256": definitions_sha256,
+                "definition_symbols": symbols,
+            },
+        )
+        self.trace.log(
+            "definitions_written",
+            item_id=item_id,
+            file="definitions.py",
+            definitions_sha256=definitions_sha256,
+            symbols=symbols,
+        )
+        return {
+            **request,
+            "_definitions_file": "definitions.py",
+            "_definitions_sha256": definitions_sha256,
+            "_definition_symbols": symbols,
+        }
+
     def _run_code_experiment(self, request: dict[str, Any], step_key: str) -> ToolResult:
         if self.code_agent is None:
             return ToolResult(False, "code_experiment", error="CodeExperimentAgent yapılandırılmamış.", metadata={"evidence_level": "COMPUTATION_ONLY"})
+        definitions_error = str(request.get("_definitions_error") or "").strip()
+        if definitions_error:
+            return ToolResult(
+                False,
+                "code_experiment",
+                error="definitions.py reddedildi: " + definitions_error,
+                metadata={
+                    "status": "DEFINITIONS_INVALID",
+                    "evidence_level": "COMPUTATION_ONLY",
+                    "definitions_error": definitions_error,
+                },
+            )
         task = str(request.get("task") or request.get("goal") or "").strip() or "Aday iddiayı küçük deterministic deneylerle sınamaya çalış."
-        return self.code_runner.run(agent=self.code_agent, task=task, step_key=step_key, call_agent=self._call, execute_cached=self._cached_workspace_action)
+        symbols_raw = request.get("_definition_symbols")
+        symbols = [str(value) for value in symbols_raw] if isinstance(symbols_raw, list) else []
+        return self.code_runner.run(
+            agent=self.code_agent,
+            task=task,
+            step_key=step_key,
+            call_agent=self._call,
+            execute_cached=self._cached_workspace_action,
+            source=str(request.get("source") or ""),
+            definitions_file=str(request.get("_definitions_file") or ""),
+            definition_symbols=symbols,
+        )
 
     def _cached_formal_result(self, raw: dict[str, Any]) -> ToolResult:
         result = ToolResult(
@@ -950,7 +1105,21 @@ class TheoremResearchLab:
                     str(raw.get("error") or ""),
                     dict(raw.get("metadata") or {}),
                 )
-                if infrastructure_failure(cached_result):
+                stdout_sha = str((cached_result.metadata or {}).get("stdout_sha256") or "")
+                stdout_hash_mismatch = bool(
+                    cached_result.tool == "code_experiment"
+                    and cached_result.ok
+                    and stdout_sha
+                    and hashlib.sha256(cached_result.output.encode("utf-8")).hexdigest() != stdout_sha
+                )
+                if stdout_hash_mismatch:
+                    self.trace.log(
+                        "code_experiment_stdout_cache_invalidated",
+                        step_key=step_key,
+                        expected_stdout_sha256=stdout_sha,
+                    )
+                    self._cache_delete(step_key)
+                elif infrastructure_failure(cached_result):
                     self.trace.log(
                         "legacy_infrastructure_cache_invalidated",
                         step_key=step_key,
@@ -1531,6 +1700,12 @@ class TheoremResearchLab:
 
             request = proposal.get("tool_request")
             tool_request = request if isinstance(request, dict) and not proposal_incomplete else None
+            if tool_request is not None:
+                tool_request = self._bind_code_definitions(
+                    proposal=proposal,
+                    item_id=item.id,
+                    request=dict(tool_request),
+                )
             tool_result = None if proposal_incomplete else self._tool(tool_request, f"iter:{iteration}:tool")
             bound_evidence = None
             if tool_result is not None:
@@ -1573,6 +1748,11 @@ class TheoremResearchLab:
                 critic_prompt(problem, item.id, claim, proposal, tool_result.as_dict() if tool_result else None, verification, ledger_context),
                 f"iter:{iteration}:critic",
             )
+            repeat_warning = self._repeated_next_task_warning(
+                current_item_id=item.id,
+                current_task=frozen_next_task,
+                target_id=target_id,
+            )
             manager_decision = self._call_json(
                 manager,
                 manager_prompt(
@@ -1585,6 +1765,7 @@ class TheoremResearchLab:
                     contract_block=contract.prompt_block() if contract is not None else "",
                     registry=self.registry,
                     candidate_incomplete=proposal_incomplete,
+                    repeat_warning=repeat_warning,
                 ),
                 f"iter:{iteration}:manager",
             )
@@ -1724,6 +1905,14 @@ class TheoremResearchLab:
             old_status = item.status
             self.trace.log("state_change", action="status", item_id=item.id, kind="conjecture", old_status=old_status, new_status=status, decision=decision, reason=str(manager_decision.get("reason") or ""))
             next_task = str(manager_decision.get("next_task") or frozen_next_task)
+            self.state.update_item(
+                item.id,
+                metadata={
+                    "input_next_task": frozen_next_task,
+                    "manager_decision": decision,
+                    "manager_next_task": next_task,
+                },
+            )
             outcomes.append(IterationOutcome(item.id, decision, status, next_task))
             self.trace.log("iteration_end", iteration=iteration, item_id=item.id, decision=decision, status=status, next_task=next_task)
             self._set_runtime(completed_iterations=iteration, current_iteration=iteration, current_step="iteration_complete", next_task=next_task, status="RUNNING")

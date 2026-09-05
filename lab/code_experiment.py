@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import os
 import re
@@ -21,6 +22,8 @@ from lab.trace import Trace
 
 
 ALLOWED_SUFFIXES = {".py", ".txt", ".md", ".json", ".csv"}
+LOCAL_SAFE_IMPORT_ROOTS = {"definitions"}
+
 SAFE_IMPORT_ROOTS = {
     "array",
     "bisect",
@@ -273,7 +276,7 @@ class GuardedExperimentWorkspace:
             tree = ast.parse(code)
         except SyntaxError as exc:
             raise UnsafeExperimentCode(f"Python syntax error: {exc}") from exc
-        allowed_imports = SAFE_IMPORT_ROOTS | self.extra_imports
+        allowed_imports = SAFE_IMPORT_ROOTS | LOCAL_SAFE_IMPORT_ROOTS | self.extra_imports
         for node in ast.walk(tree):
             if isinstance(node, (ast.Import, ast.ImportFrom)):
                 names = [a.name for a in node.names] if isinstance(node, ast.Import) else [node.module or ""]
@@ -281,6 +284,10 @@ class GuardedExperimentWorkspace:
                     root = name.split(".", 1)[0]
                     if root not in allowed_imports:
                         raise UnsafeExperimentCode(f"İzin verilmeyen import: {root}")
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and str(node.name).startswith("__"):
+                raise UnsafeExperimentCode("Dunder tanım adları kapalıdır.")
+            if isinstance(node, ast.arg) and str(node.arg).startswith("__"):
+                raise UnsafeExperimentCode("Dunder parametre adları kapalıdır.")
             if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in BLOCKED_NAMES:
                 raise UnsafeExperimentCode(f"İzin verilmeyen isim erişimi: {node.id}")
             if isinstance(node, ast.Name) and str(node.id).startswith("__"):
@@ -300,6 +307,15 @@ class GuardedExperimentWorkspace:
                         raise UnsafeExperimentCode(f"İzin verilmeyen operator helper çağrısı: {func.attr}")
                 elif isinstance(func, ast.Name) and func.id in BLOCKED_OPERATOR_CALLS:
                     raise UnsafeExperimentCode(f"İzin verilmeyen operator helper çağrısı: {func.id}")
+
+    def read_evidence_text(self, relative: str, *, expected_sha256: str = "") -> tuple[str, str]:
+        target = self._resolve(relative, must_exist=True)
+        actual_sha256 = sha256_file(target)
+        if expected_sha256 and actual_sha256 != expected_sha256:
+            raise ValueError(
+                f"Evidence SHA-256 mismatch for {relative}: expected={expected_sha256}, actual={actual_sha256}"
+            )
+        return target.read_text(encoding="utf-8", errors="replace"), actual_sha256
 
     def write_file(self, path: str, content: str) -> WorkspaceActionResult:
         try:
@@ -453,6 +469,14 @@ class GuardedExperimentWorkspace:
                 self.container_image,
                 "python",
                 "-I",
+                "-c",
+                (
+                    "import runpy,sys; "
+                    "p=sys.argv[1]; "
+                    "sys.argv=[p,*sys.argv[2:]]; "
+                    "sys.path.insert(0, \"/workspace\"); "
+                    "runpy.run_path(p, run_name=\"__main__\")"
+                ),
                 f"/workspace/{rel_script}",
                 *clean_args,
             ]
@@ -615,7 +639,9 @@ class GuardedExperimentWorkspace:
 
 CODE_EXPERIMENT_SYSTEM_PROMPT = """Sen CodeExperimentAgent'sın.
 Sen uygulayıcısın. Theorist'in belirttiği hesabı/deneyi kodla; matematiksel analiz, ispat denemesi veya yeni teori geliştirme yapma.
-Reasoning'i kısa tut. İlk eylemin deney scriptini write_file ile yazmak olsun; sonra çalıştır, sonucu gözle ve gerekirse küçük düzeltme yap.
+Reasoning'i kısa tut. Runner Theorist kaynağını exp_001.py olarak önceden yazdıysa onu write_file ile ASLA baştan yazma; önce çalıştır, gerekirse yalnız küçük patch_file düzeltmesi yap.
+Runner kaynak vermediyse İlk eylemin deney scriptini write_file ile yazmak olsun.
+definitions.py varsa oradaki sembol tanımlarını import et ve AYNEN kullan; bu sembolleri yeniden tanımlama veya başka yaygın matematik anlamlarına çekme.
 Görevin matematik/teorik CS araştırmasındaki aday iddiaları hesaplamalı deneylerle sınamak.
 Dosya işlemleri proje workspace'iyle sınırlıdır. Python yalnız no-network disposable container içinde çalışır.
 Host shell, host filesystem ve API anahtarları erişilebilir değildir.
@@ -644,9 +670,44 @@ Her tur SADECE tek JSON object döndür:
 }
 
 Önce küçük, deterministik ve denetlenebilir script yaz. Her tur geçmiş aksiyon/sonuç özetini kullan; aynı hatayı körlemesine tekrarlama.
+Theorist'in istediği kontroller başarıyla koştuysa HEMEN finish üret; kendiliğinden yeni deney, yeni tarama veya ek script başlatma. Ek deney yalnız Theorist görevi açıkça istiyorsa yapılır.
 finish ancak en az bir gerçek run_python başarıyla bittikten ve en son run_python denemesi başarılı olduktan sonra kabul edilir.
 Finite computation ispat değildir.
 """
+
+
+def top_level_bound_names(source: str) -> set[str]:
+    tree = ast.parse(str(source or ""))
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(str(node.name))
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    names.add(str(target.id))
+    return names
+
+
+def parse_ailab_trailer(stdout: str) -> dict[str, Any]:
+    trailer: dict[str, Any] = {}
+    for line in str(stdout or "").splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("AILAB_"):
+            continue
+        key, sep, raw_value = stripped.partition("=")
+        if not sep:
+            key, sep, raw_value = stripped.partition(":")
+        if not sep:
+            continue
+        raw_value = raw_value.strip()
+        try:
+            value: Any = json.loads(raw_value)
+        except json.JSONDecodeError:
+            value = raw_value
+        trailer[key] = value
+    return trailer
 
 
 class CodeExperimentRunner:
@@ -679,6 +740,9 @@ class CodeExperimentRunner:
         step_key: str,
         call_agent: Callable[[Agent, str, str], str],
         execute_cached: Callable[[str, dict[str, Any]], WorkspaceActionResult],
+        source: str = "",
+        definitions_file: str = "",
+        definition_symbols: list[str] | None = None,
     ) -> ToolResult:
         if not self.workspace.refresh_execution_availability():
             return ToolResult(
@@ -699,7 +763,70 @@ class CodeExperimentRunner:
         failed_runs: list[dict[str, Any]] = []
         last_run_ok: bool | None = None
         last_result: WorkspaceActionResult | None = None
+        last_successful_run: WorkspaceActionResult | None = None
         previous_failure: tuple[str, str] | None = None
+        protected_source = str(source or "").strip()
+        protected_path = "exp_001.py"
+        symbols = [str(value).strip() for value in (definition_symbols or []) if str(value).strip()]
+        patch_budget = max(1, int(len(protected_source) * 0.30)) if protected_source else 0
+        patch_used = 0
+        extra_write_streak = 0
+        extra_warning_emitted = False
+
+        if protected_source:
+            try:
+                source_bound = top_level_bound_names(protected_source)
+            except SyntaxError as exc:
+                return ToolResult(
+                    False,
+                    "code_experiment",
+                    error=f"Theorist source Python syntax error: {exc}",
+                    metadata={"status": "THEORIST_SOURCE_INVALID", "evidence_level": "COMPUTATION_ONLY"},
+                )
+            overlap = sorted(set(symbols) & source_bound)
+            if overlap:
+                return ToolResult(
+                    False,
+                    "code_experiment",
+                    error="Theorist source definitions.py sembollerini yeniden tanımlıyor: " + ", ".join(overlap),
+                    metadata={
+                        "status": "SOURCE_REDEFINES_DEFINITION",
+                        "evidence_level": "COMPUTATION_ONLY",
+                        "symbols": overlap,
+                    },
+                )
+            prepared_source = protected_source
+            if symbols and definitions_file:
+                prepared_source = f"from definitions import {', '.join(symbols)}\n\n" + prepared_source
+            initial_action = {"action": "write_file", "path": protected_path, "content": prepared_source}
+            initial_result = execute_cached(f"{step_key}:theorist_source", initial_action)
+            self.trace.log(
+                "theorist_source_written",
+                step_key=step_key,
+                path=protected_path,
+                ok=initial_result.ok,
+                definitions_file=definitions_file or None,
+                definition_symbols=symbols,
+                metadata=initial_result.metadata or {},
+                error=initial_result.error,
+            )
+            if not initial_result.ok:
+                return ToolResult(
+                    False,
+                    "code_experiment",
+                    error="Theorist source workspace'e yazılamadı: " + str(initial_result.error or ""),
+                    metadata={
+                        "status": "THEORIST_SOURCE_INVALID",
+                        "evidence_level": "COMPUTATION_ONLY",
+                    },
+                )
+            history.append({
+                "turn": 0,
+                "action": {"action": "write_file", "path": protected_path},
+                "result": initial_result.as_dict(),
+            })
+            observation = json.dumps(initial_result.as_dict(), ensure_ascii=False, indent=2)
+
         for turn in range(1, self.max_steps + 1):
             history_text = json.dumps(history[-6:], ensure_ascii=False, indent=2)
             prompt = (
@@ -708,6 +835,18 @@ class CodeExperimentRunner:
                 f"RECENT ACTION HISTORY:\n{history_text[-self.observation_limit:]}\n\n"
                 f"LATEST OBSERVATION:\n{observation[-self.observation_limit:]}\n\n"
                 f"Successful Python runs: {len(successful_runs)}; failed runs: {len(failed_runs)}.\n"
+                + (
+                    f"CANONICAL DEFINITIONS: `{definitions_file}`. Import and use exactly these symbols: {', '.join(symbols)}. "
+                    "Bu sembolleri yeniden tanımlama.\n"
+                    if definitions_file and symbols
+                    else ""
+                )
+                + (
+                    "THEORIST SOURCE: exp_001.py runner tarafından yazıldı. write_file ile ezme; önce run_python ile çalıştır, gerekirse yalnız küçük patch_file düzeltmesi yap.\n"
+                    if protected_source
+                    else ""
+                )
+                + "Theorist'in istediği kontroller başarılıysa hemen finish; açıkça istenmeyen yeni deney ekleme.\n"
                 "Choose exactly one next action. Return only the JSON action object."
             )
             plan_step = f"{step_key}:plan:{turn}"
@@ -770,6 +909,31 @@ class CodeExperimentRunner:
                     history.append({"turn": turn, "action": action, "result": {"ok": False, "error": reason}})
                     continue
                 summary = str(action.get("summary") or "Deney tamamlandı.")
+                if last_successful_run is None:
+                    return ToolResult(
+                        False,
+                        "code_experiment",
+                        error="Başarılı run kaydı kayboldu; ham stdout evidence üretilemedi.",
+                        metadata={"status": "STDOUT_EVIDENCE_ERROR", "evidence_level": "COMPUTATION_ONLY"},
+                    )
+                run_meta = dict(last_successful_run.metadata or {})
+                try:
+                    stdout_file = str(run_meta.get("stdout_file") or "")
+                    if stdout_file:
+                        stdout, actual_stdout_sha = self.workspace.read_evidence_text(
+                            stdout_file,
+                            expected_sha256=str(run_meta.get("stdout_sha256") or ""),
+                        )
+                    else:
+                        stdout = str(last_successful_run.output or "")
+                        actual_stdout_sha = hashlib.sha256(stdout.encode("utf-8")).hexdigest()
+                except Exception as exc:
+                    return ToolResult(
+                        False,
+                        "code_experiment",
+                        error="Ham stdout evidence okunamadı: " + str(exc),
+                        metadata={"status": "STDOUT_EVIDENCE_ERROR", "evidence_level": "COMPUTATION_ONLY"},
+                    )
                 files = self.workspace.list_files()
                 evidence = {
                     "successful_runs": successful_runs,
@@ -780,17 +944,56 @@ class CodeExperimentRunner:
                 payload = {
                     "status": "EXPERIMENT_COMPLETE",
                     "evidence_level": "COMPUTATION_ONLY",
-                    "summary": summary,
+                    "agent_summary": summary,
                     "turns": turn,
                     "workspace": str(self.workspace.root),
                     "files": json.loads(files.output) if files.ok else [],
                     "evidence": evidence,
-                    "warning": "Computational evidence is not a proof.",
+                    "stdout_file": str(run_meta.get("stdout_file") or ""),
+                    "stdout_sha256": actual_stdout_sha,
+                    "script_sha256": run_meta.get("script_sha256"),
+                    "structured_trailer": parse_ailab_trailer(stdout),
+                    "warning": "Computational evidence is not a proof. Agent summary is not evidence.",
                 }
                 self.trace.log("code_experiment_complete", step_key=step_key, **payload)
-                return ToolResult(True, "code_experiment", output=summary, metadata=payload)
+                return ToolResult(True, "code_experiment", output=stdout, metadata=payload)
 
-            last_result = execute_cached(f"{step_key}:action:{turn}", action)
+            action_path = str(action.get("path") or "").strip().replace("\\", "/")
+            action_rejected: WorkspaceActionResult | None = None
+            if protected_source and action_name == "write_file" and action_path == protected_path:
+                action_rejected = WorkspaceActionResult(
+                    False,
+                    "write_file",
+                    error="exp_001.py Theorist kaynağıdır; write_file ile ezilemez. Küçük düzeltme için patch_file kullan.",
+                    metadata={"protected_theorist_source": True},
+                )
+            elif protected_source and action_name == "patch_file" and action_path == protected_path:
+                patch_cost = max(len(str(action.get("old") or "")), len(str(action.get("new") or "")))
+                if patch_used + patch_cost > patch_budget:
+                    action_rejected = WorkspaceActionResult(
+                        False,
+                        "patch_file",
+                        error=(
+                            f"exp_001.py patch bütçesi aşıldı: used={patch_used}, requested={patch_cost}, "
+                            f"budget={patch_budget} (~%30 Theorist source)"
+                        ),
+                        metadata={
+                            "protected_theorist_source": True,
+                            "patch_budget": patch_budget,
+                            "patch_used": patch_used,
+                        },
+                    )
+                else:
+                    patch_used += patch_cost
+
+            is_new_write = False
+            if action_name == "write_file" and action_path:
+                try:
+                    is_new_write = not self.workspace._resolve(action_path).exists()
+                except ValueError:
+                    is_new_write = False
+
+            last_result = action_rejected or execute_cached(f"{step_key}:action:{turn}", action)
             result_payload = last_result.as_dict()
             self.trace.log("code_experiment_result", step_key=step_key, turn=turn, executed_action=action_name, result=result_payload)
             history.append({"turn": turn, "action": self._action_for_trace(action), "result": result_payload})
@@ -798,6 +1001,23 @@ class CodeExperimentRunner:
                 evidence_record = {"ok": bool(last_result.ok), **dict(last_result.metadata or {})}
                 last_run_ok = bool(last_result.ok)
                 (successful_runs if last_result.ok else failed_runs).append(evidence_record)
+                if last_result.ok:
+                    last_successful_run = last_result
+                    extra_write_streak = 0
+            elif last_run_ok is True and action_name == "write_file" and is_new_write:
+                extra_write_streak += 1
+                if extra_write_streak >= 2 and not extra_warning_emitted:
+                    extra_warning_emitted = True
+                    self.trace.log(
+                        "extra_experiment_after_success",
+                        step_key=step_key,
+                        turn=turn,
+                        path=action_path,
+                        successful_run_count=len(successful_runs),
+                        warning="Successful requested computation already exists; avoid unsolicited extra experiments.",
+                    )
+            else:
+                extra_write_streak = 0
             if infrastructure_failure(last_result):
                 error = str(last_result.error or self.workspace.availability_reason or "container infrastructure unavailable")
                 self.trace.log(
@@ -849,11 +1069,49 @@ class CodeExperimentRunner:
             previous_failure = current_failure
             observation = json.dumps(result_payload, ensure_ascii=False, indent=2)
 
+        if last_successful_run is not None:
+            run_meta = dict(last_successful_run.metadata or {})
+            try:
+                stdout_file = str(run_meta.get("stdout_file") or "")
+                if stdout_file:
+                    stdout, actual_stdout_sha = self.workspace.read_evidence_text(
+                        stdout_file,
+                        expected_sha256=str(run_meta.get("stdout_sha256") or ""),
+                    )
+                else:
+                    stdout = str(last_successful_run.output or "")
+                    actual_stdout_sha = hashlib.sha256(stdout.encode("utf-8")).hexdigest()
+            except Exception as exc:
+                return ToolResult(
+                    False,
+                    "code_experiment",
+                    error="Adım limitinde ham stdout evidence okunamadı: " + str(exc),
+                    metadata={"status": "STDOUT_EVIDENCE_ERROR", "evidence_level": "COMPUTATION_ONLY"},
+                )
+            return ToolResult(
+                True,
+                "code_experiment",
+                output=stdout,
+                error="",
+                metadata={
+                    "status": "STEP_LIMIT_WITH_OUTPUT",
+                    "evidence_level": "COMPUTATION_ONLY",
+                    "workspace": str(self.workspace.root),
+                    "successful_run_count": len(successful_runs),
+                    "failed_run_count": len(failed_runs),
+                    "stdout_file": str(run_meta.get("stdout_file") or ""),
+                    "stdout_sha256": actual_stdout_sha,
+                    "script_sha256": run_meta.get("script_sha256"),
+                    "structured_trailer": parse_ailab_trailer(stdout),
+                    "agent_summary": "",
+                    "warning": "Step limit reached without finish; raw stdout remains computational evidence.",
+                },
+            )
         return ToolResult(
             False,
             "code_experiment",
             output=(last_result.output if last_result else ""),
-            error=f"CodeExperimentAgent {self.max_steps} action limitine ulaştı; geçerli finish üretmedi.",
+            error=f"CodeExperimentAgent {self.max_steps} action limitine ulaştı; geçerli finish ve başarılı stdout üretmedi.",
             metadata={
                 "status": "STEP_LIMIT",
                 "evidence_level": "COMPUTATION_ONLY",
