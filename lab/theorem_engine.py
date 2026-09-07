@@ -372,7 +372,18 @@ class TheoremResearchLab:
                     buffers["dirty_chars"] = int(buffers.get("dirty_chars", 0) or 0) + 1
             if channel in {"reasoning", "content", "reasoning_details"}:
                 self._persist_partial(agent=agent, step_key=step_key, prompt=prompt, fingerprint=fingerprint, buffers=buffers, attempt=attempt)
-            self.trace.log("agent_stream", agent=agent.name, model=agent.model, reasoning_effort=agent.reasoning_effort, step_key=step_key, channel=channel, delta=delta)
+            if channel == "reasoning_details":
+                self.trace.log(
+                    "agent_stream",
+                    agent=agent.name,
+                    model=agent.model,
+                    reasoning_effort=agent.reasoning_effort,
+                    step_key=step_key,
+                    channel=channel,
+                    delta_items=len(delta) if isinstance(delta, list) else 1,
+                )
+            else:
+                self.trace.log("agent_stream", agent=agent.name, model=agent.model, reasoning_effort=agent.reasoning_effort, step_key=step_key, channel=channel, delta=delta)
             try:
                 self._check_stop()
             except ResearchStopped:
@@ -901,6 +912,67 @@ class TheoremResearchLab:
         result.metadata = metadata
         return result
 
+    def _cached_script_current(self, raw: dict[str, Any], step_key: str) -> bool:
+        """A cached ``script`` result is evidence only while the checker code is unchanged.
+
+        The step fingerprint covers the request, not the checked-in script, so
+        the stored ``script_sha256`` is compared with the current file before the
+        old output is reused.
+        """
+
+        if str(raw.get("tool") or "").lower() != "script":
+            return True
+        metadata = dict(raw.get("metadata") or {})
+        name = str(metadata.get("script") or "")
+        cached_sha = str(metadata.get("script_sha256") or "")
+        scripts = getattr(self.registry.toolbox, "scripts", None)
+        reason = ""
+        current_sha = ""
+        if not name or not cached_sha or scripts is None:
+            reason = "script_sha_missing"
+        else:
+            try:
+                script_path, _root = scripts._resolve(name)
+                current_sha = sha256_file(script_path)
+            except Exception as exc:
+                reason = f"script_unresolvable: {exc}"
+            else:
+                if current_sha != cached_sha:
+                    reason = "script_changed"
+        if not reason:
+            return True
+        self.trace.log(
+            "tool_cache_invalidated",
+            step_key=step_key,
+            script=name,
+            reason=reason,
+            cached_script_sha256=cached_sha,
+            current_script_sha256=current_sha,
+        )
+        return False
+
+    def _checkpoint_audit(self, iteration: int, *, auditor: Agent, problem: str, contract: ResearchContract | None) -> None:
+        """Run the independent checkpoint audit for ``iteration`` and clear its pending marker."""
+
+        self._set_runtime(current_step=f"iter:{iteration}:checkpoint_audit", pending_checkpoint=iteration)
+        ledger = self.state.research_context(recent_limit=50)
+        audit = self._call(
+            auditor,
+            checkpoint_prompt(
+                problem,
+                ledger,
+                iteration,
+                contract_block=contract.prompt_block() if contract is not None else "",
+            ),
+            f"iter:{iteration}:checkpoint_audit",
+        )
+        title = f"Checkpoint audit {iteration}"
+        if not [x for x in self.state.list_items(kind="audit") if x.title == title]:
+            audit_item = self.state.add_item("audit", title, audit, status="KNOWN", metadata={"iteration": iteration, "independent": True})
+            checkpoint_path = self.state.checkpoint(f"iteration-{iteration}", note=audit[:1000])
+            self.trace.log("checkpoint", iteration=iteration, audit_item_id=audit_item.id, path=str(checkpoint_path), audit=audit)
+        self._set_runtime(pending_checkpoint=0)
+
     def _tool(self, request: dict[str, Any] | None, step_key: str) -> ToolResult | None:
         name = str((request or {}).get("tool") or "none").strip().lower()
         if name == "lean":
@@ -916,6 +988,11 @@ class TheoremResearchLab:
 
         fingerprint = content_fingerprint("tool_step:v3", request or {"tool": "none"})
         cached = self._cache_get(step_key)
+        if isinstance(cached, dict) and cached.get("status") == "COMPLETE" and cached.get("fingerprint") == fingerprint:
+            raw = cached.get("result")
+            if isinstance(raw, dict) and not self._cached_script_current(raw, step_key):
+                self._cache_delete(step_key)
+                cached = None
         if isinstance(cached, dict) and cached.get("status") == "COMPLETE" and cached.get("fingerprint") == fingerprint:
             raw = cached.get("result")
             if isinstance(raw, dict):
@@ -1271,6 +1348,11 @@ class TheoremResearchLab:
         next_task = str(runtime.get("next_task") or "").strip() or "Problemi daralt; bilinen sınırları ihlal etmeyen, çürütülebilir tek bir lemma, construction veya lower-bound mekanizması öner."
         self._set_runtime(status="RUNNING", last_error="")
 
+        pending_checkpoint = int(runtime.get("pending_checkpoint", 0) or 0)
+        if pending_checkpoint and 0 < pending_checkpoint <= completed:
+            self.trace.log("checkpoint_resumed", iteration=pending_checkpoint)
+            self._checkpoint_audit(pending_checkpoint, auditor=auditor, problem=problem, contract=contract)
+
         if contract is not None and not selectable_ids and not contract.open_target_ids():
             self.controller.set_research_phase("PUBLICATION")
             self.trace.log(
@@ -1579,25 +1661,21 @@ class TheoremResearchLab:
             next_task = str(manager_decision.get("next_task") or frozen_next_task)
             outcomes.append(IterationOutcome(item.id, decision, status, next_task))
             self.trace.log("iteration_end", iteration=iteration, item_id=item.id, decision=decision, status=status, next_task=next_task)
-            self._set_runtime(completed_iterations=iteration, current_iteration=iteration, current_step="iteration_complete", next_task=next_task, status="RUNNING")
+            checkpoint_due = bool(checkpoint_every and iteration % checkpoint_every == 0)
+            # The iteration is complete, but a due checkpoint audit is recorded as
+            # pending *before* completion is persisted so an interrupted audit is
+            # replayed on resume instead of being skipped by the next-iteration loop.
+            self._set_runtime(
+                completed_iterations=iteration,
+                current_iteration=iteration,
+                current_step="iteration_complete",
+                next_task=next_task,
+                status="RUNNING",
+                pending_checkpoint=iteration if checkpoint_due else 0,
+            )
 
-            if checkpoint_every and iteration % checkpoint_every == 0:
-                ledger = self.state.research_context(recent_limit=50)
-                audit = self._call(
-                    auditor,
-                    checkpoint_prompt(
-                        problem,
-                        ledger,
-                        iteration,
-                        contract_block=contract.prompt_block() if contract is not None else "",
-                    ),
-                    f"iter:{iteration}:checkpoint_audit",
-                )
-                title = f"Checkpoint audit {iteration}"
-                if not [x for x in self.state.list_items(kind="audit") if x.title == title]:
-                    audit_item = self.state.add_item("audit", title, audit, status="KNOWN", metadata={"iteration": iteration, "independent": True})
-                    checkpoint_path = self.state.checkpoint(f"iteration-{iteration}", note=audit[:1000])
-                    self.trace.log("checkpoint", iteration=iteration, audit_item_id=audit_item.id, path=str(checkpoint_path), audit=audit)
+            if checkpoint_due:
+                self._checkpoint_audit(iteration, auditor=auditor, problem=problem, contract=contract)
 
         final_ledger = self.state.research_context(recent_limit=80)
         final_audit = self._call(

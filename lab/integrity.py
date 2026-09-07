@@ -183,8 +183,24 @@ class ProjectBusyError(RuntimeError):
     pass
 
 
+def _rename_if_absent(src: Path, dst: Path) -> None:
+    """Atomically move ``src`` to ``dst``; raise ``FileExistsError`` if ``dst`` exists."""
+
+    if os.name == "nt":
+        os.rename(src, dst)
+        return
+    os.link(src, dst)
+    os.unlink(src)
+
+
 class ProjectRunLock:
-    """Cross-process project lock backed by atomic O_EXCL file creation."""
+    """Cross-process project lock backed by atomic O_EXCL file creation.
+
+    Stale locks (dead owner on this host) are reclaimed by *moving* the observed
+    file aside and re-checking its identity, never by a blind ``unlink``: two
+    processes that both observed the same stale lock must not be able to delete
+    each other's freshly created lock.
+    """
 
     def __init__(self, project_root: str | Path):
         self.project_root = Path(project_root)
@@ -222,11 +238,7 @@ class ProjectRunLock:
                 fd = os.open(str(self.path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             except FileExistsError:
                 raw = self._read()
-                if self._stale(raw):
-                    try:
-                        self.path.unlink()
-                    except FileNotFoundError:
-                        pass
+                if self._stale(raw) and self._reclaim_stale(raw):
                     continue
                 owner = f"pid={raw.get('pid', '?')} host={raw.get('host', '?')}"
                 raise ProjectBusyError(f"Bu proje başka bir process tarafından çalıştırılıyor ({owner}).")
@@ -242,6 +254,44 @@ class ProjectRunLock:
                 self._depth = 1
                 return self
         raise ProjectBusyError("Proje run kilidi alınamadı.")
+
+    def _reclaim_stale(self, observed: dict[str, Any]) -> bool:
+        """Remove exactly the stale lock that was observed; return True if the caller may retry O_EXCL.
+
+        The file is first moved to a private name (atomic on all supported
+        platforms). Only when the moved file still carries the observed
+        token/pid was it the stale lock. Otherwise a fresh owner won the race:
+        its lock is put back with a rename that refuses to clobber an even newer
+        lock, and the caller treats the project as busy.
+        """
+
+        moved = self.path.with_name(f"{self.path.name}.reclaim-{uuid.uuid4().hex}")
+        try:
+            os.replace(self.path, moved)
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        current = _read_lock(moved)
+        same_owner = str(current.get("token") or "") == str(observed.get("token") or "") and str(
+            current.get("pid") or ""
+        ) == str(observed.get("pid") or "")
+        if same_owner:
+            try:
+                moved.unlink()
+            except OSError:
+                pass
+            return True
+        try:
+            _rename_if_absent(moved, self.path)
+        except FileExistsError:
+            try:
+                moved.unlink()
+            except OSError:
+                pass
+        except OSError:
+            pass
+        return False
 
     def release(self) -> None:
         if not self.acquired:
