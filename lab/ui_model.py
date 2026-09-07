@@ -167,6 +167,37 @@ def read_jsonl_tail(path: Path, *, max_bytes: int = 2_000_000) -> list[dict[str,
     return _parse_jsonl_lines(text.splitlines())
 
 
+def consume_log_chunk(state: dict[str, Any], chunk: bytes, *, archived: bool) -> None:
+    """Append newly read raw-log bytes to a tail-reader ``state`` without splitting records.
+
+    A worker may be mid-write, so only complete newline-terminated records are
+    decoded; the trailing partial line waits in ``state["pending"]`` *as bytes*
+    (a UTF-8 sequence cut at the read boundary must not be decoded twice). An
+    immutable archive is consumed entirely.
+    """
+
+    pending = bytes(state.get("pending") or b"") + bytes(chunk or b"")
+    if archived:
+        complete, pending = pending, b""
+    else:
+        cut = pending.rfind(b"\n")
+        complete, pending = (pending[: cut + 1], pending[cut + 1 :]) if cut >= 0 else (b"", pending)
+    state["pending"] = pending
+    if not complete:
+        return
+    text = complete.decode("utf-8", errors="replace")
+    state["raw"] = str(state.get("raw") or "") + text
+    events = state.setdefault("events", [])
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            value = {"type": "INVALID_JSON", "raw": line}
+        events.append(value if isinstance(value, dict) else {"raw": line})
+
+
 def read_jsonl_since(path: Path, offset: int) -> tuple[list[dict[str, Any]], int]:
     """Read complete JSONL records after an uncompressed-byte offset.
 

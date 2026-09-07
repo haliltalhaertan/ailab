@@ -49,6 +49,15 @@ class ResearchItem:
     updated_at: str = field(default_factory=_now)
 
 
+class LedgerReadError(RuntimeError):
+    """The authoritative ledger file exists but cannot be read.
+
+    Treating it as empty would let the next mutation silently replace the whole
+    research history, so every read fails closed instead. Recovery (restoring a
+    checkpoint or repairing the file) is an explicit, observable operation.
+    """
+
+
 class ResearchState:
     """Inspectable research ledger with explicit evidence gates for PROVEN.
 
@@ -146,9 +155,17 @@ class ResearchState:
         return True, ""
 
     def _read_state(self) -> dict[str, Any]:
-        raw = read_json_tolerant(self.state_path, {"items": [], "events": []})
-        if not isinstance(raw, dict):
-            return {"items": [], "events": []}
+        if not self.state_path.exists():
+            raw: Any = {"items": [], "events": []}
+        else:
+            try:
+                raw = json.loads(self.state_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
+                raise LedgerReadError(
+                    f"Research ledger okunamadı; boş kabul edilip üzerine yazılmayacak: {self.state_path} ({exc})"
+                ) from exc
+            if not isinstance(raw, dict):
+                raise LedgerReadError(f"Research ledger JSON nesnesi değil: {self.state_path}")
         raw.setdefault("items", [])
         raw.setdefault("events", [])
         for item in raw.get("items", []):
