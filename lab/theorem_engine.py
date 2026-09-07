@@ -844,19 +844,21 @@ class TheoremResearchLab:
             return ""
         previous = previous_items[-1]
         metadata = dict(previous.metadata or {})
-        if str(metadata.get("manager_decision") or "").upper() != "REVISE":
+        if str(metadata.get("manager_decision") or "").upper() not in {"REVISE", "KILL"}:
             return ""
         previous_target = str(metadata.get("target_id") or "").strip()
         if target_id and previous_target and previous_target != target_id:
             return ""
         input_task = str(metadata.get("input_next_task") or "").strip()
         manager_task = str(metadata.get("manager_next_task") or "").strip()
-        if not input_task or not manager_task:
-            return ""
-        first_similarity = self._task_jaccard(input_task, manager_task)
-        second_similarity = self._task_jaccard(manager_task, current_task)
-        similarity = min(first_similarity, second_similarity)
-        if similarity < 0.80:
+        similarity = self._weighted_task_similarity(input_task, manager_task) if input_task and manager_task else 0.0
+        streak = self._unresolved_streak(previous_items, target_id)
+        reason = ""
+        if streak >= 2:
+            reason = f"structural: {streak} ardışık tur aynı hedefte kapanmadan (REVISE/KILL, verifier PASS değil) bitti"
+        elif similarity >= self.REPETITION_SIMILARITY_THRESHOLD:
+            reason = f"textual: Manager önceki görevi yeniden yazdı (ağırlıklı benzerlik {similarity:.2f})"
+        if not reason:
             return ""
         warning = "bu görev iki turdur tekrarlıyor; ya farklı bir aday iste ya da DROPPED öner"
         self.trace.log(
@@ -864,12 +866,71 @@ class TheoremResearchLab:
             item_id=current_item_id,
             previous_item_id=previous.id,
             target_id=target_id,
-            similarity=similarity,
+            reason=reason,
+            unresolved_streak=streak,
+            similarity=round(similarity, 3),
             previous_input_task=input_task,
             previous_next_task=manager_task,
             current_task=current_task,
         )
         return warning
+
+    REPETITION_SIMILARITY_THRESHOLD = 0.35
+    _IDENTIFIER_WEIGHT = 3.0
+
+    @classmethod
+    def _weighted_task_tokens(cls, text: str) -> dict[str, float]:
+        """Tokens weighted so identifiers (σ_total, exp_005, code_experiment) dominate filler words."""
+
+        weights: dict[str, float] = {}
+        for raw in re.findall(r"[^\s,;:()\[\]{}\"'`]+", str(text or "").lower()):
+            token = raw.strip(".!?-")
+            if len(token) < 2:
+                continue
+            identifier_like = bool(
+                "_" in token
+                or re.search(r"\d", token)
+                or re.search(r"[σ∈≥≤⌈⌉₂→∀∃]", token)
+                or re.fullmatch(r"[a-z]+\.py", token)
+            )
+            weights[token] = max(weights.get(token, 0.0), cls._IDENTIFIER_WEIGHT if identifier_like else 1.0)
+        return weights
+
+    @classmethod
+    def _weighted_task_similarity(cls, left: str, right: str) -> float:
+        a = cls._weighted_task_tokens(left)
+        b = cls._weighted_task_tokens(right)
+        if not a or not b:
+            return 0.0
+        union = {**a, **b}
+        for token in set(a) & set(b):
+            union[token] = max(a[token], b[token])
+        shared = sum(min(a[token], b[token]) for token in set(a) & set(b))
+        total = sum(union.values())
+        return shared / total if total else 0.0
+
+    @staticmethod
+    def _unresolved_streak(previous_items: list[Any], target_id: str | None) -> int:
+        """Count the most recent consecutive items on this target that ended unresolved.
+
+        An item counts when the Manager decided REVISE/KILL and the Verifier did
+        not PASS it; that is the repetition pattern observed in real runs (the
+        same experiment re-requested each turn with INCONCLUSIVE verification).
+        """
+
+        streak = 0
+        for item in reversed(previous_items):
+            metadata = dict(item.metadata or {})
+            item_target = str(metadata.get("target_id") or "").strip()
+            if target_id and item_target and item_target != target_id:
+                break
+            decision = str(metadata.get("manager_decision") or "").upper()
+            verdict = str(metadata.get("verifier_verdict") or "").upper()
+            if decision in {"REVISE", "KILL"} and verdict != "PASS":
+                streak += 1
+                continue
+            break
+        return streak
 
     def _bind_code_definitions(
         self,
@@ -963,16 +1024,52 @@ class TheoremResearchLab:
         task = str(request.get("task") or request.get("goal") or "").strip() or "Aday iddiayı küçük deterministic deneylerle sınamaya çalış."
         symbols_raw = request.get("_definition_symbols")
         symbols = [str(value) for value in symbols_raw] if isinstance(symbols_raw, list) else []
-        return self.code_runner.run(
+        definitions_file = str(request.get("_definitions_file") or "")
+        expected_definitions_sha = str(request.get("_definitions_sha256") or "")
+        result = self.code_runner.run(
             agent=self.code_agent,
             task=task,
             step_key=step_key,
             call_agent=self._call,
             execute_cached=self._cached_workspace_action,
             source=str(request.get("source") or ""),
-            definitions_file=str(request.get("_definitions_file") or ""),
+            definitions_file=definitions_file,
             definition_symbols=symbols,
         )
+        if not definitions_file:
+            return result
+        # The canonical definitions must be byte-identical after the agent ran;
+        # otherwise the raw stdout was produced under different semantics.
+        definitions_path = self.code_workspace.root / definitions_file
+        actual_sha = sha256_file(definitions_path) if definitions_path.is_file() else ""
+        metadata = dict(result.metadata or {})
+        metadata["definitions_file"] = definitions_file
+        metadata["definitions_sha256"] = expected_definitions_sha
+        metadata["definition_symbols"] = symbols
+        if actual_sha != expected_definitions_sha:
+            self.trace.log(
+                "definitions_tampered",
+                step_key=step_key,
+                definitions_file=definitions_file,
+                expected_sha256=expected_definitions_sha,
+                actual_sha256=actual_sha,
+            )
+            metadata.update(
+                {
+                    "status": "DEFINITIONS_TAMPERED",
+                    "evidence_level": "COMPUTATION_ONLY",
+                    "definitions_actual_sha256": actual_sha,
+                    "tampered_result_status": str((result.metadata or {}).get("status") or ""),
+                }
+            )
+            return ToolResult(
+                False,
+                "code_experiment",
+                error=f"{definitions_file} deney sırasında değişti; ham stdout kanonik tanımlarla üretilmedi.",
+                metadata=metadata,
+            )
+        result.metadata = metadata
+        return result
 
     def _cached_formal_result(self, raw: dict[str, Any]) -> ToolResult:
         result = ToolResult(
@@ -1105,7 +1202,10 @@ class TheoremResearchLab:
                     str(raw.get("error") or ""),
                     dict(raw.get("metadata") or {}),
                 )
-                stdout_sha = str((cached_result.metadata or {}).get("stdout_sha256") or "")
+                cached_meta = cached_result.metadata or {}
+                # ``stdout_sha256`` is the byte hash of the evidence file;
+                # ``output`` is its decoded text, so compare against the text hash.
+                stdout_sha = str(cached_meta.get("stdout_text_sha256") or cached_meta.get("stdout_sha256") or "")
                 stdout_hash_mismatch = bool(
                     cached_result.tool == "code_experiment"
                     and cached_result.ok
@@ -1911,6 +2011,7 @@ class TheoremResearchLab:
                     "input_next_task": frozen_next_task,
                     "manager_decision": decision,
                     "manager_next_task": next_task,
+                    "verifier_verdict": str(verification.get("verdict") or "").upper(),
                 },
             )
             outcomes.append(IterationOutcome(item.id, decision, status, next_task))

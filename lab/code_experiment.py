@@ -690,6 +690,44 @@ def top_level_bound_names(source: str) -> set[str]:
     return names
 
 
+def strip_top_level_redefinitions(source: str, symbols: list[str]) -> tuple[str, list[str], list[str]]:
+    """Remove top-level ``def``/``class`` blocks that shadow canonical ``definitions`` symbols.
+
+    Returns ``(source, stripped, remaining)``. ``remaining`` lists symbols that
+    are still bound at top level by something other than a function/class
+    definition (an assignment or import); callers must reject those because
+    they cannot be removed safely.
+    """
+
+    text = str(source or "")
+    wanted = {str(value).strip() for value in symbols if str(value).strip()}
+    if not wanted:
+        return text, [], []
+    tree = ast.parse(text)
+    lines = text.splitlines(keepends=True)
+    drop: set[int] = set()
+    stripped: list[str] = []
+    remaining: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name in wanted:
+            start = min([node.lineno] + [dec.lineno for dec in node.decorator_list])
+            end = int(node.end_lineno or node.lineno)
+            drop.update(range(start - 1, end))
+            stripped.append(str(node.name))
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Name) and target.id in wanted:
+                    remaining.add(target.id)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                bound = (alias.asname or alias.name).split(".")[0]
+                if bound in wanted and not (isinstance(node, ast.ImportFrom) and node.module == "definitions"):
+                    remaining.add(bound)
+    kept = "".join(line for index, line in enumerate(lines) if index not in drop)
+    return kept, sorted(dict.fromkeys(stripped)), sorted(remaining)
+
+
 def parse_ailab_trailer(stdout: str) -> dict[str, Any]:
     trailer: dict[str, Any] = {}
     for line in str(stdout or "").splitlines():
@@ -784,18 +822,26 @@ class CodeExperimentRunner:
                     metadata={"status": "THEORIST_SOURCE_INVALID", "evidence_level": "COMPUTATION_ONLY"},
                 )
             overlap = sorted(set(symbols) & source_bound)
-            if overlap:
-                return ToolResult(
-                    False,
-                    "code_experiment",
-                    error="Theorist source definitions.py sembollerini yeniden tanımlıyor: " + ", ".join(overlap),
-                    metadata={
-                        "status": "SOURCE_REDEFINES_DEFINITION",
-                        "evidence_level": "COMPUTATION_ONLY",
-                        "symbols": overlap,
-                    },
-                )
+            stripped_redefinitions: list[str] = []
             prepared_source = protected_source
+            if overlap:
+                # Same author (Theorist) wrote both the definitions and the
+                # source, so a repeated def/class is redundancy, not an attack:
+                # drop it and keep the canonical import. Only bindings that
+                # cannot be removed (assignments/imports) still fail closed.
+                prepared_source, stripped_redefinitions, remaining = strip_top_level_redefinitions(protected_source, symbols)
+                if remaining:
+                    return ToolResult(
+                        False,
+                        "code_experiment",
+                        error="Theorist source definitions.py sembollerini atama/import ile yeniden bağlıyor: " + ", ".join(remaining),
+                        metadata={
+                            "status": "SOURCE_REDEFINES_DEFINITION",
+                            "evidence_level": "COMPUTATION_ONLY",
+                            "symbols": remaining,
+                            "stripped_redefinitions": stripped_redefinitions,
+                        },
+                    )
             if symbols and definitions_file:
                 prepared_source = f"from definitions import {', '.join(symbols)}\n\n" + prepared_source
             initial_action = {"action": "write_file", "path": protected_path, "content": prepared_source}
@@ -807,6 +853,7 @@ class CodeExperimentRunner:
                 ok=initial_result.ok,
                 definitions_file=definitions_file or None,
                 definition_symbols=symbols,
+                stripped_redefinitions=stripped_redefinitions,
                 metadata=initial_result.metadata or {},
                 error=initial_result.error,
             )
@@ -951,6 +998,7 @@ class CodeExperimentRunner:
                     "evidence": evidence,
                     "stdout_file": str(run_meta.get("stdout_file") or ""),
                     "stdout_sha256": actual_stdout_sha,
+                    "stdout_text_sha256": hashlib.sha256(stdout.encode("utf-8")).hexdigest(),
                     "script_sha256": run_meta.get("script_sha256"),
                     "structured_trailer": parse_ailab_trailer(stdout),
                     "warning": "Computational evidence is not a proof. Agent summary is not evidence.",
@@ -959,8 +1007,20 @@ class CodeExperimentRunner:
                 return ToolResult(True, "code_experiment", output=stdout, metadata=payload)
 
             action_path = str(action.get("path") or "").strip().replace("\\", "/")
+            if action_path.startswith("./"):
+                action_path = action_path[2:]
             action_rejected: WorkspaceActionResult | None = None
-            if protected_source and action_name == "write_file" and action_path == protected_path:
+            if definitions_file and action_name in {"write_file", "patch_file"} and action_path == definitions_file:
+                action_rejected = WorkspaceActionResult(
+                    False,
+                    action_name,
+                    error=(
+                        f"{definitions_file} kanonik Theorist tanımlarıdır ve ajan tarafından değiştirilemez; "
+                        "yalnız import et. Tanım yanlışsa finish özetinde belirt, Theorist düzeltir."
+                    ),
+                    metadata={"protected_definitions": True, "definitions_file": definitions_file},
+                )
+            elif protected_source and action_name == "write_file" and action_path == protected_path:
                 action_rejected = WorkspaceActionResult(
                     False,
                     "write_file",
@@ -1101,6 +1161,7 @@ class CodeExperimentRunner:
                     "failed_run_count": len(failed_runs),
                     "stdout_file": str(run_meta.get("stdout_file") or ""),
                     "stdout_sha256": actual_stdout_sha,
+                    "stdout_text_sha256": hashlib.sha256(stdout.encode("utf-8")).hexdigest(),
                     "script_sha256": run_meta.get("script_sha256"),
                     "structured_trailer": parse_ailab_trailer(stdout),
                     "agent_summary": "",
