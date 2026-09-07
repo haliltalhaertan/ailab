@@ -132,7 +132,7 @@ def test_trace_ids_never_collide(tmp_path):
         b.close()
 
 
-def test_code_experiment_finish_without_run_is_rejected(tmp_path):
+def test_code_experiment_finish_without_run_is_rejected(tmp_path, fake_container_runtime):
     ws = GuardedExperimentWorkspace(tmp_path / "workspace", timeout_s=5)
     trace = Trace("finish-gate", out_dir=tmp_path / "runs")
     runner = CodeExperimentRunner(ws, trace, max_steps=1)

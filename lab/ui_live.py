@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 
@@ -405,6 +406,48 @@ def render_stage_timeline(events: list[dict[str, Any]]) -> None:
             f"{row.get('label') or row.get('agent')} · {float(row.get('duration_s', 0.0)):.1f} sn · "
             f"{int(row.get('total_tokens', 0) or 0):,} token · {cost_label}{suffix}"
         )
+
+    code_results = [
+        event
+        for event in events
+        if event.get("type") == "tool_result"
+        and str(event.get("tool") or "") == "code_experiment"
+        and str(event.get("output") or "")
+    ]
+    if code_results:
+        st.markdown("#### Deney kanıtı")
+        for index, event in enumerate(code_results[-5:], 1):
+            raw_metadata = event.get("metadata")
+            metadata: dict[str, Any] = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
+            output = str(event.get("output") or "")
+            stdout_file = str(metadata.get("stdout_file") or "stdout.txt")
+            stdout_sha256 = str(metadata.get("stdout_sha256") or "")
+            status = str(metadata.get("status") or "")
+            with st.expander(
+                f"Ham çıktı · {status or 'code_experiment'} · {stdout_file}",
+                expanded=False,
+            ):
+                raw_tab, meta_tab = st.tabs(["Ham çıktı", "Özet / metadata"])
+                with raw_tab:
+                    preview = output[:4_000]
+                    st.code(preview, language=None)
+                    if len(output) > 4_000:
+                        st.caption(f"İlk 4.000 / {len(output):,} karakter gösteriliyor.")
+                    st.download_button(
+                        "Ham stdout'u indir",
+                        data=output,
+                        file_name=Path(stdout_file).name if stdout_file else "stdout.txt",
+                        mime="text/plain",
+                        key=f"raw_stdout_download_{index}_{stdout_sha256[:12]}",
+                    )
+                    if stdout_sha256:
+                        st.caption(f"SHA-256: `{stdout_sha256}`")
+                with meta_tab:
+                    agent_summary = str(metadata.get("agent_summary") or "")
+                    if agent_summary:
+                        st.caption("Agent özeti kanıt değildir.")
+                        st.code(agent_summary, language=None)
+                    st.json(metadata)
 
 
 def render_now_and_timeline(

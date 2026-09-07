@@ -98,3 +98,22 @@ def test_container_timeout_removes_container(tmp_path, monkeypatch):
     )
     names = {line.strip() for line in listed.stdout.splitlines() if line.strip()}
     assert not any(name.startswith("ailab-exp-") for name in names)
+
+
+def test_container_imports_canonical_definitions_file(tmp_path, monkeypatch):
+    ws = _workspace(tmp_path, monkeypatch)
+    definitions = """def sigma(n):
+    steps = 0
+    while n != 1:
+        n = n // 2 if n % 2 == 0 else 3 * n + 1
+        steps += 1
+    return steps
+"""
+    source = """from definitions import sigma
+print(sigma(60))
+"""
+    assert ws.write_file("definitions.py", definitions).ok
+    assert ws.write_file("exp_001.py", source).ok
+    result = ws.run_python("exp_001.py")
+    assert result.ok, result.error
+    assert result.output.strip() == "19"
