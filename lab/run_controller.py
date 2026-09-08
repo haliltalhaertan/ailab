@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import errno
 import os
 import threading
 import time
+
+import httpx
+from openai import APIConnectionError, APITimeoutError
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -77,13 +81,54 @@ def set_research_phase(project_root: str | Path, phase: str) -> dict[str, Any]:
     return current
 
 
-def retryable(exc: Exception) -> bool:
-    text = str(exc).lower()
+def _exception_chain(exc: BaseException):
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
+
+
+def _http_status(exc: BaseException) -> int | None:
     status = getattr(exc, "status_code", None)
-    if status in {408, 409, 425, 429}:
-        return True
-    if isinstance(status, int) and 500 <= status <= 599:
-        return True
+    if isinstance(status, int):
+        return status
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    return status if isinstance(status, int) else None
+
+
+def retryable(exc: Exception) -> bool:
+    transient_httpx = (
+        httpx.ReadError,
+        httpx.ConnectError,
+        httpx.RemoteProtocolError,
+        httpx.TimeoutException,
+        httpx.PoolTimeout,
+    )
+    transient_errno = {errno.ECONNRESET, errno.ETIMEDOUT}
+    transient_winerror = {10053, 10054, 10060}
+    chain = list(_exception_chain(exc))
+    for current in chain:
+        status = _http_status(current)
+        if status in {408, 409, 425, 429} or (isinstance(status, int) and 500 <= status <= 599):
+            return True
+        if isinstance(current, (APIConnectionError, APITimeoutError, ConnectionResetError, *transient_httpx)):
+            return True
+        if isinstance(current, OSError):
+            if getattr(current, "winerror", None) in transient_winerror:
+                return True
+            if getattr(current, "errno", None) in transient_errno:
+                return True
+
+    # Deterministic/user-data errors must not become retryable merely because
+    # their localized text happens to contain a network-looking word.
+    if isinstance(exc, (ValueError, TypeError, KeyError, AssertionError)):
+        return False
+
+    # Compatibility fallback for third-party wrappers that erase exception types.
+    text = " ".join(str(current).lower() for current in chain)
     return any(
         token in text
         for token in (

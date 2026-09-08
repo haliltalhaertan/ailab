@@ -27,6 +27,10 @@
     "IndependentAuditor": {
       "model": "google/gemini-3.7-flash",
       "reasoning_effort": "medium"
+    },
+    "CodeExperimentAgent": {
+      "model": "z-ai/glm-5.3-flash",
+      "reasoning_effort": "low"
     }
   }
 }

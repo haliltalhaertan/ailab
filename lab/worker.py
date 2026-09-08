@@ -120,6 +120,7 @@ class _UnavailableCodeRunner:
                 "tool_unavailable": True,
                 "availability_reason": self.reason,
                 "evidence_level": "COMPUTATION_ONLY",
+                "infrastructure_error": True,
             },
         )
 
@@ -173,12 +174,12 @@ def _tool_availability_for_run(root: Path, lab: Any, runtime_before: dict[str, A
     if workspace is None:
         runtime["code_experiment"] = _availability_row(False, "code workspace bu runner'da tanımlı değil")
     else:
+        refresh = getattr(workspace, "refresh_execution_availability", None)
+        if callable(refresh):
+            refresh()
         execution_available = bool(getattr(workspace, "execution_available", False))
-        engine = str(getattr(workspace, "container_engine", "") or "")
-        runtime["code_experiment"] = _availability_row(
-            execution_available,
-            f"container engine kullanılabilir: {engine}" if execution_available else "container engine kullanılamıyor",
-        )
+        reason = str(getattr(workspace, "availability_reason", "") or "container durumu bilinmiyor")
+        runtime["code_experiment"] = _availability_row(execution_available, reason)
 
     path = root / TOOL_AVAILABILITY_FILE
     previous = read_json_tolerant(path, {})

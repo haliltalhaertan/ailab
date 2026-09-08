@@ -35,7 +35,9 @@ class CardState:
     reasoning_effort_sent: str | None = None
     effort_resolution: str = "provider_default"
     reasoning_max_tokens_sent: int | None = None
+    model_default_reasoning_effort: str | None = None
     truncation_retry: str | None = None
+    infrastructure_error: str = ""
     expected_min_tokens: int | None = None
     expected_max_tokens: int | None = None
     over_budget: bool = False
@@ -81,13 +83,17 @@ def _apply_card_events(cards: list[CardState], events: list[dict[str, Any]]) -> 
 
     for event in events:
         kind = str(event.get("type") or "")
-        if kind not in {"agent_start", "agent_stream", "llm_call", "agent_error", "truncated_retry"}:
+        if kind not in {"agent_start", "agent_stream", "llm_call", "agent_error", "truncated_retry", "tool_infrastructure_error"}:
             continue
         state = get_state(event, create=kind != "truncated_retry")
         if state is None:
             continue
         if kind == "truncated_retry":
             state.truncation_retry = str(event.get("outcome") or "") or None
+            continue
+        if kind == "tool_infrastructure_error":
+            state.infrastructure_error = str(event.get("error") or "container infrastructure unavailable")
+            state.status = "error"
             continue
         if event.get("agent"):
             state.agent = str(event["agent"])
@@ -146,6 +152,11 @@ def _apply_card_events(cards: list[CardState], events: list[dict[str, Any]]) -> 
             state.reasoning_max_tokens_sent = (
                 int(event["reasoning_max_tokens_sent"])
                 if event.get("reasoning_max_tokens_sent") is not None
+                else None
+            )
+            state.model_default_reasoning_effort = (
+                str(event["model_default_reasoning_effort"])
+                if event.get("model_default_reasoning_effort") is not None
                 else None
             )
             budget = event.get("budget") or {}

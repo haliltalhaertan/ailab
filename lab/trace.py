@@ -218,6 +218,7 @@ class Trace:
             "reasoning_effort_sent": data.get("reasoning_effort_sent"),
             "effort_resolution": data.get("effort_resolution"),
             "reasoning_max_tokens_sent": data.get("reasoning_max_tokens_sent"),
+            "model_default_reasoning_effort": data.get("model_default_reasoning_effort"),
             "budget": data.get("budget") or {},
             "auto": True,
         }
@@ -351,6 +352,7 @@ class Trace:
             reasoning_effort_sent=sent_effort,
             effort_resolution=effort_resolution,
             reasoning_max_tokens_sent=getattr(response, "reasoning_max_tokens_sent", None),
+            model_default_reasoning_effort=getattr(response, "model_default_reasoning_effort", None),
             messages=exact_messages,
             output=response.content,
             answer_chars=len(str(response.content or "")),

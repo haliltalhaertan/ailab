@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
+from lab.code_experiment_settings import load_code_experiment_settings
 from lab.integrity import project_lock_is_live
 from lab.openrouter_catalog import fetch_openrouter_models
 from lab.project_manager import ProjectInfo, ProjectManager
@@ -106,7 +108,7 @@ TROPICAL_PROBLEM = (
     "or isolate a new rigorous barrier/subclass result."
 )
 
-EXPERIMENTS = {
+EXPERIMENTS: dict[str, dict[str, Any]] = {
     "Teorem Araştırması": {
         "method": "theorem_lab",
         "slug": "theorem",
@@ -188,13 +190,24 @@ def _profile_effort(role: str) -> str | None:
 
 
 def _new_reasoning_settings() -> dict:
-    return {"agents": {role: _profile_effort(role) for role in ROLE_LIBRARY if _profile_effort(role) is not None}}
+    roles = list(ROLE_LIBRARY)
+    if "CodeExperimentAgent" not in roles:
+        roles.append("CodeExperimentAgent")
+    return {"agents": {role: _profile_effort(role) for role in roles if _profile_effort(role) is not None}}
 
 
 def _ensure_reasoning_settings_defaults() -> None:
     path = settings_path()
+    defaults = _new_reasoning_settings()
     if not path.exists():
-        save_settings(_new_reasoning_settings(), path)
+        save_settings(defaults, path)
+        return
+    current = load_settings(path)
+    current_agents = current.setdefault("agents", {})
+    default_agents = defaults.get("agents", {})
+    if "CodeExperimentAgent" not in current_agents and "CodeExperimentAgent" in default_agents:
+        current_agents["CodeExperimentAgent"] = default_agents["CodeExperimentAgent"]
+        save_settings(current, path)
 
 
 _ensure_reasoning_settings_defaults()
@@ -451,6 +464,13 @@ def render_agent_card(
         if card.truncated:
             limit_label = f" (requested_max_tokens={card.requested_max_tokens})" if card.requested_max_tokens is not None else ""
             st.warning(f"⚠️ Yanıt token sınırında kesildi{limit_label}. Bu çıktı tamamlanmış kabul edilmez.")
+        if (
+            card.status == "done"
+            and card.reasoning_effort_sent is None
+            and card.effort_resolution == "provider_default"
+        ):
+            provider_default = card.model_default_reasoning_effort or "bilinmiyor"
+            st.warning(f"effort: gönderilmedi (sağlayıcı varsayılanı: {provider_default})")
         if card.over_budget:
             expected = f"{card.expected_min_tokens or '?'}–{card.expected_max_tokens or '?'}"
             st.info(
@@ -492,6 +512,8 @@ def render_agent_card(
                 st.code(card.prompt, language=None)
             if not card.system_prompt and not card.prompt:
                 st.caption("Görev ayrıntısı bu event içinde yok.")
+        if card.infrastructure_error:
+            st.warning(f"⚠️ altyapı: {card.infrastructure_error}")
         if card.error:
             st.error(card.error)
         if card.status == "done":
@@ -732,6 +754,10 @@ def launch_experiment(
         literature_query=extras.get("literature_query") or None,
         checkpoint_every=int(extras.get("checkpoint_every", 2)),
     )
+    if method == "theorem_lab":
+        code_experiment = load_code_experiment_settings()
+        code_experiment["reasoning_effort"] = get_reasoning_effort("CodeExperimentAgent")
+        request["code_experiment"] = code_experiment
     root = PROJECTS.project_root(project_id)
     write_worker_request(root, request)
     PROJECTS.touch(project_id, experiment=exp_name)
@@ -775,6 +801,7 @@ def main() -> None:
             st.switch_page("pages/1_Projeler.py")
         st.stop()
 
+    assert active is not None
     active_project_header(active)
     st.sidebar.header("Deney Ayarları")
     st.sidebar.caption(f"Aktif proje: **{active.title}** · `{active.project_id}`")

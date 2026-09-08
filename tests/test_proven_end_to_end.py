@@ -156,6 +156,17 @@ def test_run_rejects_cached_formal_evidence_from_different_claim(tmp_path):
     )
     trace = Trace("mismatch", out_dir=tmp_path / "runs")
     lab = TheoremResearchLab(trace, state, literature=EmptyLiterature())
+    lab.step_store.put_iteration_snapshot(
+        1,
+        ledger_revision=state.revision(),
+        ledger_context=state.research_context(),
+        payload={
+            "next_task": "",
+            "proposal": proposal,
+            "proposal_hash": proposal_hash,
+            "item_id": item.id,
+        },
+    )
 
     filename = f"iter-1-{item.id}.lean"
     candidate_dir = state.root / "formal" / "candidates"

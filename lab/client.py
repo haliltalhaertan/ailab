@@ -49,6 +49,7 @@ class LLMResponse:
     reasoning_effort_sent: str | None = None
     effort_resolution: str = "provider_default"
     reasoning_max_tokens_sent: int | None = None
+    model_default_reasoning_effort: str | None = None
 
     @property
     def total_tokens(self) -> int:
@@ -65,6 +66,7 @@ class _RequestPolicy:
     reasoning_effort_sent: str | None
     effort_resolution: str
     reasoning_max_tokens_sent: int | None
+    model_default_reasoning_effort: str | None = None
 
 
 def _extra(obj: Any, name: str, default: Any = None) -> Any:
@@ -291,6 +293,9 @@ class LLMClient:
         if self.is_openrouter:
             catalog_model, catalog_source = lookup_openrouter_model(model)
         model_max = catalog_model.max_completion_tokens if catalog_model is not None else None
+        model_default_reasoning_effort = (
+            catalog_model.reasoning_default_effort if catalog_model is not None else None
+        )
         requested_max_tokens, max_tokens_source = _requested_max_tokens(max_tokens, model_max)
         reasoning: dict[str, Any] = {}
         effort_sent: str | None = None
@@ -312,6 +317,7 @@ class LLMClient:
             reasoning_effort_sent=effort_sent,
             effort_resolution=effort_resolution,
             reasoning_max_tokens_sent=reasoning_max_tokens_sent,
+            model_default_reasoning_effort=model_default_reasoning_effort,
         )
         kwargs: dict[str, Any] = {
             "model": model,
@@ -341,6 +347,7 @@ class LLMClient:
             "reasoning_effort_sent": policy.reasoning_effort_sent,
             "effort_resolution": policy.effort_resolution,
             "reasoning_max_tokens_sent": policy.reasoning_max_tokens_sent,
+            "model_default_reasoning_effort": policy.model_default_reasoning_effort,
         }
 
     def _complete_once(
