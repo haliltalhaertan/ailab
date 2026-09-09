@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from lab.integrity import EvidenceSigner, atomic_write_json, read_json_tolerant, sha256_file
+from lab.integrity import EvidenceSigner, atomic_write_json, formal_verification_current, read_json_tolerant, sha256_file
 from lab.research_contract import ResearchContract
 
 
@@ -92,6 +92,8 @@ class ResearchState:
             "formal_binding_verified": bool(metadata.get("formal_binding_verified")),
             "axioms_verified": bool(metadata.get("axioms_verified")),
             "source_clean": bool(metadata.get("source_clean")),
+            "theorem_statement_verified": metadata.get("theorem_statement_verified"),
+            "formal_verification_version": metadata.get("formal_verification_version"),
         }
 
     def _validate_live_formal_binding(
@@ -102,6 +104,7 @@ class ResearchState:
     ) -> tuple[bool, str]:
         if not (
             metadata.get("formal_verified") is True
+            and formal_verification_current(metadata)
             and metadata.get("formal_binding_verified") is True
             and metadata.get("axioms_verified") is True
             and metadata.get("source_clean") is True

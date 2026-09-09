@@ -1,0 +1,26 @@
+FFF                                                                      [100%]
+================================== FAILURES ===================================
+__________ test_r01_assumptions_cannot_be_dropped_from_expected_type __________
+docs\audits\2026-09-07\review_reproductions.py:22: in test_r01_assumptions_cannot_be_dropped_from_expected_type
+    assert not result.ok, "False -> False was accepted as the unconditional expected proposition False"
+E   AssertionError: False -> False was accepted as the unconditional expected proposition False
+E   assert not True
+E    +  where True = ToolResult(ok=True, tool='lean_draft', output='Formal candidate written: bound.lean', error='', metadata={'file': 'bou... 'iteration': 1, 'claim_hash': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'claim_sha256': ''}).ok
+__________ test_r02_reclaim_does_not_open_a_window_for_a_third_owner __________
+docs\audits\2026-09-07\review_reproductions.py:43: in test_r02_reclaim_does_not_open_a_window_for_a_third_owner
+    assert not (second.acquired and third.acquired), "Moving a live lock created an admission window for a third worker"
+E   AssertionError: Moving a live lock created an admission window for a third worker
+E   assert not (True and True)
+E    +  where True = <lab.integrity.ProjectRunLock object at 0x000002AC6BBCAC10>.acquired
+E    +  and   True = <lab.integrity.ProjectRunLock object at 0x000002AC6BBCAD50>.acquired
+_____ test_r03_legacy_formal_cache_is_checked_against_new_statement_gate ______
+docs\audits\2026-09-07\review_reproductions.py:66: in test_r03_legacy_formal_cache_is_checked_against_new_statement_gate
+    assert not reused.ok, "Legacy formal cache bypasses the new statement gate"
+E   AssertionError: Legacy formal cache bypasses the new statement gate
+E   assert not True
+E    +  where True = ToolResult(ok=True, tool='lean', output='', error='', metadata={'file': 'legacy.lean', 'lean_sha256': '6fb712ce5d27829...pe': '1 = 2', 'formal_verified': True, 'source_clean': True, 'axioms_verified': True, 'formal_binding_verified': True}).ok
+=========================== short test summary info ===========================
+FAILED docs/audits/2026-09-07/review_reproductions.py::test_r01_assumptions_cannot_be_dropped_from_expected_type
+FAILED docs/audits/2026-09-07/review_reproductions.py::test_r02_reclaim_does_not_open_a_window_for_a_third_owner
+FAILED docs/audits/2026-09-07/review_reproductions.py::test_r03_legacy_formal_cache_is_checked_against_new_statement_gate
+3 failed in 0.98s

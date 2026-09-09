@@ -13,7 +13,7 @@ from lab.client import next_lower_supported_effort
 from lab.code_experiment import CODE_EXPERIMENT_SYSTEM_PROMPT, CodeExperimentRunner, GuardedExperimentWorkspace, WorkspaceActionResult
 from lab.code_experiment_settings import load_code_experiment_settings, load_code_experiment_settings_from_dict
 from lab.evidence import evidence_from_tool_result, validate_evidence_binding
-from lab.integrity import content_fingerprint, sha256_file
+from lab.integrity import content_fingerprint, formal_verification_current, sha256_file
 from lab.json_io import StructuredOutputError, parse_json_object, parse_truncated_object_prefix, repair_instruction
 from lab.literature import LiteratureClient, LiteratureSearchEmpty, Paper
 from lab.prompts import checkpoint_prompt, critic_prompt, literature_prompt, manager_prompt, proposal_prompt, verifier_prompt
@@ -816,6 +816,9 @@ class TheoremResearchLab:
         )
         metadata = dict(result.metadata or {})
         if result.ok and metadata.get("formal_verified") is True:
+            if not formal_verification_current(metadata):
+                return ToolResult(False, "lean", error="Cached formal evidence requires current statement verification.",
+                                  metadata={**metadata, "formal_verified": False})
             filename = Path(str(metadata.get("file") or "")).name
             candidate = self.state.root / "formal" / "candidates" / filename
             if not filename or not candidate.is_file() or sha256_file(candidate) != str(metadata.get("lean_sha256") or ""):
@@ -846,7 +849,7 @@ class TheoremResearchLab:
             "claim_hash": self._active_claim_hash,
             "claim_sha256": self._active_claim_sha256,
         }
-        fingerprint = content_fingerprint("bound_formal_tool:v2", enriched)
+        fingerprint = content_fingerprint("bound_formal_tool:v3", enriched)
         cached = self._cache_get(step_key)
         if isinstance(cached, dict) and cached.get("status") == "COMPLETE" and cached.get("fingerprint") == fingerprint:
             raw = cached.get("result")

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from lab.evidence import Evidence, evidence_from_tool_result, validate_evidence_binding
+from lab.integrity import formal_verification_current
 from lab.research_contract import ResearchContract
 from lab.tools import ToolResult
 
@@ -50,6 +51,7 @@ def choose_status(
         and tool_result.ok
         and tool_result.tool == "lean"
         and tmeta.get("formal_verified") is True
+        and formal_verification_current(tmeta)
         and tmeta.get("source_clean") is True
         and tmeta.get("axioms_verified") is True
         and tmeta.get("formal_binding_verified") is True

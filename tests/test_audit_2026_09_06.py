@@ -122,7 +122,7 @@ def test_a01_lean_binds_actual_theorem_type(tmp_path):
     assert accepted.metadata["theorem_conclusion"] == "True"
 
     binders = "theorem foo (n : Nat) : n + 0 = n := by simp\n"
-    assert tool.draft_source("b1.lean", binders, theorem_name="foo", theorem_type="n + 0 = n", **binding).ok is True
+    assert tool.draft_source("b1.lean", binders, theorem_name="foo", theorem_type="n + 0 = n", **binding).ok is False
     assert tool.draft_source("b2.lean", binders, theorem_name="foo", theorem_type="∀ (n : Nat), n + 0 = n", **binding).ok is True
     assert tool.draft_source("b3.lean", binders, theorem_name="foo", theorem_type="Nat", **binding).ok is False
 
@@ -132,7 +132,7 @@ def test_a01_check_file_re_elaborates_statement_with_lean(tmp_path, monkeypatch)
     tool = LeanTool(root=tmp_path / "formal")
     source = "theorem bound (n : Nat) : n + 0 = n := by simp\n"
     binding = {"item_id": "C-1", "iteration": 1, "claim_hash": "b" * 64}
-    draft = tool.draft_source("bound.lean", source, theorem_name="bound", theorem_type="n + 0 = n", **binding)
+    draft = tool.draft_source("bound.lean", source, theorem_name="bound", theorem_type="∀ (n : Nat), n + 0 = n", **binding)
     assert draft.ok is True
 
     compiled: list[str] = []
@@ -149,7 +149,7 @@ def test_a01_check_file_re_elaborates_statement_with_lean(tmp_path, monkeypatch)
         expected_iteration=1,
         expected_claim_hash="b" * 64,
         expected_theorem_name="bound",
-        expected_theorem_type="n + 0 = n",
+        expected_theorem_type="∀ (n : Nat), n + 0 = n",
     )
     assert result.ok is True
     assert result.metadata["theorem_statement_verified"] is True
@@ -171,7 +171,7 @@ def test_a01_check_file_re_elaborates_statement_with_lean(tmp_path, monkeypatch)
         expected_iteration=1,
         expected_claim_hash="b" * 64,
         expected_theorem_name="bound",
-        expected_theorem_type="n + 0 = n",
+        expected_theorem_type="∀ (n : Nat), n + 0 = n",
     )
     assert result.ok is False
     assert result.metadata["formal_verified"] is False
@@ -182,7 +182,7 @@ def test_a01_check_file_re_elaborates_statement_with_lean(tmp_path, monkeypatch)
 
 
 def _dead_lock_payload():
-    child = subprocess.Popen(["python", "-c", "pass"])
+    child = subprocess.Popen([__import__("sys").executable, "-c", "pass"])
     child.wait()
     return {"token": "dead-owner", "pid": child.pid, "host": socket.gethostname(), "created_at_epoch": time.time()}
 
@@ -199,21 +199,20 @@ def test_a02_stale_lock_reclamation_preserves_new_owner(tmp_path, monkeypatch):
 
     def racing_stale(self, raw):
         stale = original_stale(self, raw)
-        # The second worker observes the same stale lock and wins the race
-        # between the first worker's observation and its reclamation.
+        # A contender cannot enter while stale metadata is being reclaimed.
         if self is first and stale and not second.acquired:
-            second.acquire()
+            with pytest.raises(ProjectBusyError):
+                second.acquire()
         return stale
 
     monkeypatch.setattr(ProjectRunLock, "_stale", racing_stale)
-    with pytest.raises(ProjectBusyError):
-        first.acquire()
+    first.acquire()
 
-    assert first.acquired is False
-    assert second.acquired is True
-    assert json.loads(lock_path.read_text(encoding="utf-8"))["token"] == second.token
-    assert [p.name for p in root.iterdir()] == ["run.lock"]
-    second.release()
+    assert first.acquired is True
+    assert second.acquired is False
+    assert json.loads(lock_path.read_text(encoding="utf-8"))["token"] == first.token
+    assert {p.name for p in root.iterdir()} == {"run.lock", ".run.guard"}
+    first.release()
     assert not lock_path.exists()
 
 
@@ -225,7 +224,7 @@ def test_a02_plain_stale_lock_is_still_reclaimed(tmp_path):
     lock.acquire()
     try:
         assert json.loads((root / "run.lock").read_text(encoding="utf-8"))["token"] == lock.token
-        assert [p.name for p in root.iterdir()] == ["run.lock"]
+        assert {p.name for p in root.iterdir()} == {"run.lock", ".run.guard"}
     finally:
         lock.release()
 

@@ -1,0 +1,75 @@
+FFFFFFFF                                                                 [100%]
+================================== FAILURES ===================================
+___________________ test_a01_lean_binds_actual_theorem_type ___________________
+docs\audits\2026-09-06\audit_reproductions.py:68: in test_a01_lean_binds_actual_theorem_type
+    assert not draft.ok, "A theorem of True was accepted as the statement 1 = 2"
+E   AssertionError: A theorem of True was accepted as the statement 1 = 2
+E   assert not True
+E    +  where True = ToolResult(ok=True, tool='lean_draft', output='Formal candidate written: candidate.lean', error='', metadata={'file': ... 'iteration': 1, 'claim_hash': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'claim_sha256': ''}).ok
+_____________ test_a02_stale_lock_reclamation_preserves_new_owner _____________
+docs\audits\2026-09-06\audit_reproductions.py:89: in test_a02_stale_lock_reclamation_preserves_new_owner
+    with pytest.raises(ProjectBusyError):
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   Failed: DID NOT RAISE <class 'lab.integrity.ProjectBusyError'>
+______________ test_a03_corrupt_ledger_is_not_silently_replaced _______________
+docs\audits\2026-09-06\audit_reproductions.py:105: in test_a03_corrupt_ledger_is_not_silently_replaced
+    assert state.state_path.read_text(encoding="utf-8") == damaged, "Unreadable ledger was overwritten by an empty-ledger fallback"
+E   AssertionError: Unreadable ledger was overwritten by an empty-ledger fallback
+E   assert '{\n  "items"...    }\n  ]\n}' == '{"items": ['
+E     
+E     + {
+E     - {"items": [
+E     ? ^
+E     +   "items": [
+E     ? ^^          +
+E     +     {...
+E     
+E     ...Full output truncated (20 lines hidden), use '-vv' to show
+_________________ test_a04_interrupted_checkpoint_is_resumed __________________
+C:\Users\MDP\Documents\ChatGPT\ailab\docs\audits\2026-09-06\audit_reproductions.py:124: in test_a04_interrupted_checkpoint_is_resumed
+    assert second.step_store.get_step("iter:1:checkpoint_audit") is not None, "Run completed while interrupted checkpoint audit remained missing"
+E   AssertionError: Run completed while interrupted checkpoint audit remained missing
+E   assert None is not None
+E    +  where None = get_step('iter:1:checkpoint_audit')
+E    +    where get_step = <lab.step_store.StepStore object at 0x0000013709DFC910>.get_step
+E    +      where <lab.step_store.StepStore object at 0x0000013709DFC910> = <lab.theorem_engine.TheoremResearchLab object at 0x0000013709DFC7D0>.step_store
+_____________ test_a05_structured_reasoning_survives_interruption _____________
+docs\audits\2026-09-06\audit_reproductions.py:154: in test_a05_structured_reasoning_survives_interruption
+    assert partial and partial.get("reasoning_details") == [detail], "Only structured reasoning arrived, and all of it was lost"
+E   AssertionError: Only structured reasoning arrived, and all of it was lost
+E   assert (None)
+_____________ test_a06_tool_cache_invalidated_when_script_changes _____________
+docs\audits\2026-09-06\audit_reproductions.py:171: in test_a06_tool_cache_invalidated_when_script_changes
+    assert lab._tool(request, "iter:1:tool").output == "version-two", "Changed checker reused old evidence"
+E   AssertionError: Changed checker reused old evidence
+E   assert 'version-one' == 'version-two'
+E     
+E     - version-two
+E     ?         --
+E     + version-one
+E     ?          ++
+______ test_a07_large_valid_weights_do_not_create_false_counterexamples _______
+docs\audits\2026-09-06\audit_reproductions.py:179: in test_a07_large_valid_weights_do_not_create_false_counterexamples
+    assert result.ok, f"Correct single-edge circuit rejected: {result.metadata}"
+E   AssertionError: Correct single-edge circuit rejected: {'status': 'COUNTEREXAMPLE', 'n': 2, 'weights': {'1-2': 1000000000000000001}, 'expected': 1000000000000000000, 'actual': 1000000000000000001, 'cases_checked': 1, 'gate_count': 0, 'edge_gate_count': 1, 'total_gate_count': 1, 'functional_equality_only': True, 'warning': 'Finite-grid functional equality only; this is not a formal monomial-level provenance equality proof.'}
+E   assert False
+E    +  where False = ToolResult(ok=False, tool='tropical_grid', output='{"status": "COUNTEREXAMPLE", "n": 2, "weights": {"1-2": 10000000000...ue, 'warning': 'Finite-grid functional equality only; this is not a formal monomial-level provenance equality proof.'}).ok
+_____________ test_a08_raw_log_tail_preserves_split_json_records ______________
+docs\audits\2026-09-06\audit_reproductions.py:196: in test_a08_raw_log_tail_preserves_split_json_records
+    assert events == [{"type": "agent_start", "agent": "test"}], events
+E   AssertionError: [{'raw': '{"type":"agent_', 'type': 'INVALID_JSON'}, {'raw': 'start","agent":"test"}', 'type': 'INVALID_JSON'}]
+E   assert [{'raw': '{"t...NVALID_JSON'}] == [{'agent': 't...agent_start'}]
+E     
+E     At index 0 diff: {'type': 'INVALID_JSON', 'raw': '{"type":"agent_'} != {'type': 'agent_start', 'agent': 'test'}
+E     Left contains one more item: {'raw': 'start","agent":"test"}', 'type': 'INVALID_JSON'}
+E     Use -v to get more diff
+=========================== short test summary info ===========================
+FAILED docs/audits/2026-09-06/audit_reproductions.py::test_a01_lean_binds_actual_theorem_type
+FAILED docs/audits/2026-09-06/audit_reproductions.py::test_a02_stale_lock_reclamation_preserves_new_owner
+FAILED docs/audits/2026-09-06/audit_reproductions.py::test_a03_corrupt_ledger_is_not_silently_replaced
+FAILED docs/audits/2026-09-06/audit_reproductions.py::test_a04_interrupted_checkpoint_is_resumed
+FAILED docs/audits/2026-09-06/audit_reproductions.py::test_a05_structured_reasoning_survives_interruption
+FAILED docs/audits/2026-09-06/audit_reproductions.py::test_a06_tool_cache_invalidated_when_script_changes
+FAILED docs/audits/2026-09-06/audit_reproductions.py::test_a07_large_valid_weights_do_not_create_false_counterexamples
+FAILED docs/audits/2026-09-06/audit_reproductions.py::test_a08_raw_log_tail_preserves_split_json_records
+8 failed in 2.84s

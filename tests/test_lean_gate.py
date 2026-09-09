@@ -76,6 +76,8 @@ def _formal_result(claim_hash: str) -> ToolResult:
             "source_clean": True,
             "axioms_verified": True,
             "formal_binding_verified": True,
+            "theorem_statement_verified": True,
+            "formal_verification_version": 2,
             "item_id": "C-test",
             "iteration": 1,
             "claim_hash": claim_hash,

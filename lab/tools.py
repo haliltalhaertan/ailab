@@ -15,7 +15,7 @@ from itertools import product
 from pathlib import Path
 from typing import Any
 
-from lab.integrity import sha256_file
+from lab.integrity import FORMAL_VERIFICATION_VERSION, sha256_file
 
 
 @dataclass
@@ -388,10 +388,7 @@ class LeanTool:
         return statement
 
     def _accepted_types(self, binders: str, conclusion: str) -> set[str]:
-        accepted = {self._compact(conclusion)}
-        if binders:
-            accepted.add(self._compact(f"∀ {binders}, {conclusion}"))
-        return accepted
+        return {self._compact(f"∀ {binders}, {conclusion}" if binders else conclusion)}
 
     def _guard_source(self, source: str, theorem_name: str, theorem_type: str) -> tuple[bool, str]:
         clean = self._strip_comments(source)
@@ -413,7 +410,7 @@ class LeanTool:
             return (
                 False,
                 "binding theorem_type declared theorem'ün kendi tipiyle eşleşmiyor "
-                "(yalnız ': <sonuç>' kısmı ya da '∀ <binders>, <sonuç>' kabul edilir; "
+                "(tüm parametre ve varsayımlar '∀ <binders>, <sonuç>' içinde bulunmalıdır; "
                 "kaynağın başka yerinde geçen bir ifade binding sayılmaz).",
             )
         return True, ""
@@ -511,10 +508,9 @@ class LeanTool:
         return bool(re.search(r"\baxiom\b", lowered))
 
     @staticmethod
-    def _statement_probe(theorem_name: str, binders: str, conclusion: str) -> str:
+    def _statement_probe(theorem_name: str, statement: str) -> str:
         """Lean snippet that fails to elaborate unless the declaration really has the bound statement."""
 
-        statement = f"∀ {binders}, {conclusion}" if binders.strip() else conclusion
         return f"example : ({statement}) := @{theorem_name}"
 
     def _axioms_ok(
@@ -522,18 +518,17 @@ class LeanTool:
         source: str,
         theorem_name: str,
         *,
-        binders: str = "",
-        conclusion: str = "",
+        expected_type: str,
     ) -> tuple[bool, str, list[str]]:
         """Compile ``source`` plus a statement probe and ``#print axioms``.
 
-        The probe re-elaborates the parsed statement against the actual constant
+        The probe re-elaborates the expected statement against the actual constant
         so a source-level parse cannot be fooled into binding an unrelated type.
         """
 
         audit = self.candidates / f".axioms-{uuid.uuid4().hex}.lean"
         try:
-            probe = f"{self._statement_probe(theorem_name, binders, conclusion)}\n" if conclusion.strip() else ""
+            probe = f"{self._statement_probe(theorem_name, expected_type)}\n"
             audit.write_text(source.rstrip() + f"\n\n{probe}#print axioms {theorem_name}\n", encoding="utf-8")
             proc, _ = self._run_lean(audit)
             combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
@@ -636,8 +631,7 @@ class LeanTool:
             axioms_ok, axioms_output, axioms = self._axioms_ok(
                 source,
                 expected_theorem_name,
-                binders=binders,
-                conclusion=conclusion,
+                expected_type=expected_theorem_type,
             )
             metadata["axioms"] = axioms
             metadata["axioms_verified"] = axioms_ok
@@ -645,6 +639,7 @@ class LeanTool:
             if not axioms_ok:
                 return ToolResult(False, "lean", error=f"Statement/axiom audit failed: {axioms_output}", metadata=metadata)
             metadata["formal_verified"] = True
+            metadata["formal_verification_version"] = FORMAL_VERIFICATION_VERSION
             return ToolResult(True, "lean", output=proc.stdout.strip(), error=proc.stderr.strip(), metadata=metadata)
         except subprocess.TimeoutExpired as exc:
             return ToolResult(False, "lean", error=f"timeout ({self.timeout_s}s): {exc}", metadata=metadata)

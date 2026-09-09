@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from lab.integrity import sha256_file
+from lab.integrity import formal_verification_current, sha256_file
 
 if TYPE_CHECKING:
     from lab.research_contract import ResearchContract
@@ -153,7 +153,7 @@ def _classify(result: "ToolResult") -> tuple[str, bool, dict[str, Any] | None, d
     tool = result.tool
     metadata = dict(result.metadata or {})
     if tool == "lean":
-        if result.ok and metadata.get("formal_verified") is True:
+        if result.ok and metadata.get("formal_verified") is True and formal_verification_current(metadata):
             return "FORMAL_PROOF", False, None, metadata
         return "INCONCLUSIVE", False, None, metadata
     if tool == "z3":
