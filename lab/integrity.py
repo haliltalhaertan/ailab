@@ -6,10 +6,20 @@ import json
 import os
 import secrets
 import socket
+import sys
 import time
 import uuid
 from pathlib import Path
 from typing import Any
+
+FORMAL_VERIFICATION_VERSION = 2
+
+
+def formal_verification_current(metadata: dict[str, Any]) -> bool:
+    return (
+        metadata.get("formal_verification_version") == FORMAL_VERIFICATION_VERSION
+        and metadata.get("theorem_statement_verified") is True
+    )
 
 
 def canonical_json(value: Any) -> str:
@@ -184,7 +194,11 @@ class ProjectBusyError(RuntimeError):
 
 
 class ProjectRunLock:
-    """Cross-process project lock backed by atomic O_EXCL file creation."""
+    """Lifetime OS lock plus readable ownership metadata.
+
+    The persistent guard file must never be unlinked: all contenders must lock
+    the same inode, including during stale metadata reclamation.
+    """
 
     def __init__(self, project_root: str | Path):
         self.project_root = Path(project_root)
@@ -192,6 +206,7 @@ class ProjectRunLock:
         self.token = uuid.uuid4().hex
         self.acquired = False
         self._depth = 0
+        self._guard_handle: Any = None
 
     def _payload(self) -> dict[str, Any]:
         return {
@@ -212,36 +227,71 @@ class ProjectRunLock:
             pid = 0
         return bool(host and host == socket.gethostname() and pid and not process_alive(pid))
 
+    def _acquire_guard(self) -> None:
+        self.project_root.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self.project_root / ".run.guard", os.O_RDWR | os.O_CREAT, 0o600)
+        handle = os.fdopen(fd, "r+b", buffering=0)
+        try:
+            if os.fstat(fd).st_size == 0:
+                handle.write(b"0")
+            handle.seek(0)
+            if sys.platform == "win32":
+                import msvcrt
+
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            handle.close()
+            raise ProjectBusyError("Proje başka bir process tarafından kilitlenmiş.") from exc
+        self._guard_handle = handle
+
+    def _release_guard(self) -> None:
+        if self._guard_handle is not None:
+            # Closing the descriptor releases the OS lock, also after a crash.
+            self._guard_handle.close()
+            self._guard_handle = None
+
     def acquire(self) -> "ProjectRunLock":
         if self.acquired:
             self._depth += 1
             return self
-        self.project_root.mkdir(parents=True, exist_ok=True)
-        for _ in range(2):
-            try:
-                fd = os.open(str(self.path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            except FileExistsError:
+        self._acquire_guard()
+        try:
+            if self.path.exists():
                 raw = self._read()
-                if self._stale(raw):
-                    try:
-                        self.path.unlink()
-                    except FileNotFoundError:
-                        pass
-                    continue
-                owner = f"pid={raw.get('pid', '?')} host={raw.get('host', '?')}"
-                raise ProjectBusyError(f"Bu proje başka bir process tarafından çalıştırılıyor ({owner}).")
-            else:
-                with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                    json.dump(self._payload(), handle, ensure_ascii=False, indent=2)
-                    handle.flush()
-                    try:
-                        os.fsync(handle.fileno())
-                    except OSError:
-                        pass
-                self.acquired = True
-                self._depth = 1
-                return self
-        raise ProjectBusyError("Proje run kilidi alınamadı.")
+                if not self._reclaim_stale(raw):
+                    raise ProjectBusyError("Bu proje başka bir process tarafından çalıştırılıyor.")
+            fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(self._payload(), handle, ensure_ascii=False, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            self.acquired = True
+            self._depth = 1
+            return self
+        except BaseException:
+            self._release_guard()
+            raise
+
+    def _reclaim_stale(self, observed: dict[str, Any]) -> bool:
+        temporary_guard = self._guard_handle is None
+        if temporary_guard:
+            try:
+                self._acquire_guard()
+            except ProjectBusyError:
+                return False
+        try:
+            current = self._read()
+            if current != observed or not self._stale(current):
+                return False
+            self.path.unlink(missing_ok=True)
+            return True
+        finally:
+            if temporary_guard:
+                self._release_guard()
 
     def release(self) -> None:
         if not self.acquired:
@@ -249,14 +299,14 @@ class ProjectRunLock:
         if self._depth > 1:
             self._depth -= 1
             return
-        raw = self._read()
-        if str(raw.get("token") or "") == self.token:
-            try:
-                self.path.unlink()
-            except FileNotFoundError:
-                pass
-        self.acquired = False
-        self._depth = 0
+        try:
+            raw = self._read()
+            if str(raw.get("token") or "") == self.token:
+                self.path.unlink(missing_ok=True)
+        finally:
+            self.acquired = False
+            self._depth = 0
+            self._release_guard()
 
     def __enter__(self) -> "ProjectRunLock":
         return self.acquire()

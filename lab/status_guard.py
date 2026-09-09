@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from lab.evidence import Evidence, evidence_from_tool_result, validate_evidence_binding
+from lab.integrity import formal_verification_current
 from lab.research_contract import ResearchContract
 from lab.tools import ToolResult
 
@@ -28,6 +29,7 @@ def choose_status(
     expected_claim_hash: str | None = None,
     evidence: Evidence | None = None,
     contract: ResearchContract | None = None,
+    expected_claim_spec_hash: str | None = None,
 ) -> GuardDecision:
     """Return the strongest status justified by machine-observable evidence."""
 
@@ -50,6 +52,7 @@ def choose_status(
         and tool_result.ok
         and tool_result.tool == "lean"
         and tmeta.get("formal_verified") is True
+        and formal_verification_current(tmeta)
         and tmeta.get("source_clean") is True
         and tmeta.get("axioms_verified") is True
         and tmeta.get("formal_binding_verified") is True
@@ -58,9 +61,17 @@ def choose_status(
         and (expected_iteration is None or int(tmeta.get("iteration", -1)) == int(expected_iteration))
     )
     evidence_kind = bound_evidence.kind if bound_evidence is not None else "INCONCLUSIVE"
+    replay_bound = bool(
+        tool_result and tool_result.tool == "claim_check" and tmeta.get("claim_replayed") is True
+        and tmeta.get("checker_version") == 1 and expected_claim_spec_hash
+        and tmeta.get("claim_spec_hash") == expected_claim_spec_hash and claim_hash_matches
+        and tmeta.get("item_id") == expected_item_id and tmeta.get("iteration") == expected_iteration
+    )
     computation_ok = bool(
         bound_evidence
         and bound_evidence.ok
+        and bound_evidence.source_origin != "GENERATED"
+        and (bound_evidence.source != "claim_check" or replay_bound)
         and evidence_kind
         in {
             "EXACT_PASS",
@@ -72,6 +83,7 @@ def choose_status(
     deterministic_counterexample = bool(
         bound_evidence
         and bound_evidence.ok
+        and (bound_evidence.source != "claim_check" or replay_bound)
         and evidence_kind == "DETERMINISTIC_COUNTEREXAMPLE"
         and bound_evidence.witness is not None
     )
@@ -82,6 +94,8 @@ def choose_status(
     llm_refutation_candidate = bool(llm_counterexample) and not deterministic_counterexample
 
     metadata = {
+        "claim_replayed": replay_bound,
+        "generated_code_execution_only": bool(bound_evidence and bound_evidence.source_origin == "GENERATED"),
         "formal_verified": formal_verified,
         "formal_binding_verified": bool(tmeta.get("formal_binding_verified")),
         "axioms_verified": bool(tmeta.get("axioms_verified")),
@@ -108,6 +122,13 @@ def choose_status(
     if deterministic_counterexample:
         return GuardDecision(requested, "FAIL", "Deterministically verified counterexample evidence forces FAIL.", requested != "FAIL", metadata)
 
+    if tool_result and tool_result.tool == "claim_check":
+        # A model cannot override a failed replay or a passing finite window.
+        if not replay_bound:
+            return GuardDecision(requested, "OPEN", "Frozen-claim replay missing, rejected or mismatched.", requested != "OPEN", metadata)
+        if computation_ok:
+            return GuardDecision(requested, "COMPUTATION_PASS", "Exact replay passed only on the recorded finite scope; no proof or novelty claim.", requested != "COMPUTATION_PASS", metadata)
+
     if llm_refutation_candidate:
         return GuardDecision(
             requested,
@@ -133,6 +154,9 @@ def choose_status(
             True,
             metadata,
         )
+
+    if tool_result and tool_result.tool == "code_experiment" and requested == "PROOF_CANDIDATE":
+        return GuardDecision(requested, "OPEN", "Generated experiment execution cannot establish a proof candidate; use reviewed evidence.", True, metadata)
 
     if requested == "PROOF_CANDIDATE":
         if verifier_verdict == "PASS" and critic_verdict != "KILL":

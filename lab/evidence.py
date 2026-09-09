@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from lab.integrity import sha256_file
+from lab.integrity import formal_verification_current, sha256_file
 
 if TYPE_CHECKING:
     from lab.research_contract import ResearchContract
@@ -141,6 +141,8 @@ def _source_origin(tool: str) -> str:
 
 
 def _tool_sha(result: "ToolResult") -> str:
+    if result.tool == "claim_check":
+        return _module_sha("claim_check.py")
     if result.tool == "script":
         value = str(result.metadata.get("script_sha256") or "")
         return value or _module_sha("tools.py")
@@ -152,8 +154,14 @@ def _tool_sha(result: "ToolResult") -> str:
 def _classify(result: "ToolResult") -> tuple[str, bool, dict[str, Any] | None, dict[str, Any]]:
     tool = result.tool
     metadata = dict(result.metadata or {})
+    if tool == "claim_check":
+        if result.ok and metadata.get("claim_replayed") is True and metadata.get("checker_version") == 1:
+            kind = str(metadata.get("kind") or "INCONCLUSIVE")
+            if kind in {"EXACT_PASS", "DETERMINISTIC_COUNTEREXAMPLE"}:
+                return kind, bool(metadata.get("exhaustive")), metadata.get("witness"), metadata
+        return "INCONCLUSIVE", False, None, metadata
     if tool == "lean":
-        if result.ok and metadata.get("formal_verified") is True:
+        if result.ok and metadata.get("formal_verified") is True and formal_verification_current(metadata):
             return "FORMAL_PROOF", False, None, metadata
         return "INCONCLUSIVE", False, None, metadata
     if tool == "z3":
@@ -247,6 +255,14 @@ def evidence_from_tool_result(
                 if not isinstance(covered, dict):
                     covered = metadata.get("covered") if isinstance(metadata.get("covered"), dict) else None
                 resolution_scope = contract.resolution_scope(target_id, covered)
+
+    if result.tool == "claim_check":
+        # Prose equality/target_id supplied by a model cannot establish that an
+        # operational predicate formalizes a broader frozen research target.
+        target_id = None
+        target_hash = None
+        resolution_scope = "PARTIAL"
+        metadata["operational_claim_only"] = True
 
     payload = metadata.get("evidence_payload")
     termination_reason = str(payload.get("termination_reason") or "") if isinstance(payload, dict) else ""

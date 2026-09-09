@@ -348,6 +348,25 @@ def _run_orchestrator(method: str, request: dict[str, Any], trace: Trace, agent_
 
 
 def run_project(project_id: str, *, agent_factory: AgentFactory = _agent) -> int:
+    # Directed jobs have a separate frozen contract and must never load .env.
+    # Dispatch before constructing legacy project state or research agents.
+    directed_request_path = Path('research_state') / project_id / 'worker_request.json'
+    early_request = read_json_tolerant(directed_request_path, {})
+    if isinstance(early_request, dict) and early_request.get('experiment_method') == 'directed_task':
+        from lab.directed import resume_directed_task, run_directed_task
+        from lab.directed_gate import load_contract
+
+        contract, _ = load_contract(early_request['contract_path'])
+        if contract.project_id != project_id or early_request.get('project_id') != project_id:
+            raise ValueError('Directed request project identity mismatch')
+        if early_request.get('resume_run_id'):
+            result = resume_directed_task(project_id, early_request['resume_run_id'], background=False)
+        else:
+            result = run_directed_task(
+                early_request['contract_path'], input_root=early_request.get('input_root'),
+                parent_repo=early_request.get('parent_repo'), background=False,
+            )
+        return 0 if result.status in {'COMPLETED', 'COMPLETED_WITH_OPEN_CLAIMS', 'REFUTED', 'STOPPED'} else 2
     load_dotenv()
     pm = ProjectManager()
     root = pm.project_root(project_id)

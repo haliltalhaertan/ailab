@@ -230,6 +230,8 @@ def test_proven_ledger_record_is_sealed_and_live_sha_rechecked(tmp_path, monkeyp
     metadata = {
         "formal_verified": True,
         "formal_binding_verified": True,
+        "theorem_statement_verified": True,
+        "formal_verification_version": 2,
         "axioms_verified": True,
         "source_clean": True,
         "item_id": item.id,

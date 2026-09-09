@@ -1,0 +1,219 @@
+{
+  "schema_version": "1.0",
+  "task_id": "small-b-native-pilot-v1",
+  "project_id": "directed-native-pilot",
+  "parent_task_id": "principal-small-b-pilot",
+  "parent_state_commit": "db2d862fcdbd06c3dfac6bdac191bf9b7017717a",
+  "created_at": "2026-09-07T13:25:00Z",
+  "created_by": "principal_researcher",
+  "mode": "directed_task",
+  "objective": "Verify the supplied elementary small-b identities using two distinct deterministic algebra algorithms and adversarial boundary checks; audit the resulting certificates. No autonomous research continuation.",
+  "task_type": "mixed",
+  "primary_claim": {
+    "claim_id": "PILOT-XUB",
+    "statement": "The small-b identities imply XUB",
+    "status_at_start": "OPEN",
+    "quantifiers": "No XUB implication is established by this bounded pilot",
+    "definitions": [
+      "log(3)/log(2)",
+      "log(3)/log(2)-1",
+      "q(x)=exp(2*pi*i*2^x)",
+      "z=2^(x-beta)>0",
+      "A_b(x)=q(x)/(b+1)*sum(q(x+u-beta),u=0..b)",
+      "x real; b integer >=0; pilot b in {0,1,2,3,4}"
+    ]
+  },
+  "scope": {
+    "included": [
+      "Exact supplied A_b identities; coefficient verification b=0..4",
+      "Explicit elementary proofs, equality cases, no-uniform-gap boundary",
+      "DAG execution, provenance and delivery package verification"
+    ],
+    "excluded": [
+      "XUB",
+      "uniform white occupation",
+      "O(1/m) crossing",
+      "E6-N2",
+      "E7-B4",
+      "nonzero asymptotic profile",
+      "polynomial lower bound",
+      "Collatz conjecture",
+      "Independent model discovery or novelty assessment"
+    ]
+  },
+  "inputs": [
+    {
+      "path": "derive_a.json",
+      "sha256": "533d5bd147502429fa7db1d754f36cf2265759effe5d7aff96c13c5c50e99047",
+      "required": true,
+      "mutable": false
+    },
+    {
+      "path": "derive_b.json",
+      "sha256": "a9dd866b9155e81254b1e3ac727304db575c55bb673f2148c500b1a70379d194",
+      "required": true,
+      "mutable": false
+    },
+    {
+      "path": "boundary.json",
+      "sha256": "68fa68199c186eacf147e698dd87d46f1cc3e56d8ec17561722ac97369875884",
+      "required": true,
+      "mutable": false
+    },
+    {
+      "path": "audit.json",
+      "sha256": "a6802eeabf0c02aee4177a5b23c989840f4cec87a74431054fa961e54603554f",
+      "required": true,
+      "mutable": false
+    }
+  ],
+  "input_manifests": [],
+  "allowed_tools": [
+    "symbolic_algebra"
+  ],
+  "forbidden_tools": [
+    "model",
+    "network",
+    "host_generated_code_execution",
+    "canonical_repository_write"
+  ],
+  "allowed_methods": [
+    "reviewed_elementary_algebra",
+    "exact_integer_polynomial_coefficients"
+  ],
+  "forbidden_methods": [
+    "silent_scope_expansion",
+    "numerical_evidence_as_proof",
+    "autonomous_continuation"
+  ],
+  "agent_plan": {
+    "strategy": "dag",
+    "max_parallel_workers": 3,
+    "lanes": [
+      {
+        "lane_id": "derive_a",
+        "role": "ExactProducer",
+        "independence_group": "derive_a",
+        "can_read_other_lane_outputs": false,
+        "depends_on": [],
+        "visible_inputs": [
+          "task_contract",
+          "definitions"
+        ],
+        "hidden_inputs": [
+          "producer_hidden_reasoning",
+          "producer_system_prompt",
+          "other_auditor_output"
+        ],
+        "input_paths": [
+          "derive_a.json"
+        ],
+        "execution": "symbolic_algebra",
+        "source_input": "derive_a.json",
+        "max_wall_seconds": 30
+      },
+      {
+        "lane_id": "derive_b",
+        "role": "ExactProducer",
+        "independence_group": "derive_b",
+        "can_read_other_lane_outputs": false,
+        "depends_on": [],
+        "visible_inputs": [
+          "task_contract",
+          "definitions"
+        ],
+        "hidden_inputs": [
+          "producer_hidden_reasoning",
+          "producer_system_prompt",
+          "other_auditor_output"
+        ],
+        "input_paths": [
+          "derive_b.json"
+        ],
+        "execution": "symbolic_algebra",
+        "source_input": "derive_b.json",
+        "max_wall_seconds": 30
+      },
+      {
+        "lane_id": "boundary",
+        "role": "AdversarialChecker",
+        "independence_group": "boundary",
+        "can_read_other_lane_outputs": false,
+        "depends_on": [],
+        "visible_inputs": [
+          "task_contract",
+          "definitions"
+        ],
+        "hidden_inputs": [
+          "producer_hidden_reasoning",
+          "producer_system_prompt",
+          "other_auditor_output"
+        ],
+        "input_paths": [
+          "boundary.json"
+        ],
+        "execution": "symbolic_algebra",
+        "source_input": "boundary.json",
+        "max_wall_seconds": 30
+      },
+      {
+        "lane_id": "audit",
+        "role": "FinalAuditor",
+        "independence_group": "audit",
+        "can_read_other_lane_outputs": true,
+        "depends_on": [
+          "derive_a",
+          "derive_b",
+          "boundary"
+        ],
+        "visible_inputs": [
+          "task_contract",
+          "definitions",
+          "selected_artifacts"
+        ],
+        "hidden_inputs": [
+          "producer_hidden_reasoning",
+          "producer_system_prompt",
+          "other_auditor_output"
+        ],
+        "input_paths": [
+          "audit.json"
+        ],
+        "execution": "symbolic_algebra",
+        "source_input": "audit.json",
+        "max_wall_seconds": 30
+      }
+    ]
+  },
+  "budget": {
+    "max_total_llm_calls": 1,
+    "max_calls_per_lane": 1,
+    "max_total_tokens": 1,
+    "max_tokens_per_lane": 1,
+    "max_total_cost_usd": 0.001,
+    "max_wall_seconds": 120,
+    "max_parallel_workers": 3,
+    "max_retries_per_call": 0
+  },
+  "stop_rules": [
+    "INPUT_INTEGRITY_FAILURE",
+    "USER_STOP",
+    "BUDGET_EXHAUSTED",
+    "RIGOROUS_REFUTATION"
+  ],
+  "required_outputs": [
+    "CAPABILITY_REPORT.json",
+    "MASTER_FINDINGS.md",
+    "CLAIM_LEDGER.json",
+    "RUN_SUMMARY.json",
+    "FINAL_SHA256SUMS.txt",
+    "VERIFY_OUTPUT.txt"
+  ],
+  "result_policy": {
+    "allow_new_task_creation": false,
+    "allow_scope_expansion": false,
+    "allow_budget_expansion": false,
+    "allow_canonical_repository_write": false,
+    "unexpected_result_action": "RECORD_AS_ESCALATION_CANDIDATE"
+  }
+}

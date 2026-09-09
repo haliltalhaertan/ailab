@@ -54,7 +54,7 @@ class _FakeOpenAI:
         self.chat = SimpleNamespace(completions=_FakeCompletions())
 
 
-def test_reasoning_details_are_not_duplicated_into_stream_callback():
+def test_reasoning_details_are_forwarded_on_their_own_channel():
     client = LLMClient.__new__(LLMClient)
     client._client = _FakeOpenAI()
     seen = []
@@ -77,7 +77,18 @@ def test_reasoning_details_are_not_duplicated_into_stream_callback():
         lambda channel, delta: seen.append((channel, delta)),
     )
 
-    assert [channel for channel, _ in seen] == ["reasoning", "content", "reasoning"]
+    assert [channel for channel, _ in seen] == [
+        "reasoning",
+        "reasoning_details",
+        "content",
+        "reasoning",
+        "reasoning_details",
+    ]
+    assert [delta for channel, delta in seen if channel == "reasoning_details"] == [
+        [{"type": "detail", "data": "d1"}],
+        [{"type": "detail", "data": "d2"}],
+    ]
+    assert [delta for channel, delta in seen if channel != "reasoning_details"] == ["r1", "answer", "r2"]
     assert response.provider_reasoning == "r1r2"
     assert response.content == "answer"
     assert response.reasoning_details == [

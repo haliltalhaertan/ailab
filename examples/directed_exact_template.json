@@ -1,0 +1,28 @@
+{
+  "schema_version": "1.0",
+  "task_id": "even-product-demo",
+  "project_id": "directed-demo",
+  "parent_task_id": "principal-demo",
+  "parent_state_commit": "0000000000000000000000000000000000000000",
+  "created_at": "2026-09-07T00:00:00+00:00",
+  "created_by": "principal-researcher",
+  "mode": "directed_task",
+  "objective": "Check the frozen finite even-product condition in two separate lanes.",
+  "task_type": "exact_computation",
+  "primary_claim": {"claim_id": "EVEN-PRODUCT", "statement": "n*(n+1) is even for integers 1 through 200", "status_at_start": "OPEN", "quantifiers": "Every integer n in [1,200]", "definitions": ["n is an integer; even means divisible by 2"]},
+  "scope": {"included": ["Integers 1 through 200"], "excluded": ["Claims about untested integers", "Novelty claims"]},
+  "inputs": [],
+  "input_manifests": [],
+  "allowed_tools": ["claim_check"],
+  "forbidden_tools": ["network", "canonical_write"],
+  "allowed_methods": ["bounded exact arithmetic"],
+  "forbidden_methods": ["autonomous task creation", "scope expansion"],
+  "agent_plan": {"strategy": "parallel_independent", "max_parallel_workers": 2, "lanes": [
+    {"lane_id": "first-half", "role": "ExactComputer", "independence_group": "A", "execution": "claim_check", "claim_spec": {"variables": {"n": {"min": 1, "max": 100}}, "assumptions": [], "predicate": "n*(n+1)%2 == 0"}},
+    {"lane_id": "second-half", "role": "ExactComputer", "independence_group": "B", "execution": "claim_check", "claim_spec": {"variables": {"n": {"min": 101, "max": 200}}, "assumptions": [], "predicate": "n*(n+1)%2 == 0"}}
+  ]},
+  "budget": {"max_total_llm_calls": 2, "max_calls_per_lane": 1, "max_total_tokens": 2048, "max_tokens_per_lane": 1024, "max_total_cost_usd": 0.01, "max_wall_seconds": 120, "max_parallel_workers": 2, "max_retries_per_call": 0},
+  "stop_rules": ["BUDGET_EXHAUSTED", "INPUT_INTEGRITY_FAILURE", "USER_STOP", "RIGOROUS_REFUTATION"],
+  "required_outputs": ["CLAIM_LEDGER.json", "MASTER_FINDINGS.md"],
+  "result_policy": {"allow_new_task_creation": false, "allow_scope_expansion": false, "allow_budget_expansion": false, "allow_canonical_repository_write": false, "unexpected_result_action": "RECORD_AS_ESCALATION_CANDIDATE"}
+}

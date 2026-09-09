@@ -196,3 +196,22 @@ def build_request_from_ui(
             }
         )
     return payload
+
+
+def build_directed_request(
+    *, project_id: str, contract_path: str | Path, input_root: str | Path,
+    parent_repo: str | Path, resume_run_id: str | None = None,
+) -> dict[str, Any]:
+    """Prepare a directed request without loading credentials or creating agents."""
+    from lab.directed_gate import load_contract
+
+    path = Path(contract_path).resolve()
+    contract, _ = load_contract(path)
+    if contract.project_id != project_id:
+        raise ValueError('Directed contract project identity mismatch')
+    return {
+        'request_version': 2, 'project_id': project_id, 'experiment_method': 'directed_task',
+        'contract_path': str(path), 'input_root': str(Path(input_root).resolve()),
+        'parent_repo': str(Path(parent_repo).resolve()), 'resume_run_id': resume_run_id,
+        'created_at': _now(),
+    }

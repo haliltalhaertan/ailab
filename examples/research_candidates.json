@@ -1,0 +1,9 @@
+{
+  "suite_id": "research-assistant-small-v1",
+  "candidates": [
+    {"candidate_id": "inverse-a", "task_id": "modular-inverse", "answer": {"value": 1}, "model": "offline-example"},
+    {"candidate_id": "inverse-b", "parent_id": "inverse-a", "task_id": "modular-inverse", "answer": {"value": 38}, "model": "offline-example", "reasoning_effort": "low"},
+    {"candidate_id": "inverse-c", "task_id": "modular-inverse", "answer": {"value": 38}, "model": "offline-example-2"},
+    {"candidate_id": "audit-a", "task_id": "division-audit", "answer": {"analysis": "Cancellation divides by a-b=0; cancellation requires a-b != 0."}, "model": "offline-example"}
+  ]
+}

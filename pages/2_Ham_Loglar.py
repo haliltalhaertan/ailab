@@ -6,7 +6,7 @@ from pathlib import Path
 
 import streamlit as st
 
-from lab.ui_model import read_run_index
+from lab.ui_model import consume_log_chunk, read_run_index
 
 RUNS_DIR = Path("runs")
 st.set_page_config(page_title="Ham Loglar", layout="wide")
@@ -50,7 +50,8 @@ def tail_file(path: Path, state_key: str) -> tuple[str, list[dict]]:
     if not actual.exists():
         return state["raw"], state["events"]
 
-    if actual.suffix == ".gz":
+    archived = actual.suffix == ".gz"
+    if archived:
         # Completed stream archives are immutable. Decompress once per selected
         # run and keep the decoded events in session_state rather than inflating
         # a multi-megabyte gzip file on every one-second fragment refresh.
@@ -64,21 +65,16 @@ def tail_file(path: Path, state_key: str) -> tuple[str, list[dict]]:
     else:
         size = actual.stat().st_size
         if int(state.get("offset", 0)) > size:
-            state.update({"offset": 0, "raw": "", "events": []})
+            state.update({"offset": 0, "raw": "", "events": [], "pending": b""})
         with actual.open("rb") as handle:
             handle.seek(int(state.get("offset", 0)))
             chunk = handle.read()
             state["offset"] = handle.tell()
 
-    if chunk:
-        text = chunk.decode("utf-8", errors="replace")
-        state["raw"] += text
-        for line in text.splitlines():
-            try:
-                value = json.loads(line)
-            except json.JSONDecodeError:
-                value = {"type": "INVALID_JSON", "raw": line}
-            state["events"].append(value if isinstance(value, dict) else {"raw": line})
+    # Only complete newline-terminated records are decoded; a record the worker
+    # is still writing waits for the next refresh instead of becoming two
+    # INVALID_JSON halves.
+    consume_log_chunk(state, chunk, archived=archived)
     return state["raw"], state["events"]
 
 

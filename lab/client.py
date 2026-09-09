@@ -437,6 +437,11 @@ class LLMClient:
                     reasoning_details.extend(detail_delta)
                 else:
                     reasoning_details.append(detail_delta)
+                # Structured reasoning is forwarded on its own channel so the
+                # engine can persist it for partial-resume/cancel handling even
+                # when the stream dies before a final response object exists.
+                # UI text rendering only consumes ``reasoning``/``content``.
+                stream_callback("reasoning_details", detail_delta)
 
         latency = time.perf_counter() - start
         prompt_tokens, completion_tokens, reasoning_tokens, cached_tokens, cost_usd = _usage_values(final_usage)

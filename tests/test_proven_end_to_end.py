@@ -5,6 +5,8 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from lab import ResearchState, TheoremResearchLab, Trace
 from lab.client import LLMResponse
 from lab.integrity import atomic_write_json, content_fingerprint, sha256_file
@@ -121,6 +123,30 @@ def test_run_can_reach_proven_with_bound_lean_evidence(tmp_path, monkeypatch):
     assert item.metadata["claim_sha256"] == hashlib.sha256(item.claim.encode("utf-8")).hexdigest()
 
 
+@pytest.mark.parametrize("legacy_seal", [False, True])
+def test_old_statement_evidence_is_downgraded_without_erasing_ledger(tmp_path, monkeypatch, legacy_seal):
+    monkeypatch.setenv("LAB_ALLOW_HOST_LEAN", "1")
+    monkeypatch.setattr(LeanTool, "_run_lean", _clean_lean)
+    state = ResearchState(tmp_path / "state")
+    _run(tmp_path, state, _proposal())
+    raw = json.loads(state.state_path.read_text(encoding="utf-8"))
+    item = next(item for item in raw["items"] if item["status"] == "PROVEN")
+    metadata = item["metadata"]
+    metadata.pop("formal_verification_version")
+    metadata.pop("theorem_statement_verified")
+    if legacy_seal:
+        payload = state._proof_payload(item["id"], item["claim"], metadata)
+        payload.pop("formal_verification_version")
+        payload.pop("theorem_statement_verified")
+        metadata["proof_seal"] = state.signer.sign("proven_evidence:v1", payload)
+    atomic_write_json(state.state_path, raw)
+    before = state.state_path.read_bytes()
+    restored = ResearchState(state.root).get(item["id"])
+    assert restored.status == "PROOF_CANDIDATE"
+    assert "integrity_warning" in restored.metadata
+    assert state.state_path.read_bytes() == before
+
+
 def test_run_rejects_lean_sorry_warning(tmp_path, monkeypatch):
     monkeypatch.setenv("LAB_ALLOW_HOST_LEAN", "1")
 
@@ -191,7 +217,7 @@ def test_run_rejects_cached_formal_evidence_from_different_claim(tmp_path):
         "claim_hash": current_hash,
         "claim_sha256": current_sha,
     }
-    fingerprint = content_fingerprint("bound_formal_tool:v2", enriched)
+    fingerprint = content_fingerprint("bound_formal_tool:v3", enriched)
     lab._cache_put(
         "iter:1:tool",
         {
@@ -204,6 +230,8 @@ def test_run_rejects_cached_formal_evidence_from_different_claim(tmp_path):
                 "error": "",
                 "metadata": {
                     "formal_verified": True,
+                    "theorem_statement_verified": True,
+                    "formal_verification_version": 2,
                     "source_clean": True,
                     "axioms_verified": True,
                     "formal_binding_verified": True,

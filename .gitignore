@@ -11,3 +11,7 @@ research_state/
 baseline_runs/
 reasoning_settings.json
 code_experiment_settings.json
+
+# Local experiment artifacts and principal submissions
+batch_runs/
+directed_submissions/

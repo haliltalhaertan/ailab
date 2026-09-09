@@ -1,0 +1,19 @@
+{
+  "recipe": "small_b_v1",
+  "variant": "derive_b",
+  "definitions": {
+    "alpha": "log(3)/log(2)",
+    "beta": "log(3)/log(2)-1",
+    "q": "q(x)=exp(2*pi*i*2^x)",
+    "z": "z=2^(x-beta)>0",
+    "A": "A_b(x)=q(x)/(b+1)*sum(q(x+u-beta),u=0..b)",
+    "domain": "x real; b integer >=0; pilot b in {0,1,2,3,4}"
+  },
+  "claims": {
+    "PILOT-A0": "|A_0(x)|=1 for every real x",
+    "PILOT-A1": "|A_1(x)|=|cos(pi*2^(x-beta))|",
+    "PILOT-GENERAL-MODULUS": "The stated exact pairwise-cosine modulus identity holds",
+    "PILOT-EQUALITY": "For b>=1, |A_b(x)|=1 iff 2^(x-beta) is an integer",
+    "PILOT-XUB": "The small-b identities imply XUB"
+  }
+}

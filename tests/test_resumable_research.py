@@ -106,7 +106,7 @@ def test_failure_pauses_and_resume_reuses_completed_steps(tmp_path):
     second = make_agents(critic_fail=False)
     result2 = run_once(tmp_path, state, second, "second")
 
-    assert "Final Bağımsız Audit" in result2
+    assert "Final Model Denetimi" in result2
     # proposer/verifier were completed before the crash and must come from cache.
     assert second["proposer"].calls == 0
     assert second["verifier"].calls == 0

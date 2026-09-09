@@ -87,6 +87,13 @@ config_path = project / "run_config.json"
 worker_path = project / "worker.json"
 request_path = project / "worker_request.json"
 stop_path = project / "stop.flag"
+# Directed jobs have their own lane-based monitor, not a theorem iteration cursor.
+if str((project_info.runtime or {}).get("run_id") or "").startswith("directed-") or (project / "directed").is_dir():
+    st.info("Bu projenin baş araştırmacı görevlerini çalışma kolları, reasoning ve sonuçlarıyla Canlı izleme ekranında inceleyebilirsiniz.")
+    st.page_link("pages/8_Canli_Gorevler.py", label="Görevleri ve reasoning kayıtlarını aç", icon=":material/monitor:")
+    if read_json(request_path, {}).get('experiment_method') == 'directed_task' or not config_path.is_file():
+        st.stop()
+    st.caption("Aşağıdaki klasik kontroller yalnız bu projede ayrıca başlatılmış klasik deneyler içindir.")
 store = StepStore(project)
 request = read_json(request_path, {})
 experiment_method = str(request.get("experiment_method") or "theorem_lab")
@@ -102,8 +109,17 @@ with st.expander("Yerel dosya konumları", expanded=False):
     st.code(storage["runs_root"], language=None)
 
 
-@st.fragment(run_every=1.0)
+auto_refresh = st.toggle("Canlı durumu otomatik yenile", value=project_lock_is_live(project))
+st.button("Durumu şimdi yenile")
+refresh_running = project_lock_is_live(project)
+if not refresh_running:
+    st.caption("Çalışan klasik deney yok; otomatik yenileme beklemede.")
+
+
+@st.fragment(run_every=2.0 if auto_refresh and refresh_running else None)
 def live_status() -> None:
+    if refresh_running and not project_lock_is_live(project):
+        st.rerun()
     current_info = pm.get(selected_id)
     runtime = dict(current_info.runtime or {})
     worker = read_json(worker_path, {})
@@ -256,7 +272,16 @@ else:
             "model değişikliği yüzünden yeniden ücretlendirilmez. System prompt / temperature / reasoning effort değişirse "
             "ilgili step fingerprint'i bilinçli olarak değişir."
         )
-        model_ids, model_labels, model_error = model_catalog()
+        browse_models = st.toggle("Model değiştirmek için çevrimiçi kataloğu aç", value=False)
+        model_ids = list(dict.fromkeys([str(raw.get("model") or "") for raw in config.get("agents", {}).values()] + FALLBACK_MODELS))
+        model_ids = [mid for mid in model_ids if mid]
+        model_labels = {mid: mid for mid in model_ids}
+        model_error = None
+        if browse_models:
+            with st.spinner("Model kataloğu yükleniyor…"):
+                model_ids, model_labels, model_error = model_catalog()
+        else:
+            st.caption("Kayıtlı modeller hazır. Katalog açılmadan internet isteği yapılmaz; manuel model kimliği de girebilirsiniz.")
         if model_error:
             st.warning(f"OpenRouter katalog uyarısı: {model_error}")
         edited_agents: dict[str, dict] = {}

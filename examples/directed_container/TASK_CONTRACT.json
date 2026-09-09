@@ -1,0 +1,96 @@
+{
+  "schema_version": "1.0",
+  "task_id": "container-even-product-v1",
+  "project_id": "directed-container-demo",
+  "parent_task_id": "principal-demo",
+  "parent_state_commit": "db2d862fcdbd06c3dfac6bdac191bf9b7017717a",
+  "created_at": "2026-09-07T00:00:00+00:00",
+  "created_by": "principal-researcher",
+  "mode": "directed_task",
+  "objective": "Run the declared bounded integer experiment in the isolated container and record its explicit test report. No general theorem or novelty claim.",
+  "task_type": "exact_computation",
+  "primary_claim": {
+    "claim_id": "EVEN-PRODUCT",
+    "statement": "n*(n+1) is even for integers 1 through 200",
+    "status_at_start": "OPEN",
+    "quantifiers": "Every integer n in [1,200]",
+    "definitions": [
+      "n is an integer; even means divisible by 2"
+    ]
+  },
+  "scope": {
+    "included": [
+      "Integers 1 through 200"
+    ],
+    "excluded": [
+      "Claims about untested integers",
+      "Novelty claims"
+    ]
+  },
+  "inputs": [
+    {
+      "path": "experiment.py",
+      "sha256": "5b3752722a414cae296415365e1c457b8d3e5d7fc34f8d0830cda42f6079645f",
+      "required": true,
+      "mutable": false
+    }
+  ],
+  "input_manifests": [],
+  "allowed_tools": [
+    "python_exact"
+  ],
+  "forbidden_tools": [
+    "network",
+    "canonical_write"
+  ],
+  "allowed_methods": [
+    "bounded exact arithmetic"
+  ],
+  "forbidden_methods": [
+    "autonomous task creation",
+    "scope expansion"
+  ],
+  "agent_plan": {
+    "strategy": "sequential",
+    "max_parallel_workers": 1,
+    "lanes": [
+      {
+        "lane_id": "container-check",
+        "role": "ExactComputer",
+        "execution": "python_exact",
+        "source_input": "experiment.py",
+        "input_paths": [
+          "experiment.py"
+        ],
+        "max_wall_seconds": 30
+      }
+    ]
+  },
+  "budget": {
+    "max_total_llm_calls": 2,
+    "max_calls_per_lane": 1,
+    "max_total_tokens": 2048,
+    "max_tokens_per_lane": 1024,
+    "max_total_cost_usd": 0.01,
+    "max_wall_seconds": 120,
+    "max_parallel_workers": 2,
+    "max_retries_per_call": 0
+  },
+  "stop_rules": [
+    "BUDGET_EXHAUSTED",
+    "INPUT_INTEGRITY_FAILURE",
+    "USER_STOP",
+    "RIGOROUS_REFUTATION"
+  ],
+  "required_outputs": [
+    "CLAIM_LEDGER.json",
+    "MASTER_FINDINGS.md"
+  ],
+  "result_policy": {
+    "allow_new_task_creation": false,
+    "allow_scope_expansion": false,
+    "allow_budget_expansion": false,
+    "allow_canonical_repository_write": false,
+    "unexpected_result_action": "RECORD_AS_ESCALATION_CANDIDATE"
+  }
+}

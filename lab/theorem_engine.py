@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from lab.agent import Agent
+from lab.claim_check import CheckError, check_claim, normalize_spec, spec_hash
 from lab.client import next_lower_supported_effort
 from lab.code_experiment import (
     CODE_EXPERIMENT_SYSTEM_PROMPT,
@@ -21,7 +22,7 @@ from lab.code_experiment import (
 )
 from lab.code_experiment_settings import load_code_experiment_settings, load_code_experiment_settings_from_dict
 from lab.evidence import evidence_from_tool_result, validate_evidence_binding
-from lab.integrity import content_fingerprint, sha256_file
+from lab.integrity import content_fingerprint, formal_verification_current, sha256_file
 from lab.iteration_control import consume_iteration_restart
 from lab.json_io import StructuredOutputError, parse_json_object, parse_truncated_object_prefix, repair_instruction
 from lab.literature import LiteratureClient, LiteratureSearchEmpty, Paper
@@ -385,7 +386,18 @@ class TheoremResearchLab:
                     buffers["dirty_chars"] = int(buffers.get("dirty_chars", 0) or 0) + 1
             if channel in {"reasoning", "content", "reasoning_details"}:
                 self._persist_partial(agent=agent, step_key=step_key, prompt=prompt, fingerprint=fingerprint, buffers=buffers, attempt=attempt)
-            self.trace.log("agent_stream", agent=agent.name, model=agent.model, reasoning_effort=agent.reasoning_effort, step_key=step_key, channel=channel, delta=delta)
+            if channel == "reasoning_details":
+                self.trace.log(
+                    "agent_stream",
+                    agent=agent.name,
+                    model=agent.model,
+                    reasoning_effort=agent.reasoning_effort,
+                    step_key=step_key,
+                    channel=channel,
+                    delta_items=len(delta) if isinstance(delta, list) else 1,
+                )
+            else:
+                self.trace.log("agent_stream", agent=agent.name, model=agent.model, reasoning_effort=agent.reasoning_effort, step_key=step_key, channel=channel, delta=delta)
             try:
                 self._check_stop()
             except ResearchStopped:
@@ -984,6 +996,9 @@ class TheoremResearchLab:
         )
         metadata = dict(result.metadata or {})
         if result.ok and metadata.get("formal_verified") is True:
+            if not formal_verification_current(metadata):
+                return ToolResult(False, "lean", error="Cached formal evidence requires current statement verification.",
+                                  metadata={**metadata, "formal_verified": False})
             filename = Path(str(metadata.get("file") or "")).name
             candidate = self.state.root / "formal" / "candidates" / filename
             if not filename or not candidate.is_file() or sha256_file(candidate) != str(metadata.get("lean_sha256") or ""):
@@ -1014,7 +1029,7 @@ class TheoremResearchLab:
             "claim_hash": self._active_claim_hash,
             "claim_sha256": self._active_claim_sha256,
         }
-        fingerprint = content_fingerprint("bound_formal_tool:v2", enriched)
+        fingerprint = content_fingerprint("bound_formal_tool:v3", enriched)
         cached = self._cache_get(step_key)
         if isinstance(cached, dict) and cached.get("status") == "COMPLETE" and cached.get("fingerprint") == fingerprint:
             raw = cached.get("result")
@@ -1080,8 +1095,73 @@ class TheoremResearchLab:
         result.metadata = metadata
         return result
 
+    def _cached_script_current(self, raw: dict[str, Any], step_key: str) -> bool:
+        """A cached ``script`` result is evidence only while the checker code is unchanged.
+
+        The step fingerprint covers the request, not the checked-in script, so
+        the stored ``script_sha256`` is compared with the current file before the
+        old output is reused.
+        """
+
+        if str(raw.get("tool") or "").lower() != "script":
+            return True
+        metadata = dict(raw.get("metadata") or {})
+        name = str(metadata.get("script") or "")
+        cached_sha = str(metadata.get("script_sha256") or "")
+        scripts = getattr(self.registry.toolbox, "scripts", None)
+        reason = ""
+        current_sha = ""
+        if not name or not cached_sha or scripts is None:
+            reason = "script_sha_missing"
+        else:
+            try:
+                script_path, _root = scripts._resolve(name)
+                current_sha = sha256_file(script_path)
+            except Exception as exc:
+                reason = f"script_unresolvable: {exc}"
+            else:
+                if current_sha != cached_sha:
+                    reason = "script_changed"
+        if not reason:
+            return True
+        self.trace.log(
+            "tool_cache_invalidated",
+            step_key=step_key,
+            script=name,
+            reason=reason,
+            cached_script_sha256=cached_sha,
+            current_script_sha256=current_sha,
+        )
+        return False
+
+    def _checkpoint_audit(self, iteration: int, *, auditor: Agent, problem: str, contract: ResearchContract | None) -> None:
+        """Run the independent checkpoint audit for ``iteration`` and clear its pending marker."""
+
+        self._set_runtime(current_step=f"iter:{iteration}:checkpoint_audit", pending_checkpoint=iteration)
+        ledger = self.state.research_context(recent_limit=50)
+        audit = self._call(
+            auditor,
+            checkpoint_prompt(
+                problem,
+                ledger,
+                iteration,
+                contract_block=contract.prompt_block() if contract is not None else "",
+            ),
+            f"iter:{iteration}:checkpoint_audit",
+        )
+        title = f"Checkpoint audit {iteration}"
+        if not [x for x in self.state.list_items(kind="audit") if x.title == title]:
+            audit_item = self.state.add_item("audit", title, audit, status="KNOWN", metadata={"iteration": iteration, "independent": False, "review_type": "MODEL_REVIEW"})
+            checkpoint_path = self.state.checkpoint(f"iteration-{iteration}", note=audit)
+            self.trace.log("checkpoint", iteration=iteration, audit_item_id=audit_item.id, path=str(checkpoint_path), audit=audit)
+        self._set_runtime(pending_checkpoint=0)
+
     def _tool(self, request: dict[str, Any] | None, step_key: str) -> ToolResult | None:
         name = str((request or {}).get("tool") or "none").strip().lower()
+        if name == "claim_check":
+            result = self._claim_check_tool(dict(request or {}))
+            self.trace.log("tool_result", step_key=step_key, **result.as_dict())
+            return result
         if name == "lean":
             result = ToolResult(
                 False,
@@ -1095,6 +1175,11 @@ class TheoremResearchLab:
 
         fingerprint = content_fingerprint("tool_step:v3", request or {"tool": "none"})
         cached = self._cache_get(step_key)
+        if isinstance(cached, dict) and cached.get("status") == "COMPLETE" and cached.get("fingerprint") == fingerprint:
+            raw = cached.get("result")
+            if isinstance(raw, dict) and not self._cached_script_current(raw, step_key):
+                self._cache_delete(step_key)
+                cached = None
         if isinstance(cached, dict) and cached.get("status") == "COMPLETE" and cached.get("fingerprint") == fingerprint:
             raw = cached.get("result")
             if isinstance(raw, dict):
@@ -1214,7 +1299,75 @@ class TheoremResearchLab:
         )
         return dict(proposal), item
 
+    def _prepare_operational_claim(self, proposal: dict[str, Any]) -> None:
+        try:
+            self._prepare_operational_claim_unchecked(proposal)
+        except (ValueError, TypeError, KeyError) as exc:
+            raise ResearchPaused(f"Invalid operational claim: {exc}") from exc
+
+    def _prepare_operational_claim_unchecked(self, proposal: dict[str, Any]) -> None:
+        recheck = str(proposal.get("recheck_item_id") or "").strip()
+        raw = proposal.get("claim_spec")
+        if recheck:
+            try:
+                parent = self.state.get(recheck)
+            except KeyError as exc:
+                raise ResearchPaused("Recheck target does not exist; no evidence will be transferred.") from exc
+            original = parent.metadata.get("claim_spec")
+            if not original:
+                raise ResearchPaused("Legacy target has no frozen operational specification. Define a new explicit hypothesis; do not declare the old one refuted.")
+            if spec_hash(original) != parent.metadata.get("claim_spec_hash"):
+                raise ResearchPaused("Original operational claim integrity mismatch")
+            if raw and spec_hash(raw) != spec_hash(original):
+                raise ResearchPaused("Recheck changed the original predicate, domain or assumptions. Create a separate hypothesis.")
+            raw = original
+        if raw:
+            try:
+                proposal["claim_spec"] = normalize_spec(raw)
+            except (ValueError, TypeError) as exc:
+                raise ResearchPaused(f"Invalid operational claim: {exc}") from exc
+
+        elif isinstance(proposal.get("tool_request"), dict) and proposal["tool_request"].get("tool") == "claim_check":
+            raise ResearchPaused("claim_check requires a frozen claim_spec with variables, assumptions and predicate")
+
+    def _claim_check_tool(self, request: dict[str, Any]) -> ToolResult:
+        if not self._active_item_id or self._active_iteration is None:
+            return ToolResult(False, "claim_check", error="Current ledger item required")
+        item = self.state.get(self._active_item_id)
+        spec = item.metadata.get("claim_spec")
+        try:
+            if not spec or spec_hash(spec) != item.metadata.get("claim_spec_hash"):
+                raise CheckError("Frozen claim_spec missing or changed")
+            if not self.registry.is_available("claim_check"):
+                raise CheckError(self.registry.unavailable_reason("claim_check"))
+            return check_claim(spec, request, item_id=item.id,
+                               claim_hash=content_fingerprint("claim:v1", item.claim), iteration=self._active_iteration)
+        except (ValueError, TypeError) as exc:
+            return ToolResult(False, "claim_check", error=str(exc), metadata={"status": "CLAIM_CHECK_REJECTED"})
+
+    def _local_failure_reviews(self, item, result: ToolResult | None):
+        if result is None or result.ok:
+            return None
+        status = str((result.metadata or {}).get("status") or "")
+        if status not in {"CLAIM_CHECK_REJECTED", "DEFINITIONS_INVALID", "THEORIST_SOURCE_INVALID"}:
+            return None
+        signature = content_fingerprint("local-failure:v1", {"status": status, "error": result.error})
+        self.state.update_item(item.id, metadata={"local_failure_signature": signature})
+        previous = [x for x in self.state.list_items(kind="conjecture")
+                    if x.id != item.id and x.metadata.get("local_failure_signature") == signature]
+        if previous:
+            raise ResearchPaused("Same local validation failure repeated. Paused before additional reviewer calls: " + result.error)
+        self.trace.log("local_failure_review_skipped", item_id=item.id, status=status, saved_review_calls=3)
+        reason = "Local checker rejected the request; no scientific conclusion: " + result.error
+        return (
+            {"verdict": "INCONCLUSIVE", "reason": reason, "counterexample": ""},
+            {"verdict": "REVISE", "reason": reason, "counterexample": ""},
+            {"decision": "REVISE", "status": "OPEN", "reason": reason,
+             "next_task": "Correct only this execution/specification error while preserving the frozen hypothesis. " + result.error},
+        )
+
     def _ensure_item_matches_proposal(self, iteration: int, proposal: dict[str, Any], snapshot: dict[str, Any]):
+        self._prepare_operational_claim(proposal)
         claim = str(proposal.get("claim") or "Boş iddia")
         title = str(proposal.get("title") or f"Iteration {iteration} candidate")
         proposal_hash = content_fingerprint("proposal:v1", proposal)
@@ -1228,7 +1381,10 @@ class TheoremResearchLab:
                     "iteration": iteration,
                     "proposal": proposal,
                     "proposal_hash": proposal_hash,
+                    "novelty_status": "UNASSESSED",
                     "ledger_revision": snapshot.get("ledger_revision"),
+                    **({"claim_spec": proposal["claim_spec"], "claim_spec_hash": spec_hash(proposal["claim_spec"]),
+                        "recheck_item_id": str(proposal.get("recheck_item_id") or "")} if proposal.get("claim_spec") else {}),
                 },
             )
             self.trace.log("state_change", action="create", item_id=item.id, kind="conjecture", old_status=None, new_status="OPEN", title=title, claim=claim)
@@ -1547,6 +1703,11 @@ class TheoremResearchLab:
         next_task = str(runtime.get("next_task") or "").strip() or "Problemi daralt; bilinen sınırları ihlal etmeyen, çürütülebilir tek bir lemma, construction veya lower-bound mekanizması öner."
         self._set_runtime(status="RUNNING", last_error="")
 
+        pending_checkpoint = int(runtime.get("pending_checkpoint", 0) or 0)
+        if pending_checkpoint and 0 < pending_checkpoint <= completed:
+            self.trace.log("checkpoint_resumed", iteration=pending_checkpoint)
+            self._checkpoint_audit(pending_checkpoint, auditor=auditor, problem=problem, contract=contract)
+
         if contract is not None and not selectable_ids and not contract.open_target_ids():
             self.controller.set_research_phase("PUBLICATION")
             self.trace.log(
@@ -1669,6 +1830,25 @@ class TheoremResearchLab:
                     selectable_ids=selectable_ids,
                     iteration=iteration,
                 )
+            if bound_item is None and not proposal_incomplete:
+                try:
+                    self._prepare_operational_claim(proposal)
+                except ResearchPaused as exc:
+                    # One focused cheap repair; never silently rewrite a bound claim.
+                    self.trace.log("operational_claim_repair", iteration=iteration, reason=str(exc))
+                    repair_step = f"iter:{iteration}:claim_repair"
+                    proposal = self._call_json(
+                        proposer,
+                        current_proposal_prompt + "\nLOCAL VALIDATION REJECTED THE PROPOSAL: " + str(exc)
+                        + "\nReturn a corrected complete proposal. Preserve an existing target's exact specification or create a separately labelled hypothesis; never transfer refutation evidence."
+                        + "\nRejected proposal: " + json.dumps(proposal, ensure_ascii=False),
+                        repair_step,
+                    )
+                    if self._llm_step_meta.get(repair_step, {}).get("truncated"):
+                        raise ResearchPaused("Operational claim repair was truncated; no experiment executed.")
+                    proposal, target_id = self._validate_proposal_target(
+                        proposer, proposal, contract=contract, selectable_ids=selectable_ids, iteration=iteration)
+                    self._prepare_operational_claim(proposal)
             item = self._ensure_item_matches_proposal(iteration, proposal, snapshot)
             if proposal_incomplete:
                 self.state.update_item(
@@ -1738,37 +1918,41 @@ class TheoremResearchLab:
                         evidence=bound_evidence.as_dict(),
                     )
 
-            verification = self._call_json(
-                verifier,
-                verifier_prompt(problem, item.id, proposal, tool_result.as_dict() if tool_result else None, self.registry),
-                f"iter:{iteration}:verifier",
-            )
-            critique = self._call_json(
-                critic,
-                critic_prompt(problem, item.id, claim, proposal, tool_result.as_dict() if tool_result else None, verification, ledger_context),
-                f"iter:{iteration}:critic",
-            )
-            repeat_warning = self._repeated_next_task_warning(
-                current_item_id=item.id,
-                current_task=frozen_next_task,
-                target_id=target_id,
-            )
-            manager_decision = self._call_json(
-                manager,
-                manager_prompt(
-                    problem,
-                    item.id,
-                    claim,
-                    tool_result.as_dict() if tool_result else None,
-                    verification,
-                    critique,
-                    contract_block=contract.prompt_block() if contract is not None else "",
-                    registry=self.registry,
-                    candidate_incomplete=proposal_incomplete,
-                    repeat_warning=repeat_warning,
-                ),
-                f"iter:{iteration}:manager",
-            )
+            local_reviews = self._local_failure_reviews(item, tool_result)
+            if local_reviews is not None:
+                verification, critique, manager_decision = local_reviews
+            else:
+                verification = self._call_json(
+                    verifier,
+                    verifier_prompt(problem, item.id, proposal, tool_result.as_dict() if tool_result else None, self.registry),
+                    f"iter:{iteration}:verifier",
+                )
+                critique = self._call_json(
+                    critic,
+                    critic_prompt(problem, item.id, claim, proposal, tool_result.as_dict() if tool_result else None, verification, ledger_context),
+                    f"iter:{iteration}:critic",
+                )
+                repeat_warning = self._repeated_next_task_warning(
+                    current_item_id=item.id,
+                    current_task=frozen_next_task,
+                    target_id=target_id,
+                )
+                manager_decision = self._call_json(
+                    manager,
+                    manager_prompt(
+                        problem,
+                        item.id,
+                        claim,
+                        tool_result.as_dict() if tool_result else None,
+                        verification,
+                        critique,
+                        contract_block=contract.prompt_block() if contract is not None else "",
+                        registry=self.registry,
+                        candidate_incomplete=proposal_incomplete,
+                        repeat_warning=repeat_warning,
+                    ),
+                    f"iter:{iteration}:manager",
+                )
             decision = str(manager_decision.get("decision") or "REVISE").upper()
             requested_status = str(manager_decision.get("status") or "OPEN").upper()
             if tool_result and tool_result.tool == "lean" and tool_result.ok and (tool_result.metadata or {}).get("formal_verified"):
@@ -1799,6 +1983,7 @@ class TheoremResearchLab:
                     expected_item_id=item.id,
                     expected_iteration=iteration,
                     expected_claim_hash=expected_claim_hash,
+                    expected_claim_spec_hash=item.metadata.get("claim_spec_hash"),
                     evidence=bound_evidence,
                     contract=contract,
                 )
@@ -1910,30 +2095,27 @@ class TheoremResearchLab:
                 metadata={
                     "input_next_task": frozen_next_task,
                     "manager_decision": decision,
+                    "agenda_status": "RETIRED" if decision == "KILL" else "ACTIVE",
                     "manager_next_task": next_task,
                 },
             )
             outcomes.append(IterationOutcome(item.id, decision, status, next_task))
             self.trace.log("iteration_end", iteration=iteration, item_id=item.id, decision=decision, status=status, next_task=next_task)
-            self._set_runtime(completed_iterations=iteration, current_iteration=iteration, current_step="iteration_complete", next_task=next_task, status="RUNNING")
+            checkpoint_due = bool(checkpoint_every and iteration % checkpoint_every == 0)
+            # The iteration is complete, but a due checkpoint audit is recorded as
+            # pending *before* completion is persisted so an interrupted audit is
+            # replayed on resume instead of being skipped by the next-iteration loop.
+            self._set_runtime(
+                completed_iterations=iteration,
+                current_iteration=iteration,
+                current_step="iteration_complete",
+                next_task=next_task,
+                status="RUNNING",
+                pending_checkpoint=iteration if checkpoint_due else 0,
+            )
 
-            if checkpoint_every and iteration % checkpoint_every == 0:
-                ledger = self.state.research_context(recent_limit=50)
-                audit = self._call(
-                    auditor,
-                    checkpoint_prompt(
-                        problem,
-                        ledger,
-                        iteration,
-                        contract_block=contract.prompt_block() if contract is not None else "",
-                    ),
-                    f"iter:{iteration}:checkpoint_audit",
-                )
-                title = f"Checkpoint audit {iteration}"
-                if not [x for x in self.state.list_items(kind="audit") if x.title == title]:
-                    audit_item = self.state.add_item("audit", title, audit, status="KNOWN", metadata={"iteration": iteration, "independent": True})
-                    checkpoint_path = self.state.checkpoint(f"iteration-{iteration}", note=audit[:1000])
-                    self.trace.log("checkpoint", iteration=iteration, audit_item_id=audit_item.id, path=str(checkpoint_path), audit=audit)
+            if checkpoint_due:
+                self._checkpoint_audit(iteration, auditor=auditor, problem=problem, contract=contract)
 
         final_ledger = self.state.research_context(recent_limit=80)
         final_audit = self._call(
@@ -1947,12 +2129,12 @@ class TheoremResearchLab:
             ),
             "final:audit",
         )
-        final_path = self.state.checkpoint("final", note=final_audit[:1500])
+        final_path = self.state.checkpoint("final", note=final_audit)
         self.trace.log("checkpoint", final=True, path=str(final_path), audit=final_audit)
         lines = ["# Teorem Araştırması Sonucu", "", "## Tur Sonuçları"]
         for outcome in outcomes:
             lines.append(f"- `{outcome.item_id}` — **{outcome.status}** — {outcome.decision} — next: {outcome.next_task}")
         if not outcomes:
             lines.append("- Yeni tur çalıştırılmadı; mevcut state zaten istenen iterasyona kadar tamamlanmıştı.")
-        lines += ["", "## Final Bağımsız Audit", final_audit, "", f"Checkpoint: `{final_path}`"]
+        lines += ["", "## Final Model Denetimi", final_audit, "", f"Checkpoint: `{final_path}`"]
         return "\n".join(lines)

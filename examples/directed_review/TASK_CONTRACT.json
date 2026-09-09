@@ -1,0 +1,159 @@
+{
+  "schema_version": "1.0",
+  "task_id": "review-even-product-template-v1",
+  "project_id": "directed-review-demo",
+  "parent_task_id": "principal-demo",
+  "parent_state_commit": "db2d862fcdbd06c3dfac6bdac191bf9b7017717a",
+  "created_at": "2026-09-07T00:00:00+00:00",
+  "created_by": "principal-researcher",
+  "mode": "directed_task",
+  "objective": "Independently propose two elementary arguments for the frozen finite even-product claim, then inspect both public arguments for logical gaps. Do not promote model prose to a proved claim.",
+  "task_type": "proof_review",
+  "primary_claim": {
+    "claim_id": "EVEN-PRODUCT",
+    "statement": "n*(n+1) is even for integers 1 through 200",
+    "status_at_start": "OPEN",
+    "quantifiers": "Every integer n in [1,200]",
+    "definitions": [
+      "n is an integer; even means divisible by 2"
+    ]
+  },
+  "scope": {
+    "included": [
+      "Integers 1 through 200"
+    ],
+    "excluded": [
+      "Claims about untested integers",
+      "Novelty claims"
+    ]
+  },
+  "inputs": [],
+  "input_manifests": [],
+  "allowed_tools": [],
+  "forbidden_tools": [
+    "network",
+    "canonical_write"
+  ],
+  "allowed_methods": [
+    "bounded exact arithmetic"
+  ],
+  "forbidden_methods": [
+    "autonomous task creation",
+    "scope expansion"
+  ],
+  "agent_plan": {
+    "strategy": "dag",
+    "max_parallel_workers": 2,
+    "lanes": [
+      {
+        "lane_id": "producer-a",
+        "role": "Theorist",
+        "execution": "model",
+        "model": "provider/model-id",
+        "reasoning_effort": "low",
+        "independence_group": "producer-a",
+        "max_completion_tokens": 1024,
+        "max_calls": 1,
+        "max_tokens": 8000,
+        "max_cost_usd": 0.1,
+        "max_wall_seconds": 90,
+        "input_price_per_million": 1.0,
+        "output_price_per_million": 2.0,
+        "can_read_other_lane_outputs": false,
+        "depends_on": [],
+        "visible_inputs": [
+          "task_contract",
+          "definitions"
+        ],
+        "hidden_inputs": [
+          "producer_hidden_reasoning",
+          "producer_system_prompt",
+          "other_auditor_output"
+        ]
+      },
+      {
+        "lane_id": "producer-b",
+        "role": "Theorist",
+        "execution": "model",
+        "model": "provider/model-id",
+        "reasoning_effort": "low",
+        "independence_group": "producer-b",
+        "max_completion_tokens": 1024,
+        "max_calls": 1,
+        "max_tokens": 8000,
+        "max_cost_usd": 0.1,
+        "max_wall_seconds": 90,
+        "input_price_per_million": 1.0,
+        "output_price_per_million": 2.0,
+        "can_read_other_lane_outputs": false,
+        "depends_on": [],
+        "visible_inputs": [
+          "task_contract",
+          "definitions"
+        ],
+        "hidden_inputs": [
+          "producer_hidden_reasoning",
+          "producer_system_prompt",
+          "other_auditor_output"
+        ]
+      },
+      {
+        "lane_id": "auditor",
+        "role": "IndependentAuditor",
+        "execution": "model",
+        "model": "provider/model-id",
+        "reasoning_effort": "low",
+        "independence_group": "auditor",
+        "max_completion_tokens": 1024,
+        "max_calls": 1,
+        "max_tokens": 8000,
+        "max_cost_usd": 0.1,
+        "max_wall_seconds": 90,
+        "input_price_per_million": 1.0,
+        "output_price_per_million": 2.0,
+        "can_read_other_lane_outputs": true,
+        "depends_on": [
+          "producer-a",
+          "producer-b"
+        ],
+        "visible_inputs": [
+          "task_contract",
+          "definitions",
+          "selected_artifacts"
+        ],
+        "hidden_inputs": [
+          "producer_hidden_reasoning",
+          "producer_system_prompt",
+          "other_auditor_output"
+        ]
+      }
+    ]
+  },
+  "budget": {
+    "max_total_llm_calls": 3,
+    "max_calls_per_lane": 1,
+    "max_total_tokens": 24000,
+    "max_tokens_per_lane": 8000,
+    "max_total_cost_usd": 0.3,
+    "max_wall_seconds": 300,
+    "max_parallel_workers": 2,
+    "max_retries_per_call": 0
+  },
+  "stop_rules": [
+    "BUDGET_EXHAUSTED",
+    "INPUT_INTEGRITY_FAILURE",
+    "USER_STOP",
+    "RIGOROUS_REFUTATION"
+  ],
+  "required_outputs": [
+    "CLAIM_LEDGER.json",
+    "MASTER_FINDINGS.md"
+  ],
+  "result_policy": {
+    "allow_new_task_creation": false,
+    "allow_scope_expansion": false,
+    "allow_budget_expansion": false,
+    "allow_canonical_repository_write": false,
+    "unexpected_result_action": "RECORD_AS_ESCALATION_CANDIDATE"
+  }
+}

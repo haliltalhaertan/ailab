@@ -25,7 +25,7 @@ class ToolRegistry:
     effective snapshot so a hallucinated/old tool request still fails closed.
     """
 
-    BUILTIN_NAMES = ("script", "z3", "lean_draft", "tropical_grid")
+    BUILTIN_NAMES = ("script", "z3", "lean_draft", "tropical_grid", "claim_check")
 
     def __init__(self, toolbox: ResearchToolbox | None = None):
         self.toolbox = toolbox or ResearchToolbox()
@@ -156,6 +156,8 @@ class ToolRegistry:
         return "|".join(self.names(available_only=available_only))
 
     def _builtin(self, request: dict[str, Any]) -> ToolResult | None:
+        if request.get("tool") == "claim_check":
+            return ToolResult(False, "claim_check", error="Frozen ledger claim context required")
         return self.toolbox.execute(request)
 
     def execute(self, request: dict[str, Any] | None) -> ToolResult | None:

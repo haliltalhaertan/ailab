@@ -1,0 +1,22 @@
+{
+  "suite_id": "research-assistant-small-v1",
+  "model": "fixture/no-model-called",
+  "reasoning_effort": "low",
+  "elapsed_seconds": null,
+  "usage": {
+    "calls": 0,
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "reasoning_tokens": 0,
+    "cost_usd": 0,
+    "cost_complete": true
+  },
+  "responses": [
+    {"task_id": "sum-squares", "answer": {"value": 338350}},
+    {"task_id": "modular-inverse", "answer": {"value": 38}},
+    {"task_id": "polynomial-counterexample", "answer": {"n": 40, "d": 41}},
+    {"task_id": "collatz-prefix", "answer": {"values": [22, 11, 34, 17, 52]}},
+    {"task_id": "division-audit", "answer": {"analysis": "a-b=0; cancellation would divide by zero. Cancellation requires a-b != 0."}},
+    {"task_id": "contraction-audit", "answer": {"analysis": "For z_n=1+1/n, n>=2, z_n is not an integer and |cos(pi*z_n)| tends to 1. No uniform c<1 exists."}}
+  ]
+}

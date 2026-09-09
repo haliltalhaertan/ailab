@@ -519,11 +519,17 @@ class GuardedExperimentWorkspace:
                 termination_reason = "output_limit"
             stdout_preview = self._preview(stdout_path)
             stderr_preview = self._preview(stderr_path)
+            # Explicit test failure must not become execution success on exit 0.
+            test_report = experiment_test_report(stdout_path.read_text(encoding="utf-8", errors="replace")) if output_bytes <= self.max_output_bytes else {"status": "UNREPORTED"}
+            if not termination_reason and test_report["status"] in {"FAIL", "INCONCLUSIVE", "INVALID"}:
+                termination_reason = "test_" + str(test_report["status"]).lower()
             ok = returncode == 0 and not termination_reason
             metadata = {
                 "path": str(target.relative_to(self.root)),
                 "args": clean_args,
                 "returncode": returncode,
+                "test_report": test_report,
+                "execution_success": returncode == 0 and not termination_reason,
                 "wall_time_s": elapsed,
                 "termination_reason": termination_reason,
                 "max_output_bytes": self.max_output_bytes,
@@ -652,6 +658,12 @@ Host shell, host filesystem ve API anahtarları erişilebilir değildir.
 - `run_python.args` yalnız script'e verilecek komut satırı argümanlarıdır; script dosya adını `args` içine koyma, `path` alanına koy.
 - read_file/patch_file/list_files aynı workspace içindeki göreli yolları kullanır.
 
+TEST RESULT CONTRACT:
+Use assert for every Boolean test return: assert test_identity(limit), never discard a returned False.
+Emit one final AILAB_TEST={"status":"PASS","checked_points":123} JSON line after all assertions succeed; report the actual count.
+A failure must raise AssertionError or report FAIL; incomplete tests report INCONCLUSIVE. Never print PASS unconditionally.
+These are generated-code reports, not independent proof. Preserve the requested predicate and scope exactly.
+
 PYTHON POLİTİKASI — kodu yazmadan önce uygula:
 - Dunder isim/attribute kullanma: `__name__`, `__main__`, `__dict__` vb. yasaktır. Top-level kod doğrudan çalışabilir; `if __name__ == "__main__"` yazma.
 - `_` ile başlayan private attribute erişimleri yasaktır.
@@ -688,6 +700,29 @@ def top_level_bound_names(source: str) -> set[str]:
                 if isinstance(target, ast.Name):
                     names.add(str(target.id))
     return names
+
+
+def experiment_test_report(stdout: str) -> dict[str, Any]:
+    """Untrusted script report: may reject a run, never proves a claim."""
+    reports = []
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("AILAB_TEST"):
+            continue
+        if not line.startswith("AILAB_TEST="):
+            return {"status": "INVALID"}
+        try:
+            report = json.loads(line.partition("=")[2])
+        except (ValueError, TypeError):
+            return {"status": "INVALID"}
+        if not isinstance(report, dict) or report.get("status") not in {"PASS", "FAIL", "INCONCLUSIVE"}:
+            return {"status": "INVALID"}
+        if type(report.get("checked_points")) is not int or report["checked_points"] < 1:
+            return {"status": "INVALID"}
+        reports.append(report)
+    if len(reports) > 1:
+        return {"status": "INVALID"}
+    return reports[0] if reports else {"status": "UNREPORTED"}
 
 
 def parse_ailab_trailer(stdout: str) -> dict[str, Any]:

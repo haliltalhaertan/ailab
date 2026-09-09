@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from lab.integrity import EvidenceSigner, atomic_write_json, read_json_tolerant, sha256_file
+from lab.integrity import EvidenceSigner, atomic_write_json, formal_verification_current, read_json_tolerant, sha256_file
 from lab.research_contract import ResearchContract
 
 
@@ -49,6 +49,15 @@ class ResearchItem:
     updated_at: str = field(default_factory=_now)
 
 
+class LedgerReadError(RuntimeError):
+    """The authoritative ledger file exists but cannot be read.
+
+    Treating it as empty would let the next mutation silently replace the whole
+    research history, so every read fails closed instead. Recovery (restoring a
+    checkpoint or repairing the file) is an explicit, observable operation.
+    """
+
+
 class ResearchState:
     """Inspectable research ledger with explicit evidence gates for PROVEN.
 
@@ -83,6 +92,8 @@ class ResearchState:
             "formal_binding_verified": bool(metadata.get("formal_binding_verified")),
             "axioms_verified": bool(metadata.get("axioms_verified")),
             "source_clean": bool(metadata.get("source_clean")),
+            "theorem_statement_verified": metadata.get("theorem_statement_verified"),
+            "formal_verification_version": metadata.get("formal_verification_version"),
         }
 
     def _validate_live_formal_binding(
@@ -93,6 +104,7 @@ class ResearchState:
     ) -> tuple[bool, str]:
         if not (
             metadata.get("formal_verified") is True
+            and formal_verification_current(metadata)
             and metadata.get("formal_binding_verified") is True
             and metadata.get("axioms_verified") is True
             and metadata.get("source_clean") is True
@@ -146,9 +158,17 @@ class ResearchState:
         return True, ""
 
     def _read_state(self) -> dict[str, Any]:
-        raw = read_json_tolerant(self.state_path, {"items": [], "events": []})
-        if not isinstance(raw, dict):
-            return {"items": [], "events": []}
+        if not self.state_path.exists():
+            raw: Any = {"items": [], "events": []}
+        else:
+            try:
+                raw = json.loads(self.state_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
+                raise LedgerReadError(
+                    f"Research ledger okunamadı; boş kabul edilip üzerine yazılmayacak: {self.state_path} ({exc})"
+                ) from exc
+            if not isinstance(raw, dict):
+                raise LedgerReadError(f"Research ledger JSON nesnesi değil: {self.state_path}")
         raw.setdefault("items", [])
         raw.setdefault("events", [])
         for item in raw.get("items", []):
@@ -293,7 +313,11 @@ class ResearchState:
         for raw in data["items"]:
             if raw["id"] != item_id:
                 continue
-            merged_metadata = {**raw.get("metadata", {}), **(metadata or {})}
+            previous = raw.get("metadata", {})
+            for frozen_key in ("claim_spec", "claim_spec_hash", "recheck_item_id"):
+                if metadata is not None and frozen_key in previous and frozen_key in metadata and previous[frozen_key] != metadata[frozen_key]:
+                    raise ValueError(f"Frozen {frozen_key} cannot change; create a new hypothesis")
+            merged_metadata = {**previous, **(metadata or {})}
             if status == "PROVEN":
                 merged_metadata = self._seal_proven(item_id, str(raw.get("claim") or ""), merged_metadata)
             if status:
@@ -351,7 +375,17 @@ class ResearchState:
         claim = item.claim.replace("\n", " ")
         if len(claim) > claim_limit:
             claim = claim[: claim_limit - 3] + "..."
-        return f"[{item.id}] [{item.status}] {item.title}: {claim}"
+        line = f"[{item.id}] [{item.status}] {item.title}: {claim}"
+        line += "\nAGENDA: " + str(item.metadata.get("agenda_status") or ("RETIRED" if item.metadata.get("manager_decision") == "KILL" else "ACTIVE"))
+        if item.metadata.get("claim_spec"):
+            line += "\nFROZEN OPERATIONAL CLAIM: " + json.dumps(item.metadata["claim_spec"], ensure_ascii=False, sort_keys=True)
+            line += "\nSPEC HASH: " + str(item.metadata.get("claim_spec_hash") or "")
+        evidence = item.metadata.get("evidence") or {}
+        receipt = evidence.get("metadata", {}) if isinstance(evidence, dict) else {}
+        if receipt.get("claim_replayed"):
+            line += "\nMACHINE REPLAY: " + json.dumps({key: receipt.get(key) for key in
+                ("claim_spec_hash", "kind", "covered_scope", "checked_points", "witness", "exhaustive")}, ensure_ascii=False)
+        return line
 
     def summary_for_prompt(self, limit: int = 20) -> str:
         items = self.list_items()[-limit:]
@@ -368,17 +402,17 @@ class ResearchState:
         dead = [
             x
             for x in items
-            if x.kind == "conjecture" and x.status in {"FAIL", "DROPPED"}
+            if x.kind == "conjecture" and (x.status in {"FAIL", "DROPPED"} or x.metadata.get("agenda_status") == "RETIRED" or x.metadata.get("manager_decision") == "KILL")
         ]
         live = [
             x
             for x in items
-            if x.kind == "conjecture" and x.status not in {"FAIL", "DROPPED"}
+            if x.kind == "conjecture" and x not in dead
         ]
         recent = [x for x in items if x.kind != "conjecture"][-max(0, int(recent_limit)) :]
         lines: list[str] = []
         if dead:
-            lines.append("REJECTED IDEAS - DO NOT REOPEN:")
+            lines.append("REJECTED IDEAS - DO NOT REOPEN: (includes agenda retirement; evidence status is preserved)")
             for item in dead:
                 claim = item.claim.replace("\n", " ")
                 if len(claim) > fail_claim_chars:

@@ -111,7 +111,7 @@ def _popen_calls(tree: ast.Module) -> list[ast.Call]:
     return calls
 
 
-def _worker_launcher_is_pinned(tree: ast.Module) -> bool:
+def _worker_launcher_is_pinned(tree: ast.Module, expected_module: str = "lab.worker") -> bool:
     for node in ast.walk(tree):
         if not isinstance(node, ast.Assign):
             continue
@@ -121,7 +121,7 @@ def _worker_launcher_is_pinned(tree: ast.Module) -> bool:
         if not isinstance(value, ast.List):
             continue
         constants = [item.value for item in value.elts if isinstance(item, ast.Constant)]
-        if "-m" in constants and "lab.worker" in constants:
+        if "-m" in constants and expected_module in constants:
             return True
     return False
 
@@ -134,6 +134,10 @@ def test_generated_code_popen_is_confined_to_code_experiment():
         if not calls or path.name == "code_experiment.py":
             continue
         if path.name == "worker_launcher.py" and _worker_launcher_is_pinned(tree):
+            continue
+        if path.name == "batch_lab.py" and _worker_launcher_is_pinned(tree, "lab.batch_lab"):
+            continue
+        if path.name == "directed.py" and _worker_launcher_is_pinned(tree, "lab.directed"):
             continue
         offenders.extend(f"{path.relative_to(REPO_ROOT)}:{call.lineno}" for call in calls)
 

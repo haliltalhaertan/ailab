@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import json
+import math
 import os
 import re
 import shutil
@@ -14,7 +15,7 @@ from itertools import product
 from pathlib import Path
 from typing import Any
 
-from lab.integrity import sha256_file
+from lab.integrity import FORMAL_VERIFICATION_VERSION, sha256_file
 
 
 @dataclass
@@ -327,6 +328,68 @@ class LeanTool:
     def _compact(value: str) -> str:
         return " ".join(str(value or "").split())
 
+    _OPEN_BRACKETS = "([{⟨«⦃"
+    _CLOSE_BRACKETS = ")]}⟩»⦄"
+
+    @classmethod
+    def _declaration_statement(cls, clean: str, declaration: "re.Match[str]") -> tuple[str, str] | None:
+        """Split the declared signature into ``(binders, conclusion)``.
+
+        The conclusion is the text between the first bracket-depth-0 colon after
+        the declaration name and the first depth-0 ``:=`` (or a pattern-matching
+        ``|`` alternative, a ``where`` block, or end of source). ``None`` means the
+        statement could not be located, which callers must treat as a rejection.
+        """
+
+        text = clean[declaration.end():]
+        depth = 0
+        colon = -1
+        end = len(text)
+        index = 0
+        while index < len(text):
+            char = text[index]
+            if char in cls._OPEN_BRACKETS:
+                depth += 1
+            elif char in cls._CLOSE_BRACKETS:
+                depth = max(0, depth - 1)
+            elif depth == 0:
+                if text.startswith(":=", index):
+                    end = index
+                    break
+                if char == ":" and colon < 0:
+                    colon = index
+                if char == "|" and colon >= 0:
+                    line_start = text.rfind("\n", 0, index) + 1
+                    if not text[line_start:index].strip():
+                        end = index
+                        break
+                if colon >= 0 and index > 0 and text[index - 1].isspace() and re.match(r"where\b", text[index:]):
+                    end = index
+                    break
+            index += 1
+        if colon < 0 or colon >= end:
+            return None
+        binders = text[:colon].strip()
+        conclusion = text[colon + 1 : end].strip()
+        if not conclusion:
+            return None
+        return binders, conclusion
+
+    def declared_statement(self, source: str, theorem_name: str) -> tuple[str, str]:
+        """Return ``(binders, conclusion)`` of the single bound declaration or raise."""
+
+        clean = self._strip_comments(source)
+        declarations = [m for m in self.DECLARATION.finditer(clean) if m.group(2) == theorem_name.strip()]
+        if len(declarations) != 1:
+            raise ValueError("Kaynak theorem_name ile binding theorem_name eşleşmiyor.")
+        statement = self._declaration_statement(clean, declarations[0])
+        if statement is None:
+            raise ValueError("Theorem statement ayrıştırılamadı ('name binders : type :=' bekleniyor).")
+        return statement
+
+    def _accepted_types(self, binders: str, conclusion: str) -> set[str]:
+        return {self._compact(f"∀ {binders}, {conclusion}" if binders else conclusion)}
+
     def _guard_source(self, source: str, theorem_name: str, theorem_type: str) -> tuple[bool, str]:
         clean = self._strip_comments(source)
         for pattern in self.FORBIDDEN_PATTERNS:
@@ -339,9 +402,17 @@ class LeanTool:
             return False, "lean_draft için theorem_name ve theorem_type zorunludur."
         if declarations[0].group(2) != theorem_name.strip():
             return False, "Kaynak theorem_name ile binding theorem_name eşleşmiyor."
-        compact = self._compact(clean)
-        if self._compact(theorem_type) not in compact:
-            return False, "Kaynak içinde binding theorem_type bulunamadı."
+        statement = self._declaration_statement(clean, declarations[0])
+        if statement is None:
+            return False, "Theorem statement ayrıştırılamadı ('name binders : type :=' bekleniyor)."
+        binders, conclusion = statement
+        if self._compact(theorem_type) not in self._accepted_types(binders, conclusion):
+            return (
+                False,
+                "binding theorem_type declared theorem'ün kendi tipiyle eşleşmiyor "
+                "(tüm parametre ve varsayımlar '∀ <binders>, <sonuç>' içinde bulunmalıdır; "
+                "kaynağın başka yerinde geçen bir ifade binding sayılmaz).",
+            )
         return True, ""
 
     def _candidate(self, name: str) -> Path:
@@ -371,6 +442,7 @@ class LeanTool:
             ok, reason = self._guard_source(text, theorem_name, theorem_type)
             if not ok:
                 raise ValueError(reason)
+            binders, conclusion = self.declared_statement(text, theorem_name)
             binding_hash = str(claim_hash or claim_sha256).strip().lower()
             if not item_id or iteration is None or not re.fullmatch(r"[0-9a-f]{64}", binding_hash):
                 raise ValueError("Formal candidate item_id/iteration/claim hash binding olmadan yazılamaz.")
@@ -390,6 +462,8 @@ class LeanTool:
                     "source_clean": True,
                     "theorem_name": theorem_name.strip(),
                     "theorem_type": self._compact(theorem_type),
+                    "theorem_binders": self._compact(binders),
+                    "theorem_conclusion": self._compact(conclusion),
                     "item_id": item_id,
                     "iteration": int(iteration),
                     "claim_hash": binding_hash,
@@ -433,14 +507,33 @@ class LeanTool:
             return True
         return bool(re.search(r"\baxiom\b", lowered))
 
-    def _axioms_ok(self, source: str, theorem_name: str) -> tuple[bool, str, list[str]]:
+    @staticmethod
+    def _statement_probe(theorem_name: str, statement: str) -> str:
+        """Lean snippet that fails to elaborate unless the declaration really has the bound statement."""
+
+        return f"example : ({statement}) := @{theorem_name}"
+
+    def _axioms_ok(
+        self,
+        source: str,
+        theorem_name: str,
+        *,
+        expected_type: str,
+    ) -> tuple[bool, str, list[str]]:
+        """Compile ``source`` plus a statement probe and ``#print axioms``.
+
+        The probe re-elaborates the expected statement against the actual constant
+        so a source-level parse cannot be fooled into binding an unrelated type.
+        """
+
         audit = self.candidates / f".axioms-{uuid.uuid4().hex}.lean"
         try:
-            audit.write_text(source.rstrip() + f"\n\n#print axioms {theorem_name}\n", encoding="utf-8")
+            probe = f"{self._statement_probe(theorem_name, expected_type)}\n"
+            audit.write_text(source.rstrip() + f"\n\n{probe}#print axioms {theorem_name}\n", encoding="utf-8")
             proc, _ = self._run_lean(audit)
             combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
             if proc.returncode != 0:
-                return False, combined.strip() or "#print axioms failed", []
+                return False, combined.strip() or "statement probe / #print axioms failed", []
             lowered = combined.lower()
             if "does not depend on any axioms" in lowered:
                 return True, combined.strip(), []
@@ -483,6 +576,7 @@ class LeanTool:
             "source_clean": False,
             "axioms_verified": False,
             "formal_binding_verified": False,
+            "theorem_statement_verified": False,
             "claim_hash": "",
         }
         try:
@@ -509,6 +603,9 @@ class LeanTool:
             ok_source, reason = self._guard_source(source, expected_theorem_name, expected_theorem_type)
             if not ok_source:
                 raise ValueError(reason)
+            binders, conclusion = self.declared_statement(source, expected_theorem_name)
+            metadata["theorem_binders"] = self._compact(binders)
+            metadata["theorem_conclusion"] = self._compact(conclusion)
             metadata["source_clean"] = True
             if not expected_sha256 or actual_sha != expected_sha256:
                 raise ValueError("Lean source SHA-256 draft binding ile eşleşmiyor.")
@@ -531,12 +628,18 @@ class LeanTool:
                 return ToolResult(False, "lean", output=proc.stdout.strip(), error=proc.stderr.strip(), metadata=metadata)
             if self._compiler_mentions_unsafe_proof(combined):
                 return ToolResult(False, "lean", error="Lean compiler output mentions sorry/axiom; formal verification rejected.", metadata=metadata)
-            axioms_ok, axioms_output, axioms = self._axioms_ok(source, expected_theorem_name)
+            axioms_ok, axioms_output, axioms = self._axioms_ok(
+                source,
+                expected_theorem_name,
+                expected_type=expected_theorem_type,
+            )
             metadata["axioms"] = axioms
             metadata["axioms_verified"] = axioms_ok
+            metadata["theorem_statement_verified"] = axioms_ok
             if not axioms_ok:
-                return ToolResult(False, "lean", error=f"Axiom audit failed: {axioms_output}", metadata=metadata)
+                return ToolResult(False, "lean", error=f"Statement/axiom audit failed: {axioms_output}", metadata=metadata)
             metadata["formal_verified"] = True
+            metadata["formal_verification_version"] = FORMAL_VERIFICATION_VERSION
             return ToolResult(True, "lean", output=proc.stdout.strip(), error=proc.stderr.strip(), metadata=metadata)
         except subprocess.TimeoutExpired as exc:
             return ToolResult(False, "lean", error=f"timeout ({self.timeout_s}s): {exc}", metadata=metadata)
@@ -566,8 +669,8 @@ class TropicalGridTool:
 
     @staticmethod
     def _reference(n: int, weights: dict[tuple[int, int], int]) -> int:
-        inf = 10**18
-        dist = [inf] * (n + 1)
+        inf = math.inf
+        dist: list[float] = [inf] * (n + 1)
         used = [False] * (n + 1)
         dist[1] = 0
         for _ in range(n):
@@ -578,7 +681,9 @@ class TropicalGridTool:
                     continue
                 e = (u, v) if u < v else (v, u)
                 dist[v] = min(dist[v], dist[u] + weights[e])
-        return dist[n]
+        if dist[n] == inf:
+            raise ValueError("reference shortest path unreachable; weights must be finite")
+        return int(dist[n])
 
     @staticmethod
     def _evaluate(circuit: dict[str, Any], weights: dict[tuple[int, int], int]) -> int:
