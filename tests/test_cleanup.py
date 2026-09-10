@@ -5,11 +5,18 @@ from pathlib import Path
 
 import pytest
 
+from lab.integrity import EvidenceIntegrityError
 from lab.step_store import StepStore
 from lab.tool_registry import ToolRegistry
 
 
-def test_malformed_iteration_snapshot_payload_is_tolerated(tmp_path):
+def test_malformed_iteration_snapshot_payload_is_no_longer_partially_served(tmp_path):
+    """Bozuk freeze payload'u artık sütunlardan kısmen okunmaz.
+
+    The earlier contract tolerated an unreadable payload and still handed back the
+    ledger columns. Under the iteration-snapshot seal that would serve an
+    unverified freeze record to a resuming run, so the read fails closed instead.
+    """
     store = StepStore(tmp_path / "project")
     store.put_iteration_snapshot(
         1,
@@ -23,12 +30,8 @@ def test_malformed_iteration_snapshot_payload_is_tolerated(tmp_path):
             ("{broken-json", 1),
         )
 
-    snapshot = store.get_iteration_snapshot(1)
-    assert snapshot is not None
-    assert snapshot["iteration"] == 1
-    assert snapshot["ledger_revision"] == "rev"
-    assert snapshot["ledger_context"] == "context"
-    assert "ok" not in snapshot
+    with pytest.raises(EvidenceIntegrityError):
+        store.get_iteration_snapshot(1)
 
 
 def test_tool_registry_names_has_one_canonical_shape():

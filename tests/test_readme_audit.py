@@ -19,6 +19,9 @@ def test_readme_states_audit_security_and_evidence_boundaries():
     assert "mutable run işlemlerinden önce alınır" in text
     assert "Docker bulunmuyorsa `skip`" in text
     assert "global read-time seal uygulanmaz" in text
+    assert "otomatik olarak mühürlenmez" in text
+    assert "LAB_ADOPT_UNSEALED_CACHE" in text
+    assert "iteration snapshot: doğrulanamayan satır" in text
     assert "opsiyonel tam-state integrity maddesi bilinçli olarak kapsam dışında" in text
     assert "integrity_theorem_lab" not in text
     assert "experiment_method" in text

@@ -135,6 +135,19 @@ def live_status() -> None:
         c2.metric("Şu anki tur", runtime.get("current_iteration", 0))
         c3.metric("Tamamlanan adım", counts["complete_steps"])
         c4.metric("Partial", counts["partials"])
+        unsealed = int(counts["unsealed_steps"]) + int(counts["unsealed_partials"])
+        if unsealed:
+            st.warning(
+                f"{unsealed} mühürsüz/kurcalanmış StepStore satırı sunulmuyor "
+                f"(adım: {counts['unsealed_steps']}, partial: {counts['unsealed_partials']}). "
+                "Bu adımlar yeniden hesaplanır. Eski bir projeden geliyorlarsa "
+                "`LAB_ADOPT_UNSEALED_CACHE=1` ile bir kez devralınabilir."
+            )
+        if counts["adopted_unsealed_rows"]:
+            st.caption(
+                f"Mühürsüz {counts['adopted_unsealed_rows']} satır operatör onayıyla devralındı; "
+                "bu kayıtlar mühür öncesinden gelir."
+            )
         if runtime.get("next_task"):
             st.write("**Sonraki araştırma hedefi:**", runtime["next_task"])
 

@@ -13,7 +13,7 @@ from lab.client import next_lower_supported_effort
 from lab.code_experiment import CODE_EXPERIMENT_SYSTEM_PROMPT, CodeExperimentRunner, GuardedExperimentWorkspace, WorkspaceActionResult
 from lab.code_experiment_settings import load_code_experiment_settings, load_code_experiment_settings_from_dict
 from lab.evidence import evidence_from_tool_result, validate_evidence_binding
-from lab.integrity import content_fingerprint, sha256_file
+from lab.integrity import EvidenceIntegrityError, content_fingerprint, sha256_file
 from lab.json_io import StructuredOutputError, parse_json_object, parse_truncated_object_prefix, repair_instruction
 from lab.literature import LiteratureClient, LiteratureSearchEmpty, Paper
 from lab.prompts import checkpoint_prompt, critic_prompt, literature_prompt, manager_prompt, proposal_prompt, verifier_prompt
@@ -1015,15 +1015,32 @@ class TheoremResearchLab:
         candidates = [item for item in self.state.list_items(kind="conjecture") if int(item.metadata.get("iteration", -1)) == iteration]
         return candidates[-1] if candidates else None
 
+    def _snapshot_seal_mismatch(self, iteration: int, exc: EvidenceIntegrityError) -> ResearchPaused:
+        """Kurcalanmış/mühürsüz freeze kaydını sessizce yeniden türetmek yerine run'ı beklemeye al."""
+        self.trace.log("iteration_snapshot_seal_mismatch", iteration=int(iteration), error=str(exc))
+        return ResearchPaused(str(exc))
+
+    def _read_iteration_snapshot(self, iteration: int) -> dict[str, Any] | None:
+        try:
+            return self.step_store.get_iteration_snapshot(iteration)
+        except EvidenceIntegrityError as exc:
+            raise self._snapshot_seal_mismatch(iteration, exc) from exc
+
+    def _write_iteration_payload(self, iteration: int, **updates: Any) -> dict[str, Any]:
+        try:
+            return self.step_store.update_iteration_payload(iteration, **updates)
+        except EvidenceIntegrityError as exc:
+            raise self._snapshot_seal_mismatch(iteration, exc) from exc
+
     def _iteration_snapshot(self, iteration: int, next_task: str) -> dict[str, Any]:
-        existing = self.step_store.get_iteration_snapshot(iteration)
+        existing = self._read_iteration_snapshot(iteration)
         if existing:
             return existing
         context = self.state.research_context()
         revision = self.state.revision()
         self.step_store.put_iteration_snapshot(iteration, ledger_revision=revision, ledger_context=context, payload={"next_task": next_task})
         self.trace.log("iteration_snapshot_frozen", iteration=iteration, ledger_revision=revision, ledger_context_chars=len(context))
-        return self.step_store.get_iteration_snapshot(iteration) or {}
+        return self._read_iteration_snapshot(iteration) or {}
 
     def _ensure_item_matches_proposal(self, iteration: int, proposal: dict[str, Any], snapshot: dict[str, Any]):
         claim = str(proposal.get("claim") or "Boş iddia")
@@ -1053,7 +1070,7 @@ class TheoremResearchLab:
                 raise ResearchPaused(
                     f"Iteration {iteration} legacy integrity mismatch: cached proposal claim differs from ledger item {item.id}."
                 )
-        self.step_store.update_iteration_payload(iteration, proposal=proposal, proposal_hash=proposal_hash, item_id=item.id)
+        self._write_iteration_payload(iteration, proposal=proposal, proposal_hash=proposal_hash, item_id=item.id)
         self._active_iteration = int(iteration)
         self._active_item_id = item.id
         self._active_claim_hash = content_fingerprint("claim:v1", item.claim)
@@ -1245,6 +1262,10 @@ class TheoremResearchLab:
         try:
             with self.controller.lock:
                 self.trace.log("project_lock_acquired", project_root=str(self.state.root), pid=os.getpid())
+                # Mühürsüz kalan (yani sunulmayacak) cache/partial satırları run başında iz bırakmalı.
+                self.trace.log(
+                    "step_store_integrity", key_mode=self.step_store.signer.mode, **self.step_store.counts()
+                )
                 try:
                     if code_agent is None:
                         code_agent = Agent(

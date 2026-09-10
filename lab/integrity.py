@@ -315,6 +315,15 @@ class ProjectRunLock:
         self.release()
 
 
+class EvidenceIntegrityError(RuntimeError):
+    """Mühürlü bir kaydın imzası doğrulanamadı.
+
+    Raised only where a silent fallback would replace verified data with
+    unverified data. Kinds whose fallback is safe (a recomputed step, a discarded
+    partial) return ``None`` instead of raising.
+    """
+
+
 class EvidenceSigner:
     """HMAC seal for local evidence/cache tamper detection.
 

@@ -153,15 +153,23 @@ Windows launcher önce `CREATE_BREAKAWAY_FROM_JOB` ile başlatmayı dener. Paren
 
 `runtime.json` heartbeat ile güncellenir. RUNNING state için lock kayıp/ölü veya heartbeat 120 saniyeden eskiyse sistem bunu `STALE_RUNNING` olarak teşhis edebilir ve kullanıcıya güvenli resume yolu açar.
 
-Tamamlanan step'ler SQLite `StepStore` içinde content fingerprint ile saklanır. Tamamlanan step cache payload'ları HMAC ile seal edilir; seal uyuşmazsa cache yeniden kullanılmaz. Yarım provider-visible çalışma `reasoning`, `reasoning_details` ve `content` ile birlikte partial kayıt olarak tutulur.
+Tamamlanan step'ler SQLite `StepStore` içinde content fingerprint ile saklanır. Yarım provider-visible çalışma `reasoning`, `reasoning_details` ve `content` ile birlikte partial kayıt olarak tutulur. `StepStore`'un sunduğu üç kayıt türünün tamamı HMAC ile seal edilir: tamamlanan step cache payload'ları, partial kayıtlar ve dondurulmuş iteration snapshot'ları. Mühür doğrulanmazsa kayıt güvenilir veri olarak sunulmaz; davranış tür bazında bilinçli olarak farklıdır ve her biri fail-closed'dır:
 
-Her iteration başında ledger context, ledger revision ve next task dondurulur. Resume sırasında proposer'ın ürettiği claim dondurulmuş proposal ile uyuşmazsa yeni evidence eski conjecture'a sessizce bağlanmaz; run fail-closed biçimde `PAUSED_ERROR` durumuna geçer.
+- step cache: doğrulanamayan satır cache miss'tir, adım yeniden hesaplanır
+- partial: doğrulanamayan satır düşürülür, adım sıfırdan başlar (kurcalanmış yarım metin prompt'a girmez)
+- iteration snapshot: doğrulanamayan satır `EvidenceIntegrityError` yükseltir ve run `PAUSED_ERROR` olur
+
+`steps` tablosundaki `status`/`fingerprint` sütunları yalnız indeks amaçlıdır; güvenilir her okuma bu değerleri mühürlü payload'dan türetir, dolayısıyla sütunu elle değiştirmek `counts()` veya `list_steps()` çıktısını değiştirmez.
+
+Her iteration başında ledger context, ledger revision ve next task dondurulur. Freeze kaydının kendisi de mühürlüdür ve mühür `iteration`, `ledger_revision`, `ledger_context` ile payload'ın tamamını kapsar; kurcalanmış ya da mühürsüz bir freeze kaydı geçerli sayılmaz ve mevcut ledger'dan sessizce yeniden türetilmez. Resume sırasında proposer'ın ürettiği claim dondurulmuş proposal ile uyuşmazsa yeni evidence eski conjecture'a sessizce bağlanmaz; run fail-closed biçimde `PAUSED_ERROR` durumuna geçer.
 
 Bu gerçek provider KV-cache resume değildir. Provider'ın gizli inference state'i API tarafından verilmediğinde yalnız provider-visible reasoning/content güvenli biçimde yeniden kullanılabilir.
 
 ## Araştırma state'i bütünlük sınırı
 
-`PROVEN` evidence kayıtları HMAC proof seal taşır ve bağlı Lean dosyasının canlı SHA-256 değeri yeniden kontrol edilir. Tamamlanmış StepStore cache kayıtları da HMAC ile doğrulanır. `LAB_EVIDENCE_HMAC_KEY` dışarıdan verildiğinde anahtar proje verisinin dışında tutulabilir. Bu değişken verilmezse StepStore HMAC anahtarı proje klasöründe tutulur; bu mod kazara/basit manuel düzenlemeleri saptamak için bir bütünlük kontrolüdür, proje dosyalarına erişebilen düşman bir modele karşı güvenlik imzası değildir.
+`PROVEN` evidence kayıtları HMAC proof seal taşır ve bağlı Lean dosyasının canlı SHA-256 değeri yeniden kontrol edilir. StepStore'un step cache, partial ve iteration snapshot kayıtları da HMAC ile doğrulanır. `LAB_EVIDENCE_HMAC_KEY` dışarıdan verildiğinde anahtar proje verisinin dışında tutulabilir. Bu değişken verilmezse StepStore HMAC anahtarı proje klasöründe tutulur; bu mod kazara/basit manuel düzenlemeleri saptamak için bir bütünlük kontrolüdür, proje dosyalarına erişebilen düşman bir modele karşı güvenlik imzası değildir.
+
+Mühür mekanizmasından önce yazılmış (ya da eski JSON cache'inden içe aktarılmış) satırlar imza taşımaz. Bunlar **otomatik olarak mühürlenmez**: taze bir anahtarla yeniden mühürlemek, yükseltmeden önce yerleştirilmiş her satırı "doğrulanmış" evidence'a çevirirdi. Bu satırlar güvenilmez kalır ve sunulmaz; sayıları Research Control'da ve run trace'indeki `step_store_integrity` olayında görünür. Operatör `LAB_ADOPT_UNSEALED_CACHE=1` ile bir kez sorumluluğu devralabilir; devralma tek seferliktir ve zaman damgası, anahtar modu ve satır sayılarıyla `meta` tablosuna kaydedilir. Devralma yalnız hiç imza taşımayan satırları kapsar: imzası olup doğrulanmayan bir satır elle düzenlenmiş ya da başka bir anahtarla yazılmıştır ve devralınmaz, dolayısıyla bu kapı ne kurcalanmış bir kaydı onaylamak ne de mevcut evidence'ı toptan yeniden anahtarlamak için kullanılamaz.
 
 Buna karşılık **bütün `state.json` dosyasının canonical items+events içeriği için global read-time seal uygulanmaz**. Audit'teki opsiyonel tam-state integrity maddesi bilinçli olarak kapsam dışında bırakılmıştır; proje dosya sistemini ve yerel HMAC anahtarını değiştirebilen bir yöneticiye karşı genel tamper-proof ledger garantisi verilmez. Güvenlik/evidence iddiaları yukarıdaki daha dar PROVEN ve cache kontrolleriyle sınırlıdır.
 
