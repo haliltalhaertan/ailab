@@ -20,7 +20,7 @@ from lab.integrity import (
 )
 from lab.project_manager import ProjectManager
 from lab.research_state import ResearchState
-from lab.run_controller import ResearchStopped, RunController
+from lab.run_controller import ResearchStopped, RunController, mark_runtime_error
 from lab.tool_registry import EFFECTIVE_AVAILABILITY_ENV, ToolRegistry
 from lab.tools import ToolResult
 from lab.trace import Trace
@@ -64,14 +64,7 @@ def _write_worker(root: Path, *, pid: int, run_id: str, launched_at: str) -> Non
 
 
 def _mark_runtime_error(root: Path, exc: Exception) -> None:
-    path = root / "runtime.json"
-    current = read_json_tolerant(path, {})
-    current = dict(current) if isinstance(current, dict) else {}
-    now = _now()
-    current.update(
-        {"status": "PAUSED_ERROR", "last_error": repr(exc), "pid": os.getpid(), "updated_at": now, "heartbeat_at": now}
-    )
-    atomic_write_json(path, current)
+    mark_runtime_error(root, exc)
 
 
 def _availability_row(available: bool, reason: str) -> dict[str, Any]:

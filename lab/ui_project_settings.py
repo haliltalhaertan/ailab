@@ -9,8 +9,9 @@ import time
 from pathlib import Path
 from typing import Any
 
-from lab.integrity import atomic_write_json, process_alive, read_json_tolerant
-from lab.runtime_health import cleanup_stale_run, normalize_runtime, worker_liveness
+from lab.integrity import ProjectBusyError, ProjectRunLock, atomic_write_json, process_alive, read_json_tolerant
+from lab.runtime_health import worker_liveness
+from lab.run_controller import RuntimeReadError, read_runtime
 
 
 UI_SETTINGS_FILE = "ui_settings.json"
@@ -186,19 +187,18 @@ def force_stop_worker(project_root: str | Path, *, wait_s: float = 2.0) -> bool:
     if process_alive(pid):
         return False
 
-    raw = read_json_tolerant(root / "runtime.json", {})
-    runtime = dict(raw) if isinstance(raw, dict) else {}
-    derived = normalize_runtime(root, runtime, heartbeat_timeout_s=0.0)
-    if str(derived.get("status") or "").upper() == "STALE_RUNNING":
-        try:
-            cleanup_stale_run(root)
-            return True
-        except RuntimeError:
-            pass
-
-    (root / "run.lock").unlink(missing_ok=True)
-    if runtime:
-        runtime["status"] = "INTERRUPTED"
-        runtime["last_error"] = "Worker kullanıcı tarafından zorla durduruldu; partial/cache dosyaları korunmuş olabilir."
-        atomic_write_json(root / "runtime.json", runtime)
+    try:
+        with ProjectRunLock(root):
+            # The stopped process may have advanced before exiting. Read under
+            # exclusive ownership; a replacement worker must not be overwritten.
+            if _worker_pid(root) not in {0, pid}:
+                return False
+            runtime = read_runtime(root / "runtime.json")
+            if runtime.get("status") in {"COMPLETED", "STOPPED", "PAUSED_ERROR", "INTERRUPTED"}:
+                return True
+            runtime["status"] = "INTERRUPTED"
+            runtime["last_error"] = "Worker kullanıcı tarafından zorla durduruldu; kayıtlar korundu."
+            atomic_write_json(root / "runtime.json", runtime)
+    except (ProjectBusyError, RuntimeReadError):
+        return False
     return True

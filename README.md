@@ -130,7 +130,7 @@ Merkezi evidence guard LLM'nin istediği status ile gerçekten mevcut evidence'�
 - `REFUTATION_CANDIDATE`: LLM'nin öne sürdüğü ama deterministic olarak doğrulanmamış karşıörnek; araştırma alanını kalıcı kapatmaz.
 - `COMPUTATION_PASS`: anlamlı ve başarılı deterministic compute evidence gerekir. Z3 için en az bir assertion; tropical grid için en az bir gerçekten kontrol edilmiş case gerekir.
 - `PROOF_CANDIDATE`: verifier/critic değerlendirmesi gerekir; formal ispat değildir.
-- `PROVEN`: aynı ledger item/iteration/claim'e bağlı başarılı Lean evidence, temiz kaynak, axiom audit, verifier PASS ve critic'in KILL etmemesi gerekir.
+- `PROVEN`: manager'ın açık talebi, aynı ledger item/iteration/claim'e bağlı başarılı Lean evidence, temiz kaynak, axiom audit, verifier PASS ve critic'in KILL etmemesi gerekir. Kayıtlı `claim`, doğrulanmış tam `theorem_type` ile birebir aynı formal metin olmalıdır; dış boşluklar hariç metin dönüştürülmez.
 - `FAIL`: yalnız deterministic olarak doğrulanmış counterexample yolu kalıcı matematiksel FAIL üretebilir. LLM-only negatif kanaat FAIL değildir.
 
 Manager daha güçlü bir status ister fakat evidence yoksa durum otomatik olarak daha düşük güven seviyesine indirilir ve trace'e kaydedilir.
@@ -154,6 +154,12 @@ Windows launcher önce `CREATE_BREAKAWAY_FROM_JOB` ile başlatmayı dener. Paren
 `runtime.json` heartbeat ile güncellenir. RUNNING state için lock kayıp/ölü veya heartbeat 120 saniyeden eskiyse sistem bunu `STALE_RUNNING` olarak teşhis edebilir ve kullanıcıya güvenli resume yolu açar.
 
 Tamamlanan step'ler SQLite `StepStore` içinde content fingerprint ile saklanır. Tamamlanan step cache payload'ları HMAC ile seal edilir; seal uyuşmazsa cache yeniden kullanılmaz. Yarım provider-visible çalışma `reasoning`, `reasoning_details` ve `content` ile birlikte partial kayıt olarak tutulur.
+
+Tur snapshot'ları (tur kimliği, ledger revision/context ve payload) ve kısmi cevaplar da HMAC ile doğrulanır. Eksik/geçersiz mühür varsa devam `PAUSED_ERROR` ile durur; özgün kayıt korunur. Eski imzasız cache kayıtları otomatik imzalanmaz. Step tablosunun status/fingerprint sütunları imzalı payload ile karşılaştırılır; geçersiz kayıtlar tamamlanmış iş sayısına katılmaz. SQLite bağlantıları her işlemden sonra kapatılır.
+
+Var olan `runtime.json` okunamıyorsa veya geçersiz durum/ilerleme alanları içeriyorsa varsayılan ilerlemeyle üzerine yazılmaz. Hata bilgisi ayrı `runtime_error.json` dosyasına yazılır; sağlık görünümü `PAUSED_ERROR` gösterir. Stale temizleme ve zorla durdurma sonrası güncelleme OS kilidi altında yeniden okuma yapar; canlı/yeni worker'ın kaydını silemez.
+
+12 Eylül düzeltmeleri ve geçiş sınırları: [Kurtarma ve kanıt bütünlüğü](docs/audits/2026-09-12/RECOVERY_AND_PROOF.md).
 
 Her iteration başında ledger context, ledger revision ve next task dondurulur. Resume sırasında proposer'ın ürettiği claim dondurulmuş proposal ile uyuşmazsa yeni evidence eski conjecture'a sessizce bağlanmaz; run fail-closed biçimde `PAUSED_ERROR` durumuna geçer.
 

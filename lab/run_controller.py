@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import json
 import os
 import threading
 import time
@@ -59,6 +60,29 @@ def default_runtime() -> dict[str, Any]:
     }
 
 
+class RuntimeReadError(ResearchPaused):
+    """Existing runtime state cannot be safely used for a mutation."""
+
+
+def read_runtime(path: str | Path) -> dict[str, Any]:
+    target = Path(path)
+    try:
+        raw = json.loads(target.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return default_runtime()
+    except (OSError, ValueError) as exc:
+        raise RuntimeReadError(f"Durum dosyası okunamadı; üzerine yazılmadı: {target}") from exc
+    if not isinstance(raw, dict) or not isinstance(raw.get("status"), str) or not raw["status"].strip():
+        raise RuntimeReadError(f"Durum dosyası geçersiz; üzerine yazılmadı: {target}")
+    for key in ("completed_iterations", "current_iteration"):
+        if key in raw and (type(raw[key]) is not int or raw[key] < 0):
+            raise RuntimeReadError(f"Durum dosyasında geçersiz {key}; üzerine yazılmadı: {target}")
+    if "next_task" in raw and not isinstance(raw["next_task"], str):
+        raise RuntimeReadError(f"Durum dosyasında geçersiz next_task; üzerine yazılmadı: {target}")
+    raw.setdefault("research_phase", DEFAULT_RESEARCH_PHASE)
+    return raw
+
+
 def normalize_research_phase(value: Any) -> str:
     phase = str(value or DEFAULT_RESEARCH_PHASE).upper()
     if phase not in RESEARCH_PHASES:
@@ -66,13 +90,30 @@ def normalize_research_phase(value: Any) -> str:
     return phase
 
 
+def mark_runtime_error(root: str | Path, exc: Exception) -> None:
+    """Publish failure without replacing unreadable authoritative state."""
+    root = Path(root)
+    path = root / "runtime.json"
+    try:
+        current = read_runtime(path)
+    except RuntimeReadError as read_error:
+        atomic_write_json(root / "runtime_error.json", {
+            "status": "PAUSED_ERROR", "last_error": repr(exc),
+            "integrity_error": str(read_error), "runtime_preserved": True, "updated_at": now_iso(),
+        })
+        return
+    now = now_iso()
+    current.update({"status": "PAUSED_ERROR", "last_error": repr(exc),
+                    "pid": os.getpid(), "updated_at": now, "heartbeat_at": now})
+    atomic_write_json(path, current)
+
+
 def set_research_phase(project_root: str | Path, phase: str) -> dict[str, Any]:
     """Persist a scientific workflow phase without changing execution status."""
 
     root = Path(project_root)
     path = root / "runtime.json"
-    raw = read_json_tolerant(path, None)
-    current = dict(raw) if isinstance(raw, dict) else default_runtime()
+    current = read_runtime(path)
     current.setdefault("status", "NEW")
     current["research_phase"] = normalize_research_phase(phase)
     current["updated_at"] = now_iso()
@@ -162,10 +203,7 @@ class RunController:
 
     def runtime(self) -> dict[str, Any]:
         with self.write_lock:
-            value = read_json(self.runtime_path, default_runtime())
-            current = dict(value) if isinstance(value, dict) else default_runtime()
-            current.setdefault("research_phase", DEFAULT_RESEARCH_PHASE)
-            return current
+            return read_runtime(self.runtime_path)
 
     def set_runtime(self, **updates: Any) -> dict[str, Any]:
         with self.write_lock:

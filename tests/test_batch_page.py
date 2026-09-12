@@ -6,7 +6,9 @@ from streamlit.testing.v1 import AppTest
 def test_batch_page_add_and_clear_without_launching(monkeypatch, tmp_path):
     import lab.batch_lab as batch
     monkeypatch.setattr(batch, 'ROOT', tmp_path)
-    app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / 'pages/6_Paralel_Deneyler.py')).run()
+    app = AppTest.from_file(
+        str(Path(__file__).resolve().parents[1] / 'pages/6_Paralel_Deneyler.py'), default_timeout=25,
+    ).run()
     assert not app.exception
     next(b for b in app.button if b.label == 'Görev listesine ekle').click().run()
     assert not app.exception

@@ -5,8 +5,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from lab.integrity import atomic_write_json, process_alive, project_lock_owner, read_json_tolerant
-from lab.run_controller import DEFAULT_RESEARCH_PHASE
+from lab.integrity import ProjectRunLock, atomic_write_json, process_alive, project_lock_owner, read_json_tolerant
+from lab.run_controller import DEFAULT_RESEARCH_PHASE, RuntimeReadError, read_runtime
 
 
 STALE_HEARTBEAT_S = 120.0
@@ -119,8 +119,11 @@ def normalize_runtime(
     root = Path(project_root)
     current = dict(runtime or {})
     if not current:
-        raw = read_json_tolerant(root / "runtime.json", {})
-        current = dict(raw) if isinstance(raw, dict) else {}
+        try:
+            current = read_runtime(root / "runtime.json")
+        except RuntimeReadError as exc:
+            return {"status": "PAUSED_ERROR", "last_error": str(exc),
+                    "integrity_error": True, "runtime_preserved": True}
     current.setdefault("research_phase", DEFAULT_RESEARCH_PHASE)
     reason = stale_running_reason(root, current, heartbeat_timeout_s=heartbeat_timeout_s)
     if not reason:
@@ -142,26 +145,29 @@ def cleanup_stale_run(project_root: str | Path) -> dict[str, Any]:
     """Explicitly convert a detected stale run to resumable INTERRUPTED."""
 
     root = Path(project_root)
-    raw = read_json_tolerant(root / "runtime.json", {})
-    current = dict(raw) if isinstance(raw, dict) else {}
+    current = read_runtime(root / "runtime.json")
     derived = normalize_runtime(root, current)
     if str(derived.get("status") or "").upper() != "STALE_RUNNING":
         raise RuntimeError("Run is not stale; refusing to remove a live project lock.")
 
-    (root / "run.lock").unlink(missing_ok=True)
-    now = _now()
-    cleaned = dict(current)
-    cleaned.setdefault("research_phase", DEFAULT_RESEARCH_PHASE)
-    cleaned.update(
-        {
-            "status": "INTERRUPTED",
-            "last_error": "Stale worker state was explicitly cleaned; cached/partial work is preserved and can be resumed.",
-            "interrupted_at": now,
-            "updated_at": now,
-            "heartbeat_at": now,
-            "stale_reason": derived.get("stale_reason", ""),
-            "stale_worker_pid": derived.get("stale_worker_pid", 0),
-        }
-    )
-    atomic_write_json(root / "runtime.json", cleaned)
-    return cleaned
+    with ProjectRunLock(root):
+        # Re-read only after exclusive ownership; another worker may have advanced.
+        current = read_runtime(root / "runtime.json")
+        if str(current.get("status") or "").upper() != "RUNNING":
+            raise RuntimeError("Run state changed; cleanup refused.")
+        now = _now()
+        cleaned = dict(current)
+        cleaned.setdefault("research_phase", DEFAULT_RESEARCH_PHASE)
+        cleaned.update(
+            {
+                "status": "INTERRUPTED",
+                "last_error": "Stale worker state was explicitly cleaned; cached/partial work is preserved and can be resumed.",
+                "interrupted_at": now,
+                "updated_at": now,
+                "heartbeat_at": now,
+                "stale_reason": derived.get("stale_reason", ""),
+                "stale_worker_pid": derived.get("stale_worker_pid", 0),
+            }
+        )
+        atomic_write_json(root / "runtime.json", cleaned)
+        return cleaned

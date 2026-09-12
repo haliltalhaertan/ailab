@@ -81,6 +81,7 @@ def _formal_result(claim_hash: str) -> ToolResult:
             "item_id": "C-test",
             "iteration": 1,
             "claim_hash": claim_hash,
+            "theorem_type": "1 = 1",
         },
     )
 
@@ -101,11 +102,12 @@ def test_claim_hash_mismatch_cannot_be_proven():
     assert decision.metadata["claim_hash_matches"] is False
 
 
-def test_matching_claim_hash_with_pass_and_keep_is_proven():
-    expected = content_fingerprint("claim:v1", "the actual claim")
+def test_matching_formal_claim_with_pass_and_keep_is_proven():
+    expected = content_fingerprint("claim:v1", "1 = 1")
     decision = choose_status(
         "PROVEN",
         tool_result=_formal_result(expected),
+        expected_claim="1 = 1",
         verifier={"verdict": "PASS"},
         critic={"verdict": "KEEP"},
         expected_item_id="C-test",

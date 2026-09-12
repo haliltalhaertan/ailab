@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from lab.integrity import EvidenceSigner, atomic_write_json, formal_verification_current, read_json_tolerant, sha256_file
+from lab.integrity import EvidenceSigner, atomic_write_json, formal_claim_matches, formal_verification_current, read_json_tolerant, sha256_file
 from lab.research_contract import ResearchContract
 
 
@@ -132,6 +132,8 @@ class ResearchState:
             metadata.get("theorem_type") or ""
         ).strip():
             return False, "formal statement binding missing"
+        if not formal_claim_matches(claim, metadata.get("theorem_type")):
+            return False, "formal statement does not exactly match the recorded claim"
         return True, ""
 
     def _seal_proven(self, item_id: str, claim: str, metadata: dict[str, Any]) -> dict[str, Any]:

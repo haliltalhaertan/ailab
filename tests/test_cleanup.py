@@ -6,10 +6,11 @@ from pathlib import Path
 import pytest
 
 from lab.step_store import StepStore
+from lab.run_controller import ResearchPaused
 from lab.tool_registry import ToolRegistry
 
 
-def test_malformed_iteration_snapshot_payload_is_tolerated(tmp_path):
+def test_malformed_iteration_snapshot_payload_stops_resume(tmp_path):
     store = StepStore(tmp_path / "project")
     store.put_iteration_snapshot(
         1,
@@ -23,12 +24,8 @@ def test_malformed_iteration_snapshot_payload_is_tolerated(tmp_path):
             ("{broken-json", 1),
         )
 
-    snapshot = store.get_iteration_snapshot(1)
-    assert snapshot is not None
-    assert snapshot["iteration"] == 1
-    assert snapshot["ledger_revision"] == "rev"
-    assert snapshot["ledger_context"] == "context"
-    assert "ok" not in snapshot
+    with pytest.raises(ResearchPaused, match="Tur"):
+        store.get_iteration_snapshot(1)
 
 
 def test_tool_registry_names_has_one_canonical_shape():

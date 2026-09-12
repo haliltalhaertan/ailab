@@ -156,6 +156,8 @@ def proposal_prompt(
         "Separate proved facts from assumptions. If computation/formal checking is useful, request ONE tool from the available tool schema only. "
         "Do not describe your own candidate as verified/proven before deterministic evidence exists; call it an aday/candidate. "
         "For lean_draft, theorem_name and theorem_type are mandatory and must describe the exact single theorem/lemma in source; "
+        "For a formal claim, claim must be the exact full Lean theorem_type; put the natural-language explanation in strategy. "
+        "Natural-language claims stay PROOF_CANDIDATE even if a related formal theorem compiles. "
         "theorem_type must include every declaration parameter and assumption as '∀ <binders>, <type>'; "
         "only a declaration without binders may use its conclusion alone, never a proposition appearing elsewhere in the file; "
         "the engine will ignore your filename, bind the source to this iteration's ledger item, and check that exact SHA immediately. "

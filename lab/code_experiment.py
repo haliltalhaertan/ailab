@@ -786,6 +786,8 @@ class CodeExperimentRunner:
                 error=f"infrastructure: {self.workspace.availability_reason}",
                 metadata={
                     "status": "CONTAINER_UNAVAILABLE",
+                    "successful_run_count": 0,
+                    "failed_run_count": 0,
                     "evidence_level": "COMPUTATION_ONLY",
                     "infrastructure_error": True,
                     "tool_unavailable": True,

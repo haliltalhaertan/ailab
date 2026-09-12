@@ -132,7 +132,7 @@ def test_trace_ids_never_collide(tmp_path):
         b.close()
 
 
-def test_code_experiment_finish_without_run_is_rejected(tmp_path):
+def test_code_experiment_finish_without_run_is_rejected(tmp_path, fake_container_runtime):
     ws = GuardedExperimentWorkspace(tmp_path / "workspace", timeout_s=5)
     trace = Trace("finish-gate", out_dir=tmp_path / "runs")
     runner = CodeExperimentRunner(ws, trace, max_steps=1)
@@ -151,6 +151,26 @@ def test_code_experiment_finish_without_run_is_rejected(tmp_path):
     trace.close()
     assert not result.ok
     assert result.metadata["successful_run_count"] == 0
+
+
+def test_unavailable_container_returns_zero_counts_without_agent_call(tmp_path, monkeypatch):
+    ws = GuardedExperimentWorkspace(tmp_path / "workspace", timeout_s=5)
+    monkeypatch.setattr(ws, "refresh_execution_availability", lambda: False)
+    trace = Trace("unavailable", out_dir=tmp_path / "runs")
+    runner = CodeExperimentRunner(ws, trace, max_steps=1)
+
+    def forbidden(*args):
+        raise AssertionError("No model or action is allowed without a container")
+
+    try:
+        result = runner.run(agent=FakeAgent(name="CodeExperimentAgent"), task="test",
+                            step_key="iter:1:tool", call_agent=forbidden, execute_cached=forbidden)
+    finally:
+        trace.close()
+    assert not result.ok
+    assert result.metadata["status"] == "CONTAINER_UNAVAILABLE"
+    assert result.metadata["successful_run_count"] == 0
+    assert result.metadata["failed_run_count"] == 0
 
 
 def test_code_experiment_finish_after_failed_run_is_rejected(tmp_path, fake_container_runtime):

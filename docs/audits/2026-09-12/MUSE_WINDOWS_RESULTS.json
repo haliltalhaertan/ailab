@@ -1,0 +1,56 @@
+{
+  "ailab": {
+    "project_manager_bypass": {
+      "start_overwrites_corrupt_bytes": true,
+      "progress_key_missing_after_start": true,
+      "error_handler_preserved": true,
+      "final_touch_overwrites": true
+    },
+    "lean_context_precheck": {
+      "accepted": true,
+      "reason": "",
+      "kernel_tested": false
+    },
+    "missing_runtime": {
+      "before_completed_iterations": 7,
+      "after_completed_iterations": 0,
+      "after_next_task": ""
+    },
+    "phase_write_race": {
+      "worker_committed_iterations": 8,
+      "after_completed_iterations": 7,
+      "after_next_task": "old"
+    },
+    "missing_snapshot": {
+      "new_ledger_revision_accepted": true,
+      "new_next_task": "different task"
+    }
+  },
+  "llm_lab": {
+    "project_manager_bypass": {
+      "start_overwrites_corrupt_bytes": true,
+      "progress_key_missing_after_start": true,
+      "error_handler_preserved": true,
+      "final_touch_overwrites": true
+    },
+    "lean_context_precheck": {
+      "accepted": true,
+      "reason": "",
+      "kernel_tested": false
+    },
+    "missing_runtime": {
+      "before_completed_iterations": 7,
+      "after_completed_iterations": 0,
+      "after_next_task": ""
+    },
+    "phase_write_race": {
+      "worker_committed_iterations": 8,
+      "after_completed_iterations": 7,
+      "after_next_task": "old"
+    },
+    "missing_snapshot": {
+      "new_ledger_revision_accepted": true,
+      "new_next_task": "different task"
+    }
+  }
+}

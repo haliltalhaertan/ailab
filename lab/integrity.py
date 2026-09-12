@@ -15,6 +15,18 @@ from typing import Any
 FORMAL_VERIFICATION_VERSION = 2
 
 
+def formal_claim_matches(claim: Any, theorem_type: Any) -> bool:
+    """Only identical formal text establishes identity; never infer translation.
+
+    Strip outer whitespace only: rewriting internal whitespace could change Lean
+    strings or comments. Natural-language claims remain proof candidates.
+    """
+    return (
+        isinstance(claim, str) and isinstance(theorem_type, str)
+        and bool(claim.strip()) and claim.strip() == theorem_type.strip()
+    )
+
+
 def formal_verification_current(metadata: dict[str, Any]) -> bool:
     return (
         metadata.get("formal_verification_version") == FORMAL_VERIFICATION_VERSION
@@ -100,7 +112,7 @@ def read_json_tolerant(path: str | Path, default: Any) -> Any:
         return default
     try:
         return json.loads(target.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError, PermissionError):
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError, OSError, PermissionError):
         return default
 
 
@@ -220,6 +232,9 @@ class ProjectRunLock:
         return _read_lock(self.path)
 
     def _stale(self, raw: dict[str, Any]) -> bool:
+        if not raw:
+            # Ownership is protected by the lifetime OS guard, not this metadata.
+            return True
         host = str(raw.get("host") or "")
         try:
             pid = int(raw.get("pid") or 0)
@@ -367,7 +382,7 @@ class EvidenceSigner:
         return hmac.new(self.key, payload, hashlib.sha256).hexdigest()
 
     def verify(self, kind: str, value: Any, signature: str | None) -> bool:
-        if not signature:
+        if not isinstance(signature, str) or len(signature) != 64 or any(c not in "0123456789abcdef" for c in signature):
             return False
         expected = self.sign(kind, value)
         return hmac.compare_digest(expected, str(signature))
