@@ -42,7 +42,7 @@ class FakeAgent:
         )
 
 
-def _proposal(claim: str = "The bound claim") -> dict:
+def _proposal(claim: str = "1 = 1") -> dict:
     return {
         "title": "Bound theorem",
         "claim": claim,
@@ -76,10 +76,11 @@ def _agents(proposal: dict):
     }
 
 
-def _run(tmp_path: Path, state: ResearchState, proposal: dict, *, name: str = "proven"):
+def _run(tmp_path: Path, state: ResearchState, proposal: dict, *, name: str = "proven", manager_status="PROVEN"):
     trace = Trace(name, out_dir=tmp_path / "runs")
     lab = TheoremResearchLab(trace, state, literature=EmptyLiterature())
     agents = _agents(proposal)
+    agents["manager"].outputs = [json.dumps({"decision": "KEEP", "status": manager_status, "next_task": "next"})]
     lab.run(
         "P",
         manager=agents["manager"],
@@ -121,6 +122,26 @@ def test_run_can_reach_proven_with_bound_lean_evidence(tmp_path, monkeypatch):
     assert item.metadata["lean_sha256"]
     assert item.metadata["claim_hash"] == content_fingerprint("claim:v1", item.claim)
     assert item.metadata["claim_sha256"] == hashlib.sha256(item.claim.encode("utf-8")).hexdigest()
+
+
+def test_unrelated_formal_theorem_cannot_prove_natural_language_claim(tmp_path, monkeypatch):
+    monkeypatch.setenv("LAB_ALLOW_HOST_LEAN", "1")
+    monkeypatch.setattr(LeanTool, "_run_lean", _clean_lean)
+    state = ResearchState(tmp_path / "state")
+    _run(tmp_path, state, _proposal("Every Collatz orbit reaches one"))
+    item = state.list_items(kind="conjecture")[0]
+    assert item.status == "PROOF_CANDIDATE"
+    assert item.metadata["formal_candidate"]["theorem_type"] == "1 = 1"
+    with pytest.raises(ValueError, match="formal statement"):
+        state.update_item(item.id, status="PROVEN", metadata=item.metadata["formal_candidate"])
+
+
+def test_lean_success_does_not_override_manager_open(tmp_path, monkeypatch):
+    monkeypatch.setenv("LAB_ALLOW_HOST_LEAN", "1")
+    monkeypatch.setattr(LeanTool, "_run_lean", _clean_lean)
+    state = ResearchState(tmp_path / "state")
+    _run(tmp_path, state, _proposal(), manager_status="OPEN")
+    assert state.list_items(kind="conjecture")[0].status == "OPEN"
 
 
 @pytest.mark.parametrize("legacy_seal", [False, True])

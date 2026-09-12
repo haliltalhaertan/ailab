@@ -26,7 +26,7 @@ from lab.research_protocol import (
     selectable_target_ids,
 )
 from lab.research_state import ResearchState
-from lab.run_controller import ResearchPaused, ResearchStopped, RunController, atomic_json, now_iso, retryable
+from lab.run_controller import ResearchPaused, ResearchStopped, RunController, atomic_json, mark_runtime_error, now_iso, retryable
 from lab.status_guard import choose_status
 from lab.step_store import StepStore
 from lab.tool_registry import ToolRegistry
@@ -1299,11 +1299,13 @@ class TheoremResearchLab:
                     self.trace.log("run_stopped", error=str(exc))
                     return "# Araştırma durduruldu\n\nKalıcı state, iteration snapshot ve tamamlanan adımlar korundu. Devam edildiğinde ilk tamamlanmamış adımdan ilerlenir."
                 except ResearchPaused as exc:
-                    self._set_runtime(status="PAUSED_ERROR", last_error=str(exc))
+                    with self.controller.write_lock:
+                        mark_runtime_error(self.state.root, exc)
                     self.trace.log("run_paused", error=str(exc))
                     return f"# Araştırma hata nedeniyle beklemeye alındı\n\n{exc}\n\nBelirsiz/bozuk structured output veya integrity uyuşmazlığı sessizce geçilmedi."
                 except Exception as exc:
-                    self._set_runtime(status="PAUSED_ERROR", last_error=repr(exc))
+                    with self.controller.write_lock:
+                        mark_runtime_error(self.state.root, exc)
                     self.trace.log("run_unhandled_error", error=repr(exc))
                     raise
                 finally:
@@ -1528,8 +1530,6 @@ class TheoremResearchLab:
             )
             decision = str(manager_decision.get("decision") or "REVISE").upper()
             requested_status = str(manager_decision.get("status") or "OPEN").upper()
-            if tool_result and tool_result.tool == "lean" and tool_result.ok and (tool_result.metadata or {}).get("formal_verified"):
-                requested_status = "PROVEN"
             expected_claim_hash = content_fingerprint("claim:v1", item.claim)
             if proposal_incomplete:
                 status = "OPEN"
@@ -1556,6 +1556,7 @@ class TheoremResearchLab:
                     expected_item_id=item.id,
                     expected_iteration=iteration,
                     expected_claim_hash=expected_claim_hash,
+                    expected_claim=item.claim,
                     evidence=bound_evidence,
                     contract=contract,
                 )
@@ -1611,6 +1612,8 @@ class TheoremResearchLab:
                     metadata.update({"truncated": True, "completion": "INCOMPLETE_OUTPUT"})
                 if bound_evidence is not None:
                     metadata["evidence"] = bound_evidence.as_dict()
+                if status == "PROOF_CANDIDATE" and tool_result and tool_result.tool == "lean":
+                    metadata["formal_candidate"] = dict(tool_result.metadata or {})
                 if status == "PROVEN" and tool_result and tool_result.tool == "lean":
                     formal_metadata = dict(tool_result.metadata or {})
                     formal_metadata["formal_verified"] = True

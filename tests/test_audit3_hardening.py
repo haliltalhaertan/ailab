@@ -222,7 +222,7 @@ def test_lean_unexpected_axiom_is_not_formal_verified(tmp_path, monkeypatch):
 def test_proven_ledger_record_is_sealed_and_live_sha_rechecked(tmp_path, monkeypatch):
     monkeypatch.setenv("LAB_EVIDENCE_HMAC_KEY", "unit-test-external-key")
     state = ResearchState(tmp_path / "project")
-    item = state.add_item("conjecture", "Bound", "claim")
+    item = state.add_item("conjecture", "Bound", "1 = 1")
     candidate_dir = state.root / "formal" / "candidates"
     candidate_dir.mkdir(parents=True, exist_ok=True)
     candidate = candidate_dir / f"iter-1-{item.id}.lean"

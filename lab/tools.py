@@ -310,6 +310,11 @@ class LeanTool:
     )
     DECLARATION = re.compile(r"(?m)^\s*(theorem|lemma)\s+([A-Za-z_][A-Za-z0-9_'.]*)\b")
     CLAIM_MARKER = re.compile(r"(?m)^\s*--\s*ailab-claim:\s*([0-9a-f]{64})\s*$", re.I)
+    DEFAULT_ALLOWED_AXIOMS = ("propext", "Classical.choice", "Quot.sound")
+    #: Hiçbir koşulda güvenilir sayılamayan axiomlar. ``LAB_LEAN_ALLOWED_AXIOMS``
+    #: ile genişletilseler bile reddedilirler: ``sorryAx`` ispatın ``sorry``
+    #: üzerinden kapatıldığını gösterir.
+    DENIED_AXIOMS = ("sorryAx", "Lean.ofReduceBool", "Lean.trustCompiler")
 
     def __init__(self, root: str | Path = "formal", timeout_s: int = 120):
         self.root = Path(root).resolve()
@@ -505,7 +510,20 @@ class LeanTool:
         lowered = text.lower()
         if "declaration uses 'sorry'" in lowered or 'declaration uses "sorry"' in lowered:
             return True
+        # ``sorryAx`` kelime sınırı nedeniyle ``\baxiom\b`` ile yakalanmaz;
+        # reddedilen axiom adları ayrıca aranır.
+        if any(denied.casefold() in lowered for denied in LeanTool.DENIED_AXIOMS):
+            return True
         return bool(re.search(r"\baxiom\b", lowered))
+
+    @classmethod
+    def _resolved_allowed_axioms(cls) -> set[str]:
+        """İzin verilen axiom kümesi; reddedilenler ortamdan eklenemez."""
+
+        raw = os.environ.get("LAB_LEAN_ALLOWED_AXIOMS", ",".join(cls.DEFAULT_ALLOWED_AXIOMS))
+        requested = {x.strip() for x in raw.split(",") if x.strip()}
+        denied = {x.casefold() for x in cls.DENIED_AXIOMS}
+        return {x for x in requested if x.casefold() not in denied}
 
     @staticmethod
     def _statement_probe(theorem_name: str, statement: str) -> str:
@@ -541,14 +559,11 @@ class LeanTool:
             if not match:
                 return False, "#print axioms output could not be parsed", []
             found = [x.strip() for x in match.group(1).split(",") if x.strip()]
-            allowed = {
-                x.strip()
-                for x in os.environ.get(
-                    "LAB_LEAN_ALLOWED_AXIOMS",
-                    "propext,Classical.choice,Quot.sound",
-                ).split(",")
-                if x.strip()
-            }
+            denied = {x.casefold() for x in self.DENIED_AXIOMS}
+            forbidden = [x for x in found if x.casefold() in denied]
+            if forbidden:
+                return False, f"Denied Lean axioms: {forbidden}", found
+            allowed = self._resolved_allowed_axioms()
             unexpected = [x for x in found if x not in allowed]
             if unexpected:
                 return False, f"Unexpected Lean axioms: {unexpected}", found

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from lab.evidence import Evidence, evidence_from_tool_result, validate_evidence_binding
-from lab.integrity import formal_verification_current
+from lab.integrity import content_fingerprint, formal_claim_matches, formal_verification_current
 from lab.research_contract import ResearchContract
 from lab.tools import ToolResult
 
@@ -27,6 +27,7 @@ def choose_status(
     expected_item_id: str | None = None,
     expected_iteration: int | None = None,
     expected_claim_hash: str | None = None,
+    expected_claim: str | None = None,
     evidence: Evidence | None = None,
     contract: ResearchContract | None = None,
 ) -> GuardDecision:
@@ -59,6 +60,10 @@ def choose_status(
         and (expected_item_id is None or str(tmeta.get("item_id") or "") == str(expected_item_id))
         and (expected_iteration is None or int(tmeta.get("iteration", -1)) == int(expected_iteration))
     )
+    formal_statement_matches = bool(
+        formal_claim_matches(expected_claim, tmeta.get("theorem_type"))
+        and expected_claim_hash == content_fingerprint("claim:v1", expected_claim)
+    )
     evidence_kind = bound_evidence.kind if bound_evidence is not None else "INCONCLUSIVE"
     computation_ok = bool(
         bound_evidence
@@ -85,6 +90,7 @@ def choose_status(
 
     metadata = {
         "formal_verified": formal_verified,
+        "formal_statement_matches_claim": formal_statement_matches,
         "formal_binding_verified": bool(tmeta.get("formal_binding_verified")),
         "axioms_verified": bool(tmeta.get("axioms_verified")),
         "source_clean": bool(tmeta.get("source_clean")),
@@ -121,6 +127,13 @@ def choose_status(
 
     if requested == "PROVEN":
         if formal_verified and verifier_verdict == "PASS" and critic_verdict != "KILL":
+            if not formal_statement_matches:
+                return GuardDecision(
+                    requested, "PROOF_CANDIDATE",
+                    "Lean ifadesi doğrulandı; kayıtlı iddiayla birebir formal ifade eşleşmesi yok. "
+                    "Doğal dil çevirisi otomatik ispat sayılmaz.",
+                    True, metadata,
+                )
             return GuardDecision(
                 requested,
                 "PROVEN",
